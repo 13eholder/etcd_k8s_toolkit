@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use tonic::transport::Server;
 
-use crate::pb::etcdserverpb::{
-    kv_client::KvClient, lease_client::LeaseClient, watch_client::WatchClient,
-};
+use crate::pb::etcdserverpb::kv_client::KvClient;
+use crate::pb::etcdserverpb::lease_client::LeaseClient;
+use crate::pb::etcdserverpb::watch_client::WatchClient;
 
 #[tokio::main]
 async fn main() {
