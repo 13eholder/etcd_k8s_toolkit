@@ -25,12 +25,13 @@ async fn main() {
         .expect("lease_client failed to connect to etcd");
 
     let logger = Arc::new(proxy::Logger::new("etcd_proxy.jsonl"));
-    let proxy_service = proxy::ProxyService::new(kv_client, watch_client, lease_client, logger);
+    let proxy_service =
+        proxy::ProxyService::new(kv_client, watch_client, lease_client, Arc::clone(&logger));
     let proxy_addr = "[::1]:50051"
         .parse()
         .expect("failed to parse proxy address");
 
-    Server::builder()
+    let serve_result = Server::builder()
         .add_service(pb::etcdserverpb::kv_server::KvServer::new(
             proxy_service.clone(),
         ))
@@ -41,6 +42,8 @@ async fn main() {
             proxy_service.clone(),
         ))
         .serve(proxy_addr)
-        .await
-        .unwrap();
+        .await;
+
+    logger.flush().await;
+    serve_result.unwrap();
 }
