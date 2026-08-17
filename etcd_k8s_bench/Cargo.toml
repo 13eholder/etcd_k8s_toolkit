@@ -1,0 +1,16 @@
+[package]
+name = "etcd_k8s_bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "etcd_k8s_bench"
+path = "src/main.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

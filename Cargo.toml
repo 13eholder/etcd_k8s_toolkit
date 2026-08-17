@@ -1,17 +1,17 @@
-[package]
-name = "etcd_proxy_rs"
+[workspace]
+resolver = "3"
+members = ["etcd_proxy", "etcd_k8s_bench"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "etcd_proxy_rs"
-path = "src/main.rs"
-
-[dependencies]
-serde_json = "1.0"
-tonic = "0.14"
+[workspace.dependencies]
+async-stream = "0.2"
 prost = "0.14"
-tonic-prost = "0.14"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1", features = [
     "fs",
     "io-util",
@@ -20,11 +20,10 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-serde = { version = "1.0", features = ["derive"] }
 tokio-stream = "0.1"
-async-stream = "0.2"
-rand = "0.8"
-
-
-[build-dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+
+[workspace.metadata]
+name = "etcd_k8s_toolkit"

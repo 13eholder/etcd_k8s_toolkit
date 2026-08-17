@@ -145,7 +145,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "etcd_proxy_rs"
+name = "etcd_k8s_bench"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "etcd_proxy"
 version = "0.1.0"
 dependencies = [
  "async-stream",
