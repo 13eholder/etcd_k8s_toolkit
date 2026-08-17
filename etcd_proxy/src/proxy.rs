@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
 use std::mem;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -287,9 +288,12 @@ struct LogEntry {
     request: String,
 }
 
-const LOG_BUFFER_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
-const LOG_CHANNEL_CAPACITY: usize = 4096;
-const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+#[derive(Debug, Clone, Copy)]
+pub struct LoggerOptions {
+    pub buffer_capacity_bytes: usize,
+    pub channel_capacity: usize,
+    pub flush_interval: Duration,
+}
 
 enum LogCommand {
     Entry(LogEntry),
@@ -306,15 +310,15 @@ pub struct Logger {
 }
 
 impl Logger {
-    pub fn new(file_path: &str) -> Self {
+    pub fn new(file_path: impl AsRef<Path>, options: LoggerOptions) -> Self {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(file_path)
             .expect("failed to open log file");
         let file = tokio::fs::File::from_std(file);
-        let (sender, receiver) = mpsc::channel(LOG_CHANNEL_CAPACITY);
-        tokio::spawn(run_logger(file, receiver));
+        let (sender, receiver) = mpsc::channel(options.channel_capacity);
+        tokio::spawn(run_logger(file, receiver, options));
 
         Logger { sender }
     }
@@ -336,12 +340,28 @@ impl Logger {
     }
 }
 
-async fn run_logger(file: tokio::fs::File, receiver: mpsc::Receiver<LogCommand>) {
+async fn run_logger(
+    file: tokio::fs::File,
+    receiver: mpsc::Receiver<LogCommand>,
+    options: LoggerOptions,
+) {
     let (batch_sender, batch_receiver) = mpsc::channel(1);
     let (empty_buffer_sender, empty_buffer_receiver) = mpsc::channel(1);
-    let writer = tokio::spawn(write_batches(file, batch_receiver, empty_buffer_sender));
+    let writer = tokio::spawn(write_batches(
+        file,
+        batch_receiver,
+        empty_buffer_sender,
+        options.buffer_capacity_bytes,
+    ));
 
-    collect_entries(receiver, batch_sender, empty_buffer_receiver).await;
+    collect_entries(
+        receiver,
+        batch_sender,
+        empty_buffer_receiver,
+        options.buffer_capacity_bytes,
+        options.flush_interval,
+    )
+    .await;
     writer.await.expect("log writer task failed");
 }
 
@@ -349,10 +369,12 @@ async fn collect_entries(
     mut receiver: mpsc::Receiver<LogCommand>,
     batch_sender: mpsc::Sender<WriteBatch>,
     mut empty_buffer_receiver: mpsc::Receiver<Vec<u8>>,
+    buffer_capacity_bytes: usize,
+    flush_interval: Duration,
 ) {
-    let mut active = Vec::with_capacity(LOG_BUFFER_CAPACITY_BYTES);
-    let mut standby = Some(Vec::with_capacity(LOG_BUFFER_CAPACITY_BYTES));
-    let mut flush_interval = tokio::time::interval(LOG_FLUSH_INTERVAL);
+    let mut active = Vec::with_capacity(buffer_capacity_bytes);
+    let mut standby = Some(Vec::with_capacity(buffer_capacity_bytes));
+    let mut flush_interval = tokio::time::interval(flush_interval);
     flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     flush_interval.tick().await;
 
@@ -364,7 +386,7 @@ async fn collect_entries(
                         serde_json::to_writer(&mut active, &entry)
                             .expect("failed to serialize log entry");
                         active.push(b'\n');
-                        if active.len() >= LOG_BUFFER_CAPACITY_BYTES {
+                        if active.len() >= buffer_capacity_bytes {
                             submit_buffer(
                                 &mut active,
                                 &mut standby,
@@ -439,6 +461,7 @@ async fn write_batches(
     mut file: tokio::fs::File,
     mut batch_receiver: mpsc::Receiver<WriteBatch>,
     empty_buffer_sender: mpsc::Sender<Vec<u8>>,
+    buffer_capacity_bytes: usize,
 ) {
     while let Some(batch) = batch_receiver.recv().await {
         if !batch.bytes.is_empty() {
@@ -454,7 +477,7 @@ async fn write_batches(
 
         let mut bytes = batch.bytes;
         bytes.clear();
-        bytes.shrink_to(LOG_BUFFER_CAPACITY_BYTES);
+        bytes.shrink_to(buffer_capacity_bytes);
         let _ = empty_buffer_sender.send(bytes).await;
     }
 }
@@ -478,6 +501,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         path
     }
+    fn logger_options(buffer_capacity_bytes: usize, flush_interval: Duration) -> LoggerOptions {
+        LoggerOptions {
+            buffer_capacity_bytes,
+            channel_capacity: 16,
+            flush_interval,
+        }
+    }
 
     async fn wait_for_file_size(path: &std::path::Path, minimum_bytes: u64) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -498,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn logger_appends_json_lines() {
         let path = test_log_path("appends");
-        let logger = Logger::new(path.to_str().expect("log path is not UTF-8"));
+        let logger = Logger::new(&path, logger_options(1024, Duration::from_secs(1)));
 
         logger
             .log(LogEntry {
@@ -527,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn logger_flushes_on_interval() {
         let path = test_log_path("interval");
-        let logger = Logger::new(path.to_str().expect("log path is not UTF-8"));
+        let logger = Logger::new(&path, logger_options(1024, Duration::from_millis(20)));
 
         logger
             .log(LogEntry {
@@ -546,17 +576,20 @@ mod tests {
     #[tokio::test]
     async fn logger_flushes_at_buffer_capacity() {
         let path = test_log_path("capacity");
-        let logger = Logger::new(path.to_str().expect("log path is not UTF-8"));
-
+        let buffer_capacity_bytes = 128;
+        let logger = Logger::new(
+            &path,
+            logger_options(buffer_capacity_bytes, Duration::from_secs(1)),
+        );
         logger
             .log(LogEntry {
                 timestamp_ms: 1,
                 method: "/etcdserverpb.KV/Put",
-                request: "x".repeat(LOG_BUFFER_CAPACITY_BYTES),
+                request: "x".repeat(buffer_capacity_bytes),
             })
             .await;
 
-        wait_for_file_size(&path, LOG_BUFFER_CAPACITY_BYTES as u64).await;
+        wait_for_file_size(&path, buffer_capacity_bytes as u64).await;
         let content = std::fs::read_to_string(&path).expect("failed to read log file");
         assert!(content.contains("\"method\":\"/etcdserverpb.KV/Put\""));
         let _ = std::fs::remove_file(path);
