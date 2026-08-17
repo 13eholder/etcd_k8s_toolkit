@@ -14,14 +14,19 @@ use crate::pb::etcdserverpb::kv_client::KvClient;
 use crate::pb::etcdserverpb::kv_server::Kv;
 use crate::pb::etcdserverpb::lease_client::LeaseClient;
 use crate::pb::etcdserverpb::lease_server::Lease;
+use crate::pb::etcdserverpb::maintenance_client::MaintenanceClient;
+use crate::pb::etcdserverpb::maintenance_server::Maintenance;
 use crate::pb::etcdserverpb::watch_client::WatchClient;
 use crate::pb::etcdserverpb::watch_server::Watch;
 use crate::pb::etcdserverpb::{
-    CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse,
-    LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
-    LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
-    LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, PutRequest, PutResponse, RangeRequest,
-    RangeResponse, TxnRequest, TxnResponse, WatchRequest, WatchResponse,
+    AlarmRequest, AlarmResponse, CompactionRequest, CompactionResponse, DefragmentRequest,
+    DefragmentResponse, DeleteRangeRequest, DeleteRangeResponse, HashKvRequest, HashKvResponse,
+    HashRequest, HashResponse, LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest,
+    LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest,
+    LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, MoveLeaderRequest,
+    MoveLeaderResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, SnapshotRequest,
+    SnapshotResponse, StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest,
+    WatchResponse,
 };
 
 #[derive(Clone)]
@@ -29,6 +34,7 @@ pub struct ProxyService {
     kv_client: KvClient<Channel>,
     watch_client: WatchClient<Channel>,
     lease_client: LeaseClient<Channel>,
+    maintenance_client: MaintenanceClient<Channel>,
     logger: Arc<Logger>,
 }
 
@@ -37,12 +43,14 @@ impl ProxyService {
         kv_client: KvClient<Channel>,
         watch_client: WatchClient<Channel>,
         lease_client: LeaseClient<Channel>,
+        maintenance_client: MaintenanceClient<Channel>,
         logger: Arc<Logger>,
     ) -> Self {
         ProxyService {
             kv_client,
             watch_client,
             lease_client,
+            maintenance_client,
             logger,
         }
     }
@@ -91,6 +99,78 @@ impl Kv for ProxyService {
             .await;
         let mut kv_client = self.kv_client.clone();
         kv_client.compact(request).await
+    }
+}
+
+#[tonic::async_trait]
+impl Maintenance for ProxyService {
+    async fn alarm(
+        &self,
+        request: Request<AlarmRequest>,
+    ) -> Result<Response<AlarmResponse>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/Alarm", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.alarm(request).await
+    }
+
+    async fn status(
+        &self,
+        request: Request<StatusRequest>,
+    ) -> Result<Response<StatusResponse>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/Status", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.status(request).await
+    }
+
+    async fn defragment(
+        &self,
+        request: Request<DefragmentRequest>,
+    ) -> Result<Response<DefragmentResponse>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/Defragment", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.defragment(request).await
+    }
+
+    async fn hash(&self, request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/Hash", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.hash(request).await
+    }
+
+    async fn hash_kv(
+        &self,
+        request: Request<HashKvRequest>,
+    ) -> Result<Response<HashKvResponse>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/HashKV", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.hash_kv(request).await
+    }
+
+    type SnapshotStream = tonic::codec::Streaming<SnapshotResponse>;
+
+    async fn snapshot(
+        &self,
+        request: Request<SnapshotRequest>,
+    ) -> Result<Response<Self::SnapshotStream>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/Snapshot", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.snapshot(request).await
+    }
+
+    async fn move_leader(
+        &self,
+        request: Request<MoveLeaderRequest>,
+    ) -> Result<Response<MoveLeaderResponse>, Status> {
+        self.log_request("/etcdserverpb.Maintenance/MoveLeader", request.get_ref())
+            .await;
+        let mut maintenance_client = self.maintenance_client.clone();
+        maintenance_client.move_leader(request).await
     }
 }
 
