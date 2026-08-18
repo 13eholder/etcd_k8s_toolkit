@@ -19,6 +19,7 @@ tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
     "sync",
+    "signal",
     "time",
 ] }
 tokio-stream = "0.1"

@@ -1,0 +1,450 @@
+use std::{fmt, fs, net::SocketAddr, path::Path, time::Duration};
+
+use crate::metrics::{PoolName, ResourceName, WorkloadName};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub endpoint: String,
+    pub workload: WorkloadSpec,
+    pub pod_size: usize,
+    pub nodes: u64,
+    pub rate_scale: f64,
+    pub time_scale: f64,
+    pub workers: usize,
+    pub queue_capacity: usize,
+    pub request_timeout: Duration,
+    pub operation_timeout: Duration,
+    pub max_message_size: usize,
+    pub metrics_listen: SocketAddr,
+    pub seed: u64,
+}
+
+#[cfg(test)]
+pub const DEFAULT_POD_SIZE_BYTES: usize = 4096;
+#[cfg(test)]
+pub const DEFAULT_NODE_COUNT: u64 = 2003;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkloadSpec {
+    pub name: String,
+    pub pod_size_bytes: usize,
+    pub nodes: NodeSpec,
+    pub timeline: Vec<TimelineSegment>,
+    pub resources: Vec<ResourceSpec>,
+    pub ranges: Vec<RangeSpec>,
+    #[serde(default)]
+    pub etcd_lease_pools: Vec<EtcdLeasePoolSpec>,
+    #[serde(default)]
+    pub status_count: u64,
+    #[serde(default)]
+    pub compact_interval_s: f64,
+    pub master_lease_interval_s: f64,
+    #[serde(default)]
+    pub cas_conflicts: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct NodeSpec {
+    pub count: u64,
+    pub status_interval_s: f64,
+    pub lease_interval_s: f64,
+    pub lease_jitter: f64,
+    pub status_retry_limit: u32,
+    pub lease_retry_limit: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TimelineSegment {
+    pub duration_s: f64,
+    pub application_txn_rps: f64,
+    pub range_rps: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResourceSpec {
+    pub name: String,
+    pub key_pattern: String,
+    pub unique_keys: u64,
+    pub create_weight: f64,
+    pub update_weight: f64,
+    pub delete_weight: f64,
+    pub value_size_bytes: usize,
+    pub retry_policy: RetryPolicy,
+    #[serde(default)]
+    pub lease_pool: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct RangeSpec {
+    pub key_pattern: String,
+    pub kind: String,
+    pub limit: u64,
+    pub count_only: bool,
+    pub weight: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct EtcdLeasePoolSpec {
+    pub name: String,
+    pub object_ttl_s: f64,
+    pub reuse_s: f64,
+    pub max_objects: u64,
+    #[serde(default)]
+    pub keep_alive: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPolicy {
+    CreateOnly,
+    GuaranteedUpdate,
+    ConditionalDelete,
+    Event,
+    MasterLease,
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
+    Json(serde_json::Error),
+    Invalid(String),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => write!(f, "cannot read config {path}: {source}"),
+            Self::Json(source) => write!(f, "invalid workload JSON: {source}"),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Json(source) => Some(source),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+impl WorkloadSpec {
+    pub fn from_json(input: &str) -> Result<Self, ConfigError> {
+        let spec: Self = serde_json::from_str(input).map_err(ConfigError::Json)?;
+        spec.validate(usize::MAX)?;
+        Ok(spec)
+    }
+
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let input = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Self::from_json(&input)
+    }
+
+    pub fn validate(&self, max_message_size: usize) -> Result<(), ConfigError> {
+        WorkloadName::new(self.name.clone()).map_err(|error| {
+            ConfigError::Invalid(format!("name is not a valid metric label: {error}"))
+        })?;
+        if self.pod_size_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "pod_size_bytes must be greater than zero".into(),
+            ));
+        }
+        if self.pod_size_bytes > max_message_size {
+            return Err(ConfigError::Invalid(format!(
+                "pod_size_bytes ({}) exceeds max_message_size ({max_message_size})",
+                self.pod_size_bytes
+            )));
+        }
+        self.nodes.validate()?;
+        if self.timeline.is_empty() {
+            return Err(ConfigError::Invalid("timeline must not be empty".into()));
+        }
+        for (index, segment) in self.timeline.iter().enumerate() {
+            if !segment.duration_s.is_finite() || segment.duration_s <= 0.0 {
+                return Err(ConfigError::Invalid(format!(
+                    "timeline[{index}].duration_s must be greater than zero"
+                )));
+            }
+            for (field, value) in [
+                ("application_txn_rps", segment.application_txn_rps),
+                ("range_rps", segment.range_rps),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "timeline[{index}].{field} must be non-negative"
+                    )));
+                }
+            }
+        }
+
+        for (index, resource) in self.resources.iter().enumerate() {
+            ResourceName::new(resource.name.clone()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "resources[{index}].name is not a valid metric label: {error}"
+                ))
+            })?;
+            resource.validate(index, max_message_size)?;
+            if let Some(pool) = &resource.lease_pool {
+                if !self
+                    .etcd_lease_pools
+                    .iter()
+                    .any(|candidate| candidate.name == *pool)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "resources[{index}].lease_pool references unknown pool {pool:?}"
+                    )));
+                }
+            }
+        }
+        for (index, range) in self.ranges.iter().enumerate() {
+            range.validate(index)?;
+        }
+        for (index, pool) in self.etcd_lease_pools.iter().enumerate() {
+            PoolName::new(pool.name.clone()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "etcd_lease_pools[{index}].name is not a valid metric label: {error}"
+                ))
+            })?;
+            pool.validate(index)?;
+        }
+        if self.compact_interval_s <= 0.0 || !self.compact_interval_s.is_finite() {
+            return Err(ConfigError::Invalid(
+                "compact_interval_s must be greater than zero".into(),
+            ));
+        }
+        if !self.master_lease_interval_s.is_finite() || self.master_lease_interval_s <= 0.0 {
+            return Err(ConfigError::Invalid(
+                "master_lease_interval_s must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl NodeSpec {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.count == 0 {
+            return Err(ConfigError::Invalid(
+                "nodes.count must be greater than zero".into(),
+            ));
+        }
+        for (field, value) in [
+            ("status_interval_s", self.status_interval_s),
+            ("lease_interval_s", self.lease_interval_s),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::Invalid(format!(
+                    "nodes.{field} must be greater than zero"
+                )));
+            }
+        }
+        if !self.lease_jitter.is_finite() || !(0.0..1.0).contains(&self.lease_jitter) {
+            return Err(ConfigError::Invalid(
+                "nodes.lease_jitter must be in [0, 1)".into(),
+            ));
+        }
+        if self.status_retry_limit == 0 {
+            return Err(ConfigError::Invalid(
+                "nodes.status_retry_limit must be greater than zero".into(),
+            ));
+        }
+        if self.lease_retry_limit == 0 {
+            return Err(ConfigError::Invalid(
+                "nodes.lease_retry_limit must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ResourceSpec {
+    fn validate(&self, index: usize, max_message_size: usize) -> Result<(), ConfigError> {
+        if self.name.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "resources[{index}].name must not be empty"
+            )));
+        }
+        if self.key_pattern.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "resources[{index}].key_pattern must not be empty"
+            )));
+        }
+        if self.unique_keys == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "resources[{index}].unique_keys must be greater than zero"
+            )));
+        }
+        for (field, value) in [
+            ("create_weight", self.create_weight),
+            ("update_weight", self.update_weight),
+            ("delete_weight", self.delete_weight),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError::Invalid(format!(
+                    "resources[{index}].{field} must be non-negative"
+                )));
+            }
+        }
+        if self.create_weight + self.update_weight + self.delete_weight <= 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "resources[{index}] operation weights must sum to a positive value"
+            )));
+        }
+        if self.value_size_bytes == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "resources[{index}].value_size_bytes must be greater than zero"
+            )));
+        }
+        if self.value_size_bytes > max_message_size {
+            return Err(ConfigError::Invalid(format!(
+                "resources[{index}].value_size_bytes ({}) exceeds max_message_size ({max_message_size})",
+                self.value_size_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RangeSpec {
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        if self.key_pattern.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "ranges[{index}].key_pattern must not be empty"
+            )));
+        }
+        if self.kind != "point" && self.kind != "prefix" {
+            return Err(ConfigError::Invalid(format!(
+                "ranges[{index}].kind must be point or prefix"
+            )));
+        }
+        if !self.weight.is_finite() || self.weight <= 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "ranges[{index}].weight must be greater than zero"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl EtcdLeasePoolSpec {
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        if self.name.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "etcd_lease_pools[{index}].name must not be empty"
+            )));
+        }
+        if !self.object_ttl_s.is_finite() || self.object_ttl_s <= 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "etcd_lease_pools[{index}].object_ttl_s must be greater than zero"
+            )));
+        }
+        if !self.reuse_s.is_finite() || self.reuse_s < 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "etcd_lease_pools[{index}].reuse_s must be non-negative"
+            )));
+        }
+        if self.max_objects == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "etcd_lease_pools[{index}].max_objects must be greater than zero"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn embedded() -> WorkloadSpec {
+        WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap()
+    }
+    #[test]
+    fn embedded_density_preserves_resource_and_lease_shapes() {
+        let spec = embedded();
+        assert_eq!(
+            spec.timeline
+                .iter()
+                .map(|segment| segment.duration_s)
+                .sum::<f64>(),
+            2_310.0
+        );
+        assert_eq!(spec.master_lease_interval_s, 10.0);
+        assert_eq!(spec.cas_conflicts, 0);
+        assert_eq!(spec.pod_size_bytes, 4096);
+        assert_eq!(spec.nodes.count, 2003);
+
+        let event = spec
+            .resources
+            .iter()
+            .find(|resource| resource.name == "events")
+            .unwrap();
+        assert_eq!(event.unique_keys, 45_432);
+        assert_eq!(event.create_weight, 45_432.0);
+        assert_eq!(event.update_weight, 266.0);
+        assert_eq!(event.delete_weight, 1.0);
+
+        let pool = spec
+            .etcd_lease_pools
+            .iter()
+            .find(|pool| pool.name == "events")
+            .unwrap();
+        assert_eq!(pool.object_ttl_s + pool.reuse_s, 3_660.0);
+        assert_eq!(pool.object_ttl_s, 3_600.0);
+        assert_eq!(pool.reuse_s, 60.0);
+    }
+
+    #[test]
+    fn rejects_zero_nodes() {
+        let mut spec = embedded();
+        spec.nodes.count = 0;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("nodes.count"));
+    }
+
+    #[test]
+    fn rejects_zero_pod_size() {
+        let mut spec = embedded();
+        spec.pod_size_bytes = 0;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("pod_size_bytes"));
+    }
+
+    #[test]
+    fn rejects_jitter_outside_half_open_interval() {
+        let mut spec = embedded();
+        spec.nodes.lease_jitter = 1.0;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("lease_jitter"));
+    }
+
+    #[test]
+    fn rejects_empty_timeline() {
+        let mut spec = embedded();
+        spec.timeline.clear();
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("timeline"));
+    }
+    #[test]
+    fn rejects_invalid_metric_labels() {
+        let mut spec = embedded();
+        spec.name = "invalid label".into();
+        assert!(spec.validate(64 * 1024 * 1024).is_err());
+        spec.name = "density".into();
+        spec.resources[0].name = "invalid label".into();
+        assert!(spec.validate(64 * 1024 * 1024).is_err());
+        spec.resources[0].name = "pods".into();
+        spec.etcd_lease_pools[0].name = "invalid label".into();
+        assert!(spec.validate(64 * 1024 * 1024).is_err());
+    }
+}
