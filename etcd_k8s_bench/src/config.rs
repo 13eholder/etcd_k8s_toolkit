@@ -34,6 +34,8 @@ pub struct WorkloadSpec {
     pub resources: Vec<ResourceSpec>,
     pub ranges: Vec<RangeSpec>,
     #[serde(default)]
+    pub range_fixtures: Vec<RangeFixtureSpec>,
+    #[serde(default)]
     pub etcd_lease_pools: Vec<EtcdLeasePoolSpec>,
     #[serde(default)]
     pub status_count: u64,
@@ -42,6 +44,10 @@ pub struct WorkloadSpec {
     pub master_lease_interval_s: f64,
     #[serde(default)]
     pub cas_conflicts: u64,
+    #[serde(default)]
+    pub range_limit_10000_count: u64,
+    #[serde(default)]
+    pub range_count_only_count: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -82,6 +88,14 @@ pub struct RangeSpec {
     pub limit: u64,
     pub count_only: bool,
     pub weight: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct RangeFixtureSpec {
+    pub name: String,
+    pub key_pattern: String,
+    pub count: u64,
+    pub value_size_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -209,6 +223,9 @@ impl WorkloadSpec {
         for (index, range) in self.ranges.iter().enumerate() {
             range.validate(index)?;
         }
+        for (index, fixture) in self.range_fixtures.iter().enumerate() {
+            fixture.validate(index, max_message_size)?;
+        }
         for (index, pool) in self.etcd_lease_pools.iter().enumerate() {
             PoolName::new(pool.name.clone()).map_err(|error| {
                 ConfigError::Invalid(format!(
@@ -225,6 +242,32 @@ impl WorkloadSpec {
         if !self.master_lease_interval_s.is_finite() || self.master_lease_interval_s <= 0.0 {
             return Err(ConfigError::Invalid(
                 "master_lease_interval_s must be greater than zero".into(),
+            ));
+        }
+        let total_range_weight = self.ranges.iter().map(|range| range.weight).sum::<f64>();
+        let prefix_range_weight = self
+            .ranges
+            .iter()
+            .filter(|range| range.kind == "prefix")
+            .map(|range| range.weight)
+            .sum::<f64>();
+        let base_range_total = self
+            .timeline
+            .iter()
+            .map(|segment| (segment.range_rps * segment.duration_s).floor() as u64)
+            .sum::<u64>();
+        let prefix_capacity = if total_range_weight > 0.0 {
+            (base_range_total as f64 * prefix_range_weight / total_range_weight).floor() as u64
+        } else {
+            0
+        };
+        if self
+            .range_limit_10000_count
+            .saturating_add(self.range_count_only_count)
+            > prefix_capacity
+        {
+            return Err(ConfigError::Invalid(
+                "range shape counts must not exceed scheduled prefix Range capacity".into(),
             ));
         }
         Ok(())
@@ -336,6 +379,32 @@ impl RangeSpec {
     }
 }
 
+impl RangeFixtureSpec {
+    fn validate(&self, index: usize, max_message_size: usize) -> Result<(), ConfigError> {
+        ResourceName::new(self.name.clone()).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "range_fixtures[{index}].name is not a valid metric label: {error}"
+            ))
+        })?;
+        if self.key_pattern.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "range_fixtures[{index}].key_pattern must not be empty"
+            )));
+        }
+        if self.count == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "range_fixtures[{index}].count must be greater than zero"
+            )));
+        }
+        if self.value_size_bytes == 0 || self.value_size_bytes > max_message_size {
+            return Err(ConfigError::Invalid(format!(
+                "range_fixtures[{index}].value_size_bytes must be in 1..={max_message_size}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl EtcdLeasePoolSpec {
     fn validate(&self, index: usize) -> Result<(), ConfigError> {
         if self.name.trim().is_empty() {
@@ -381,6 +450,9 @@ mod tests {
         );
         assert_eq!(spec.master_lease_interval_s, 10.0);
         assert_eq!(spec.cas_conflicts, 0);
+        assert_eq!(spec.range_limit_10000_count, 2_720);
+        assert_eq!(spec.range_count_only_count, 220);
+        assert_eq!(spec.range_fixtures.len(), 2);
         assert_eq!(spec.pod_size_bytes, 4096);
         assert_eq!(spec.nodes.count, 2003);
 
@@ -446,5 +518,56 @@ mod tests {
         spec.resources[0].name = "pods".into();
         spec.etcd_lease_pools[0].name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
+        spec.etcd_lease_pools[0].name = "events".into();
+        spec.range_fixtures[0].name = "invalid label".into();
+        assert!(spec.validate(64 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn range_shape_validation_uses_scheduled_capacity_not_raw_weight() {
+        let mut spec = embedded();
+        spec.timeline = vec![TimelineSegment {
+            duration_s: 10.0,
+            application_txn_rps: 0.0,
+            range_rps: 100.0,
+        }];
+        spec.ranges = vec![RangeSpec {
+            key_pattern: "/registry/test/".into(),
+            kind: "prefix".into(),
+            limit: 500,
+            count_only: false,
+            weight: 1.0,
+        }];
+        spec.range_limit_10000_count = 10;
+        spec.range_count_only_count = 0;
+        assert!(spec.validate(64 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn range_shape_validation_uses_per_segment_capacity_floor() {
+        let mut spec = embedded();
+        spec.timeline = vec![
+            TimelineSegment {
+                duration_s: 1.0,
+                application_txn_rps: 0.0,
+                range_rps: 0.5,
+            },
+            TimelineSegment {
+                duration_s: 1.0,
+                application_txn_rps: 0.0,
+                range_rps: 0.5,
+            },
+        ];
+        spec.ranges = vec![RangeSpec {
+            key_pattern: "/registry/test/".into(),
+            kind: "prefix".into(),
+            limit: 500,
+            count_only: false,
+            weight: 1.0,
+        }];
+        spec.range_limit_10000_count = 1;
+        spec.range_count_only_count = 0;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("scheduled prefix Range capacity"));
     }
 }

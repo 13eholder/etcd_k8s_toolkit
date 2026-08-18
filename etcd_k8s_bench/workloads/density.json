@@ -78,6 +78,10 @@
     {"key_pattern":"/registry/resourcequotas","kind":"point","limit":0,"count_only":false,"weight":40},
     {"key_pattern":"/registry/persistentvolumeclaims","kind":"point","limit":0,"count_only":false,"weight":40}
   ],
+  "range_fixtures": [
+    {"name":"services_fixture","key_pattern":"/registry/services/bench-{ns}/{id}","count":100,"value_size_bytes":1024},
+    {"name":"endpointslices_fixture","key_pattern":"/registry/endpointslices/bench-{ns}/{id}","count":100,"value_size_bytes":1024}
+  ],
   "etcd_lease_pools": [
     {"name":"events","object_ttl_s":3600,"reuse_s":60,"max_objects":1000,"keep_alive":false},
     {"name":"masterleases","object_ttl_s":15,"reuse_s":0,"max_objects":1,"keep_alive":false}
@@ -85,5 +89,7 @@
   "status_count": 61,
   "compact_interval_s": 300,
   "master_lease_interval_s": 10,
-  "cas_conflicts": 0
+  "cas_conflicts": 0,
+  "range_limit_10000_count": 2720,
+  "range_count_only_count": 220
 }

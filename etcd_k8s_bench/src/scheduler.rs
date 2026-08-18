@@ -12,8 +12,8 @@ use crate::{
     },
     pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse},
     workload::{
-        CasDecision, CasLoop, KeyState, ResourceOperation, RetryPolicy as CasRetryPolicy,
-        TxnAttempt, build_compact_revision_txn,
+        CasDecision, CasLoop, ExhaustedReason, KeyState, ResourceOperation,
+        RetryPolicy as CasRetryPolicy, TxnAttempt, build_compact_revision_txn, failure_version,
     },
 };
 use std::{
@@ -45,11 +45,16 @@ pub enum WorkItem {
         item: HeartbeatItem,
         done: oneshot::Sender<Result<(), String>>,
     },
+    BootstrapFixture {
+        name: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        done: oneshot::Sender<Result<(), String>>,
+    },
     Status,
     CompactTick {
         observed_revision: i64,
         previous_revision: Option<i64>,
-        expected_version: i64,
     },
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -412,6 +417,7 @@ fn next_present_id(resource: &mut ResourceQuota) -> Option<u64> {
     }
     None
 }
+#[derive(Clone)]
 struct RangeProducer {
     deficits: Vec<f64>,
     total: f64,
@@ -442,6 +448,77 @@ impl RangeProducer {
     }
 }
 
+struct RangeShapePlan {
+    prefix_total: u64,
+    seen: u64,
+    limit_10000: u64,
+    count_only: u64,
+}
+
+impl RangeShapePlan {
+    fn new(prefix_total: u64, limit_10000: u64, count_only: u64) -> Self {
+        Self {
+            prefix_total,
+            seen: 0,
+            limit_10000,
+            count_only,
+        }
+    }
+
+    fn takes(slot: u64, target: u64, total: u64) -> bool {
+        if total == 0 {
+            return false;
+        }
+        let before = slot as u128 * target as u128 / total as u128;
+        let after = (slot + 1) as u128 * target as u128 / total as u128;
+        after > before
+    }
+
+    fn apply(&mut self, request: &mut RangeRequest) {
+        let slot = self.seen;
+        self.seen = self.seen.saturating_add(1);
+        let shaped_total = self.limit_10000.saturating_add(self.count_only);
+        if !Self::takes(slot, shaped_total, self.prefix_total) {
+            return;
+        }
+        let shaped_before = slot as u128 * shaped_total as u128 / self.prefix_total.max(1) as u128;
+        let shaped_ordinal = shaped_before as u64;
+        if Self::takes(shaped_ordinal, self.count_only, shaped_total) {
+            request.count_only = true;
+        } else {
+            request.limit = 10_000;
+        }
+    }
+}
+
+fn exact_prefix_total(
+    mut producer: RangeProducer,
+    weights: &[f64],
+    ranges: &[crate::config::RangeSpec],
+    scheduled_ranges: u64,
+) -> u64 {
+    (0..scheduled_ranges)
+        .filter_map(|_| producer.next(weights))
+        .filter(|index| ranges[*index].kind == "prefix")
+        .count() as u64
+}
+
+fn range_shape_plan(
+    workload: &WorkloadSpec,
+    prefix_total: u64,
+    time_scale: f64,
+) -> Result<RangeShapePlan, String> {
+    let limit_10000 = (workload.range_limit_10000_count as f64 * time_scale).round() as u64;
+    let count_only = (workload.range_count_only_count as f64 * time_scale).round() as u64;
+    if limit_10000.saturating_add(count_only) > prefix_total {
+        return Err(format!(
+            "scaled Range shape count ({}) exceeds scheduled prefix Range capacity ({prefix_total})",
+            limit_10000.saturating_add(count_only)
+        ));
+    }
+    Ok(RangeShapePlan::new(prefix_total, limit_10000, count_only))
+}
+
 fn deterministic_unit(seed: u64, n: u64) -> f64 {
     splitmix(seed.wrapping_add(n)) as f64 / u64::MAX as f64
 }
@@ -459,20 +536,25 @@ fn stable_shard(key: &[u8], workers: usize) -> usize {
             % workers
     }
 }
-fn resource_key(resource: &ResourceSpec, id: u64) -> Vec<u8> {
-    resource
-        .key_pattern
+fn patterned_key(pattern: &str, id: u64) -> Vec<u8> {
+    pattern
         .replace("{ns}", "bench")
         .replace("{id}", &format!("{id:05}"))
         .into_bytes()
 }
-fn resource_value(resource: &ResourceSpec, id: u64, n: u64) -> Vec<u8> {
-    let mut value = vec![0; resource.value_size_bytes];
+fn resource_key(resource: &ResourceSpec, id: u64) -> Vec<u8> {
+    patterned_key(&resource.key_pattern, id)
+}
+fn patterned_value(size: usize, id: u64, n: u64) -> Vec<u8> {
+    let mut value = vec![0; size];
     let marker = splitmix(id ^ n);
     for (i, byte) in value.iter_mut().enumerate() {
         *byte = marker.rotate_left((i % 63) as u32) as u8;
     }
     value
+}
+fn resource_value(resource: &ResourceSpec, id: u64, n: u64) -> Vec<u8> {
+    patterned_value(resource.value_size_bytes, id, n)
 }
 fn prefix_end(mut key: Vec<u8>) -> Vec<u8> {
     for i in (0..key.len()).rev() {
@@ -622,8 +704,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         } else {
             Operation::Update
         };
-        metrics::record_scheduled(operation, &resource.unwrap());
-        stats.scheduled += 1;
         let send_result = tokio::select! {
             _ = &mut ctrl_c => {
                 bootstrap_interrupted = true;
@@ -632,7 +712,36 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             result = senders[shard].send(WorkItem::Bootstrap { item, done: done_tx }) => result,
         };
         send_result.map_err(|_| "bootstrap worker closed".to_string())?;
+        metrics::record_scheduled(operation, &resource.unwrap());
+        stats.scheduled += 1;
         bootstrap_acks.push(done_rx);
+    }
+    if !bootstrap_interrupted {
+        'fixture_send: for fixture in &scheduler.workload.range_fixtures {
+            let label = ResourceName::new(fixture.name.clone()).expect("validated fixture label");
+            for id in 0..fixture.count {
+                let key = patterned_key(&fixture.key_pattern, id);
+                let shard = stable_shard(&key, workers_count);
+                let (done_tx, done_rx) = oneshot::channel();
+                let item = WorkItem::BootstrapFixture {
+                    name: fixture.name.clone(),
+                    value: patterned_value(fixture.value_size_bytes, id, 0),
+                    key,
+                    done: done_tx,
+                };
+                let send_result = tokio::select! {
+                    _ = &mut ctrl_c => {
+                        bootstrap_interrupted = true;
+                        break 'fixture_send;
+                    }
+                    result = senders[shard].send(item) => result,
+                };
+                send_result.map_err(|_| "bootstrap worker closed".to_string())?;
+                metrics::record_scheduled(Operation::Create, &label);
+                stats.scheduled += 1;
+                bootstrap_acks.push(done_rx);
+            }
+        }
     }
     if !bootstrap_interrupted {
         'bootstrap_ack: for done_rx in bootstrap_acks {
@@ -682,6 +791,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
     let mut lifecycle = LifecycleProducer::new(&scheduler.workload, app.total(), scheduler.seed);
     let mut range_producer = RangeProducer::new(scheduler.workload.ranges.iter().map(|r| r.weight));
     let weights: Vec<f64> = scheduler.workload.ranges.iter().map(|r| r.weight).collect();
+    let prefix_total = exact_prefix_total(
+        range_producer.clone(),
+        &weights,
+        &scheduler.workload.ranges,
+        ranges.total(),
+    );
+    let mut range_shapes =
+        range_shape_plan(&scheduler.workload, prefix_total, scheduler.time_scale)?;
     let mut heap = BinaryHeap::new();
     let mut sequence = 0u64;
     let push = |at: Duration,
@@ -705,11 +822,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
     }
     let status_interval =
         Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s * scheduler.time_scale);
-    let status_ticks = if status_interval.is_zero() {
-        0
-    } else {
-        duration.as_nanos() / status_interval.as_nanos()
-    } as u64;
     for node in 0..scheduler.nodes {
         let lease_at = heartbeat_interval(
             scheduler.seed,
@@ -729,15 +841,17 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 &mut sequence,
             );
         }
-        if status_ticks > 0 {
+        if !status_interval.is_zero() {
             let status_at = node_status_phase(node, scheduler.nodes, status_interval);
-            push(
-                status_at,
-                0,
-                Source::NodeStatus { node, tick: 0 },
-                &mut heap,
-                &mut sequence,
-            );
+            if status_at <= duration {
+                push(
+                    status_at,
+                    0,
+                    Source::NodeStatus { node, tick: 0 },
+                    &mut heap,
+                    &mut sequence,
+                );
+            }
         }
     }
     let master_lease_interval =
@@ -824,7 +938,11 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     push(at, 2, Source::Range, &mut heap, &mut sequence);
                 }
                 if let Some(index) = range_producer.next(&weights) {
-                    let request = range_request(&scheduler.workload.ranges[index], event.sequence);
+                    let mut request =
+                        range_request(&scheduler.workload.ranges[index], event.sequence);
+                    if scheduler.workload.ranges[index].kind == "prefix" {
+                        range_shapes.apply(&mut request);
+                    }
                     metrics::record_scheduled(
                         Operation::Read,
                         &ResourceName::new("range").unwrap(),
@@ -944,14 +1062,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     }
                     Err(_) => {}
                 }
-                let next_tick = tick + 1;
-                if next_tick < status_ticks {
+                let next_at = event.at.saturating_add(status_interval);
+                if next_at <= duration {
                     push(
-                        event.at.saturating_add(status_interval),
+                        next_at,
                         0,
                         Source::NodeStatus {
                             node,
-                            tick: next_tick,
+                            tick: tick + 1,
                         },
                         &mut heap,
                         &mut sequence,
@@ -1006,7 +1124,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 let item = WorkItem::CompactTick {
                     observed_revision: observed,
                     previous_revision: previous.filter(|revision| *revision > 0),
-                    expected_version: tick as i64,
                 };
                 match senders[stable_shard(b"compact_rev_key", workers_count)].try_send(item) {
                     Ok(()) => {}
@@ -1079,6 +1196,7 @@ async fn worker_loop(
     cas_conflicts: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let mut states = HashMap::new();
+    let mut compact_version = 0i64;
     while let Some(item) = receiver.recv().await {
         match item {
             WorkItem::Txn {
@@ -1131,6 +1249,8 @@ async fn worker_loop(
                             operation,
                             inject_conflict,
                             retry_policy(spec),
+                            CasRetryPolicy::generic_controller(),
+                            spec.retry_policy == ConfigRetryPolicy::MasterLease,
                             remaining_timeout,
                             lease_id,
                             latest_revision.clone(),
@@ -1178,6 +1298,44 @@ async fn worker_loop(
                 .await;
                 let _ = done.send(result);
             }
+            WorkItem::BootstrapFixture {
+                name,
+                key,
+                value,
+                done,
+            } => {
+                let result = match ResourceName::new(name) {
+                    Ok(label) => {
+                        let policy = CasRetryPolicy {
+                            max_attempts: 1,
+                            delay: Duration::ZERO,
+                            jitter_ratio: 0.0,
+                        };
+                        match execute_txn(
+                            &client,
+                            &label,
+                            &mut states,
+                            key,
+                            value,
+                            ResourceOperation::Create,
+                            false,
+                            policy,
+                            policy,
+                            false,
+                            timeout,
+                            0,
+                            latest_revision.clone(),
+                        )
+                        .await
+                        {
+                            Outcome::Success => Ok(()),
+                            outcome => Err(format!("range fixture create failed: {outcome:?}")),
+                        }
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = done.send(result);
+            }
             WorkItem::Heartbeat(item) => {
                 let _ = execute_heartbeat(
                     &client,
@@ -1216,13 +1374,13 @@ async fn worker_loop(
             WorkItem::CompactTick {
                 observed_revision,
                 previous_revision,
-                expected_version,
             } => {
                 execute_compact_tick(
                     &client,
                     observed_revision,
                     previous_revision,
-                    expected_version,
+                    &mut compact_version,
+                    timeout,
                     latest_revision.clone(),
                 )
                 .await;
@@ -1235,83 +1393,128 @@ async fn execute_compact_tick(
     client: &ClientBundle,
     observed_revision: i64,
     previous_revision: Option<i64>,
-    expected_version: i64,
+    coordination_version: &mut i64,
+    timeout: Duration,
     latest_revision: Arc<AtomicI64>,
 ) {
     let coordination_revision = previous_revision.unwrap_or(observed_revision);
     let value = coordination_revision.to_string();
     let label = ResourceName::new("compact_rev_key").unwrap();
-    let operation = if expected_version == 0 {
+    let operation = if previous_revision.is_none() {
         Operation::Create
     } else {
         Operation::Update
     };
-    let start = Instant::now();
-    metrics::add_inflight(Rpc::Txn);
-    let result = client
-        .txn(build_compact_revision_txn(
-            value.as_bytes(),
-            expected_version,
-        ))
-        .await;
-    metrics::remove_inflight(Rpc::Txn);
-    metrics::record_request_duration(Rpc::Txn, start.elapsed());
-    metrics::record_request_bytes(&label, b"compact_rev_key".len() + value.len());
-    let response = match result {
-        Ok(response) => {
-            metrics::record_request(Rpc::Txn, Outcome::Success);
-            response
-        }
-        Err(_) => {
-            metrics::record_request(Rpc::Txn, Outcome::GrpcError);
-            metrics::record_operation(operation, &label, Outcome::GrpcError);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            metrics::record_operation(operation, &label, Outcome::Timeout);
+            if previous_revision.is_some() {
+                metrics::record_operation(
+                    Operation::Compact,
+                    &ResourceName::new("compact").unwrap(),
+                    Outcome::Timeout,
+                );
+            }
             return;
         }
-    };
-    if let Some(header) = response.header.as_ref() {
-        update_revision(&latest_revision, header.revision);
-    }
-    metrics::record_txn(
-        &label,
-        TxnShape::CompactRevision,
+        let request = build_compact_revision_txn(value.as_bytes(), *coordination_version);
+        let start = Instant::now();
+        metrics::add_inflight(Rpc::Txn);
+        let result = time::timeout(remaining, client.txn(request)).await;
+        metrics::remove_inflight(Rpc::Txn);
+        metrics::record_request_duration(Rpc::Txn, start.elapsed());
+        metrics::record_request_bytes(&label, b"compact_rev_key".len() + value.len());
+        let response = match result {
+            Ok(Ok(response)) => {
+                metrics::record_request(Rpc::Txn, Outcome::Success);
+                response
+            }
+            Ok(Err(_)) => {
+                metrics::record_request(Rpc::Txn, Outcome::GrpcError);
+                metrics::record_operation(operation, &label, Outcome::GrpcError);
+                if previous_revision.is_some() {
+                    metrics::record_operation(
+                        Operation::Compact,
+                        &ResourceName::new("compact").unwrap(),
+                        Outcome::GrpcError,
+                    );
+                }
+                return;
+            }
+            Err(_) => {
+                metrics::record_request(Rpc::Txn, Outcome::Timeout);
+                metrics::record_operation(operation, &label, Outcome::Timeout);
+                if previous_revision.is_some() {
+                    metrics::record_operation(
+                        Operation::Compact,
+                        &ResourceName::new("compact").unwrap(),
+                        Outcome::Timeout,
+                    );
+                }
+                return;
+            }
+        };
+        if let Some(header) = response.header.as_ref() {
+            update_revision(&latest_revision, header.revision);
+        }
+        metrics::record_txn(
+            &label,
+            TxnShape::CompactRevision,
+            if response.succeeded {
+                TxnResult::Committed
+            } else {
+                TxnResult::Conflict
+            },
+        );
         if response.succeeded {
-            TxnResult::Committed
-        } else {
-            TxnResult::Conflict
-        },
-    );
-    if !response.succeeded {
-        metrics::record_operation(operation, &label, Outcome::GrpcError);
-        return;
+            *coordination_version = coordination_version.saturating_add(1);
+            metrics::record_operation(operation, &label, Outcome::Success);
+            break;
+        }
+        *coordination_version = failure_version(&response).unwrap_or(0);
+        metrics::record_cas_retry(&label, operation);
     }
-    metrics::record_operation(operation, &label, Outcome::Success);
 
     let Some(revision) = previous_revision else {
         return;
     };
     let compact = ResourceName::new("compact").unwrap();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        metrics::record_operation(Operation::Compact, &compact, Outcome::Timeout);
+        return;
+    }
     let start = Instant::now();
     metrics::add_inflight(Rpc::Compact);
-    let result = client
-        .compact(CompactionRequest {
+    let result = time::timeout(
+        remaining,
+        client.compact(CompactionRequest {
             revision,
             physical: false,
-        })
-        .await;
+        }),
+    )
+    .await;
     metrics::remove_inflight(Rpc::Compact);
     metrics::record_request_duration(Rpc::Compact, start.elapsed());
     metrics::record_request_bytes(&compact, 8);
     let outcome = match result {
-        Ok(response) => {
+        Ok(Ok(response)) => {
             if let Some(header) = response.header.as_ref() {
                 update_revision(&latest_revision, header.revision);
             }
             metrics::record_request(Rpc::Compact, Outcome::Success);
             Outcome::Success
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             metrics::record_request(Rpc::Compact, Outcome::GrpcError);
             Outcome::GrpcError
+        }
+        Err(_) => {
+            metrics::record_request(Rpc::Compact, Outcome::Timeout);
+            Outcome::Timeout
         }
     };
     metrics::record_compact(outcome);
@@ -1438,6 +1641,28 @@ fn shape(op: ResourceOperation) -> TxnShape {
     }
 }
 
+fn storage_operation_for_state(
+    operation: ResourceOperation,
+    state: &KeyState,
+    recreate_missing: bool,
+) -> Option<ResourceOperation> {
+    if matches!(operation, ResourceOperation::Create) || state.mod_revision().is_some() {
+        Some(operation)
+    } else if recreate_missing && operation == ResourceOperation::GuaranteedUpdate {
+        Some(ResourceOperation::Create)
+    } else {
+        None
+    }
+}
+
+fn take_storage_attempt(used: &mut u32, limit: u32) -> bool {
+    if *used >= limit {
+        return false;
+    }
+    *used = used.saturating_add(1);
+    true
+}
+
 async fn execute_txn(
     client: &ClientBundle,
     label: &ResourceName,
@@ -1446,7 +1671,9 @@ async fn execute_txn(
     value: Vec<u8>,
     operation: ResourceOperation,
     mut inject_conflict: bool,
-    policy: CasRetryPolicy,
+    transport_policy: CasRetryPolicy,
+    cas_policy: CasRetryPolicy,
+    recreate_missing: bool,
     timeout: Duration,
     lease_id: i64,
     latest_revision: Arc<AtomicI64>,
@@ -1455,18 +1682,21 @@ async fn execute_txn(
     let mut outer_attempt = 0u32;
     let mut current_value = value;
     let mut state = states.get(&key).cloned().unwrap_or_default();
-    if !matches!(operation, ResourceOperation::Create) && state.mod_revision().is_none() {
+    let mut storage_attempts = 0u32;
+    let Some(mut storage_operation) =
+        storage_operation_for_state(operation, &state, recreate_missing)
+    else {
         metrics::record_txn(label, shape(operation), TxnResult::Conflict);
         metrics::record_operation(operation_metric(operation), label, Outcome::GrpcError);
         return Outcome::GrpcError;
-    }
+    };
     loop {
         if Instant::now() >= deadline {
             metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
             return Outcome::Timeout;
         }
         outer_attempt = outer_attempt.saturating_add(1);
-        let mut attempt = match operation {
+        let mut attempt = match storage_operation {
             ResourceOperation::Create => TxnAttempt::create(key.clone(), current_value.clone()),
             ResourceOperation::GuaranteedUpdate => {
                 let revision = state.mod_revision().unwrap_or(0);
@@ -1482,12 +1712,12 @@ async fn execute_txn(
                 TxnAttempt::delete(key.clone(), state.mod_revision().unwrap_or(0))
             }
         };
-        let mut cas = CasLoop::new(
-            attempt.clone(),
-            CasRetryPolicy::generic_controller(),
-            deadline,
-        );
+        let mut cas = CasLoop::new(attempt.clone(), cas_policy, deadline);
         loop {
+            if !take_storage_attempt(&mut storage_attempts, cas_policy.max_attempts) {
+                metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
+                return Outcome::Timeout;
+            }
             let request = attempt.request_with_lease(lease_id);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1515,7 +1745,7 @@ async fn execute_txn(
                 }
                 Ok(Err(error)) => {
                     metrics::record_request(Rpc::Txn, Outcome::GrpcError);
-                    if !error.is_retriable() || outer_attempt >= policy.max_attempts {
+                    if !error.is_retriable() || outer_attempt >= transport_policy.max_attempts {
                         metrics::record_operation(
                             operation_metric(operation),
                             label,
@@ -1523,8 +1753,8 @@ async fn execute_txn(
                         );
                         return Outcome::GrpcError;
                     }
-                    let delay =
-                        policy.delay_for(stable_shard(&key, usize::MAX) as u64, outer_attempt);
+                    let delay = transport_policy
+                        .delay_for(stable_shard(&key, usize::MAX) as u64, outer_attempt);
                     time::sleep(delay.min(deadline.saturating_duration_since(Instant::now())))
                         .await;
                     break;
@@ -1532,7 +1762,7 @@ async fn execute_txn(
             };
             metrics::record_txn(
                 label,
-                shape(operation),
+                shape(storage_operation),
                 if response.succeeded {
                     TxnResult::Committed
                 } else {
@@ -1561,7 +1791,7 @@ async fn execute_txn(
                 CasDecision::Retry { latest, .. } => {
                     metrics::record_cas_retry(label, operation_metric(operation));
                     state = latest.clone();
-                    current_value = if operation == ResourceOperation::ConditionalDelete {
+                    current_value = if storage_operation == ResourceOperation::ConditionalDelete {
                         Vec::new()
                     } else {
                         resource_value_for_retry(&current_value, attempt.number)
@@ -1575,6 +1805,17 @@ async fn execute_txn(
                         return Outcome::GrpcError;
                     };
                     attempt = next.clone();
+                }
+                CasDecision::Exhausted {
+                    reason: ExhaustedReason::MissingFailureKey,
+                    ..
+                } if recreate_missing
+                    && storage_operation == ResourceOperation::GuaranteedUpdate =>
+                {
+                    metrics::record_cas_retry(label, operation_metric(operation));
+                    storage_operation = ResourceOperation::Create;
+                    state = KeyState::Absent;
+                    break;
                 }
                 CasDecision::Exhausted { .. } => {
                     metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
@@ -1660,6 +1901,8 @@ async fn execute_heartbeat(
         operation,
         false,
         policy,
+        policy,
+        false,
         timeout,
         0,
         latest_revision,
@@ -1705,11 +1948,14 @@ mod tests {
                 lease_pool: None,
             }],
             ranges: vec![],
+            range_fixtures: vec![],
             etcd_lease_pools: vec![],
             status_count: 0,
             compact_interval_s: 300.0,
             master_lease_interval_s: 10.0,
             cas_conflicts: 0,
+            range_limit_10000_count: 0,
+            range_count_only_count: 0,
         };
         let cursor = RateCursor::new(&workload, 1.0, true, 1.0, 1, 1);
         assert_eq!(cursor.total(), 10000);
@@ -1799,6 +2045,138 @@ mod tests {
                 Duration::from_secs(300),
             ]
         );
+    }
+
+    #[test]
+    fn node_status_ticks_follow_each_nodes_phase_until_deadline() {
+        let nodes = 2003;
+        let interval = Duration::from_secs(300);
+        let duration = Duration::from_secs(2310);
+        let mut total = 0;
+        for node in 0..nodes {
+            let mut at = node_status_phase(node, nodes, interval);
+            while at <= duration {
+                total += 1;
+                at = at.saturating_add(interval);
+            }
+        }
+        assert_eq!(total, 15_423);
+    }
+
+    #[test]
+    fn range_shape_plan_emits_exact_trace_counts() {
+        let workload = WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        let ranges = RateCursor::new(&workload, 1.0, false, 1.0, 1, 0xB2);
+        assert_eq!(ranges.total(), 22_080);
+        let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
+        let producer = RangeProducer::new(weights.iter().copied());
+        let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
+        let mut plan = range_shape_plan(&workload, prefix_total, 1.0).unwrap();
+        assert_eq!(plan.prefix_total, 16_875);
+        assert_eq!(plan.limit_10000, 2_720);
+        assert_eq!(plan.count_only, 220);
+        let mut limit_10000 = 0;
+        let mut count_only = 0;
+        for _ in 0..plan.prefix_total {
+            let mut request = RangeRequest {
+                limit: 500,
+                ..Default::default()
+            };
+            plan.apply(&mut request);
+            limit_10000 += u64::from(request.limit == 10_000);
+            count_only += u64::from(request.count_only);
+        }
+        assert_eq!(limit_10000, 2_720);
+        assert_eq!(count_only, 220);
+    }
+
+    #[test]
+    fn range_shapes_follow_actual_prefix_slots() {
+        let mut workload =
+            WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        workload.ranges = vec![
+            crate::config::RangeSpec {
+                key_pattern: "/registry/prefix/".into(),
+                kind: "prefix".into(),
+                limit: 500,
+                count_only: false,
+                weight: 1.0,
+            },
+            crate::config::RangeSpec {
+                key_pattern: "/registry/point".into(),
+                kind: "point".into(),
+                limit: 0,
+                count_only: false,
+                weight: 1.0,
+            },
+        ];
+        workload.range_limit_10000_count = 1;
+        workload.range_count_only_count = 0;
+        let weights = vec![1.0, 1.0];
+        let producer = RangeProducer::new(weights.iter().copied());
+        let prefix_total = exact_prefix_total(producer.clone(), &weights, &workload.ranges, 3);
+        assert_eq!(prefix_total, 1);
+        let mut plan = range_shape_plan(&workload, prefix_total, 1.0).unwrap();
+        let mut producer = producer;
+        let mut shaped = 0;
+        for _ in 0..3 {
+            let index = producer.next(&weights).unwrap();
+            if workload.ranges[index].kind == "prefix" {
+                let mut request = RangeRequest {
+                    limit: 500,
+                    ..Default::default()
+                };
+                plan.apply(&mut request);
+                shaped += u64::from(request.limit == 10_000);
+            }
+        }
+        assert_eq!(shaped, 1);
+    }
+
+    #[test]
+    fn masterlease_update_recreates_a_missing_key() {
+        assert_eq!(
+            storage_operation_for_state(
+                ResourceOperation::GuaranteedUpdate,
+                &KeyState::Absent,
+                true,
+            ),
+            Some(ResourceOperation::Create)
+        );
+        assert_eq!(
+            storage_operation_for_state(
+                ResourceOperation::GuaranteedUpdate,
+                &KeyState::Absent,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn storage_attempt_budget_does_not_reset_between_retry_kinds() {
+        let mut used = 0;
+        for _ in 0..5 {
+            assert!(take_storage_attempt(&mut used, 5));
+        }
+        assert!(!take_storage_attempt(&mut used, 5));
+    }
+
+    #[test]
+    fn embedded_read_only_prefixes_have_bootstrap_fixtures() {
+        let workload = WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        for prefix in ["services", "endpointslices"] {
+            let fixture = workload
+                .range_fixtures
+                .iter()
+                .find(|fixture| fixture.name.starts_with(prefix))
+                .unwrap();
+            assert_eq!(fixture.count, 100);
+            assert!(
+                patterned_key(&fixture.key_pattern, 0)
+                    .starts_with(format!("/registry/{prefix}/bench-bench/").as_bytes())
+            );
+        }
     }
 
     #[test]

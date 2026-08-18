@@ -270,6 +270,10 @@ fn failure_kv(response: &TxnResponse) -> Option<&mvccpb::KeyValue> {
         })
 }
 
+pub fn failure_version(response: &TxnResponse) -> Option<i64> {
+    failure_kv(response).map(|kv| kv.version)
+}
+
 /// Apply a response and return the header revision observed by this attempt.
 /// Failure KV data comes from the Txn failure Range; this function never asks
 /// the caller to issue an independent Range.
@@ -558,6 +562,12 @@ mod tests {
             Some(TargetUnion::Version(7))
         );
         assert_eq!(compact.failure.len(), 1);
+    }
+
+    #[test]
+    fn compact_conflict_exposes_server_version_for_resync() {
+        assert_eq!(failure_version(&conflict(9, b"123", 4)), Some(4));
+        assert_eq!(failure_version(&TxnResponse::default()), None);
     }
 
     #[test]
