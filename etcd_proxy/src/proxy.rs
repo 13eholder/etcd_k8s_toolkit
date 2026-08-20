@@ -1,13 +1,17 @@
 use std::fs::OpenOptions;
 use std::mem;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -29,6 +33,7 @@ use crate::pb::etcdserverpb::{
     SnapshotResponse, StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest,
     WatchResponse,
 };
+static NEXT_WATCH_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct ProxyService {
@@ -214,6 +219,10 @@ impl Lease for ProxyService {
                             timestamp_ms: now_ms(),
                             method: "/etcdserverpb.Lease/LeaseKeepAlive",
                             request: format!("{message:?}"),
+                            stream_id: None,
+                            direction: None,
+                            sequence: None,
+                            details: None,
                         }).await;
                         yield message;
                     }
@@ -248,25 +257,124 @@ impl Lease for ProxyService {
 
 #[tonic::async_trait]
 impl Watch for ProxyService {
-    type WatchStream = tonic::codec::Streaming<WatchResponse>;
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
 
     async fn watch(
         &self,
         request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let stream_id = NEXT_WATCH_STREAM_ID.fetch_add(1, Ordering::Relaxed);
         let mut watch_client = self.watch_client.clone();
+        let logger = Arc::clone(&self.logger);
         let (metadata, extensions, mut inbound) = request.into_parts();
-        let outbound = async_stream::stream! {
+        let require_leader = require_leader_enabled(&metadata);
+        let (inbound_error_tx, inbound_error_rx) = oneshot::channel::<Status>();
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let inbound_logger = Arc::clone(&logger);
+        tokio::spawn(async move {
+            let mut sequence = 0u64;
             loop {
                 match inbound.message().await {
-                    Ok(Some(message)) => yield message,
-                    Ok(None) | Err(_) => break,
+                    Ok(Some(message)) => {
+                        let details = format!(
+                            "{} require_leader={require_leader}",
+                            watch_request_details(&message)
+                        );
+                        inbound_logger
+                            .log(LogEntry {
+                                timestamp_ms: now_ms(),
+                                method: "/etcdserverpb.Watch/Watch",
+                                request: format!("{message:?}"),
+                                stream_id: Some(stream_id),
+                                direction: Some("inbound"),
+                                sequence: Some(sequence),
+                                details: Some(details),
+                            })
+                            .await;
+                        sequence = sequence.saturating_add(1);
+                        if request_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(status) => {
+                        let _ = inbound_error_tx.send(status);
+                        break;
+                    }
                 }
             }
-        };
-        let request = Request::from_parts(metadata, extensions, outbound);
-        watch_client.watch(request).await
+        });
+        let request = Request::from_parts(metadata, extensions, ReceiverStream::new(request_rx));
+        let response = watch_client.watch(request).await?;
+        let upstream = response.into_inner();
+        let (response_tx, response_rx) = mpsc::channel::<Result<WatchResponse, Status>>(8);
+        tokio::spawn(dispatch_watch_responses(
+            upstream,
+            inbound_error_rx,
+            response_tx,
+            logger,
+            stream_id,
+        ));
+        Ok(Response::new(Box::pin(ReceiverStream::new(response_rx))))
     }
+}
+
+async fn dispatch_watch_responses<S>(
+    upstream: S,
+    mut inbound_error_rx: oneshot::Receiver<Status>,
+    response_tx: mpsc::Sender<Result<WatchResponse, Status>>,
+    logger: Arc<Logger>,
+    stream_id: u64,
+) where
+    S: Stream<Item = Result<WatchResponse, Status>> + Send + 'static,
+{
+    let mut sequence = 0u64;
+    let mut upstream = Box::pin(upstream);
+    let mut inbound_error_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            inbound_result = &mut inbound_error_rx, if inbound_error_open => {
+                inbound_error_open = false;
+                if let Ok(status) = inbound_result {
+                    // Dropping the task immediately drops the
+                    // upstream stream and cancels the response side.
+                    let _ = response_tx.send(Err(status)).await;
+                    break;
+                }
+            }
+            response = upstream.next() => match response {
+                Some(Ok(message)) => {
+                    let details = watch_response_details(&message);
+                    logger.log(LogEntry {
+                        timestamp_ms: now_ms(),
+                        method: "/etcdserverpb.Watch/Watch",
+                        request: format!("{message:?}"),
+                        stream_id: Some(stream_id),
+                        direction: Some("outbound"),
+                        sequence: Some(sequence),
+                        details: Some(details),
+                    }).await;
+                    sequence = sequence.saturating_add(1);
+                    if response_tx.send(Ok(message)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Err(status)) => {
+                    let _ = response_tx.send(Err(status)).await;
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+fn require_leader_enabled(metadata: &tonic::metadata::MetadataMap) -> bool {
+    metadata
+        .get("hasleader")
+        .and_then(|value| value.to_str().ok())
+        == Some("true")
 }
 
 impl ProxyService {
@@ -276,6 +384,10 @@ impl ProxyService {
                 timestamp_ms: now_ms(),
                 method,
                 request: format!("{request:?}"),
+                stream_id: None,
+                direction: None,
+                sequence: None,
+                details: None,
             })
             .await;
     }
@@ -286,6 +398,64 @@ struct LogEntry {
     timestamp_ms: u128,
     method: &'static str,
     request: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+}
+
+fn watch_request_details(request: &WatchRequest) -> String {
+    match request.request_union.as_ref() {
+        Some(crate::pb::etcdserverpb::watch_request::RequestUnion::CreateRequest(create)) => {
+            format!(
+                "create key={} range_end={} start_revision={} prev_kv={} progress_notify={}",
+                create.key.len(),
+                create.range_end.len(),
+                create.start_revision,
+                create.prev_kv,
+                create.progress_notify
+            )
+        }
+        Some(crate::pb::etcdserverpb::watch_request::RequestUnion::ProgressRequest(_)) => {
+            "progress_request watch_id=-1".into()
+        }
+        Some(crate::pb::etcdserverpb::watch_request::RequestUnion::CancelRequest(cancel)) => {
+            format!("cancel watch_id={}", cancel.watch_id)
+        }
+        None => "empty".into(),
+    }
+}
+
+fn watch_response_details(response: &WatchResponse) -> String {
+    let event_bytes: usize = response
+        .events
+        .iter()
+        .map(|event| {
+            event
+                .kv
+                .as_ref()
+                .map_or(0, |kv| kv.key.len() + kv.value.len())
+                + event
+                    .prev_kv
+                    .as_ref()
+                    .map_or(0, |kv| kv.key.len() + kv.value.len())
+        })
+        .sum();
+    format!(
+        "watch_id={} created={} canceled={} compact_revision={} cancel_reason={:?} events={} event_bytes={} revision={}",
+        response.watch_id,
+        response.created,
+        response.canceled,
+        response.compact_revision,
+        response.cancel_reason,
+        response.events.len(),
+        event_bytes,
+        response.header.as_ref().map_or(0, |header| header.revision)
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -492,6 +662,22 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn require_leader_uses_etcd_canonical_metadata_pair() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            "hasleader",
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        assert!(require_leader_enabled(&metadata));
+
+        let mut legacy = tonic::metadata::MetadataMap::new();
+        legacy.insert(
+            "x-etcd-require-leader",
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        assert!(!require_leader_enabled(&legacy));
+    }
 
     fn test_log_path(test_name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -507,6 +693,72 @@ mod tests {
             channel_capacity: 16,
             flush_interval,
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_forwards_upstream_status_verbatim() {
+        let path = test_log_path("dispatch_upstream_status");
+        let logger = Arc::new(Logger::new(
+            &path,
+            logger_options(1024, Duration::from_secs(1)),
+        ));
+        let (_inbound_error_tx, inbound_error_rx) = oneshot::channel();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let expected = Status::resource_exhausted("upstream status");
+
+        dispatch_watch_responses(
+            tokio_stream::iter([Err(expected)]),
+            inbound_error_rx,
+            response_tx,
+            Arc::clone(&logger),
+            1,
+        )
+        .await;
+
+        match response_rx.recv().await {
+            Some(Err(status)) => {
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                assert_eq!(status.message(), "upstream status");
+            }
+            other => panic!("expected upstream status, got {other:?}"),
+        }
+        assert!(response_rx.recv().await.is_none());
+        logger.flush().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn dispatch_treats_upstream_eof_as_clean_close() {
+        let path = test_log_path("dispatch_upstream_eof");
+        let logger = Arc::new(Logger::new(
+            &path,
+            logger_options(1024, Duration::from_secs(1)),
+        ));
+        let (_inbound_error_tx, inbound_error_rx) = oneshot::channel();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+
+        dispatch_watch_responses(
+            tokio_stream::empty::<Result<WatchResponse, Status>>(),
+            inbound_error_rx,
+            response_tx,
+            Arc::clone(&logger),
+            1,
+        )
+        .await;
+
+        assert!(response_rx.recv().await.is_none());
+        logger.flush().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn independent_first_watch_streams_do_not_claim_reconnect() {
+        let request = WatchRequest::default();
+        let first_details = watch_request_details(&request);
+        let second_details = watch_request_details(&request);
+
+        assert!(!first_details.contains("reconnect"));
+        assert!(!second_details.contains("reconnect"));
     }
 
     async fn wait_for_file_size(path: &std::path::Path, minimum_bytes: u64) {
@@ -535,6 +787,10 @@ mod tests {
                 timestamp_ms: 1,
                 method: "/etcdserverpb.KV/Range",
                 request: "first".to_string(),
+                stream_id: None,
+                direction: None,
+                sequence: None,
+                details: None,
             })
             .await;
         logger
@@ -542,6 +798,10 @@ mod tests {
                 timestamp_ms: 2,
                 method: "/etcdserverpb.Lease/LeaseGrant",
                 request: "second".to_string(),
+                stream_id: None,
+                direction: None,
+                sequence: None,
+                details: None,
             })
             .await;
         logger.flush().await;
@@ -564,6 +824,10 @@ mod tests {
                 timestamp_ms: 1,
                 method: "/etcdserverpb.KV/Range",
                 request: "interval".to_string(),
+                stream_id: None,
+                direction: None,
+                sequence: None,
+                details: None,
             })
             .await;
 
@@ -586,6 +850,10 @@ mod tests {
                 timestamp_ms: 1,
                 method: "/etcdserverpb.KV/Put",
                 request: "x".repeat(buffer_capacity_bytes),
+                stream_id: None,
+                direction: None,
+                sequence: None,
+                details: None,
             })
             .await;
 
