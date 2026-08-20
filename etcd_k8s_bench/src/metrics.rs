@@ -7,8 +7,10 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder};
@@ -23,15 +25,35 @@ pub const CAS_RETRIES_TOTAL: &str = "etcd_k8s_bench_cas_retries_total";
 pub const LEASE_KEEPALIVE_TOTAL: &str = "etcd_k8s_bench_lease_keepalive_total";
 pub const NODE_HEARTBEATS_TOTAL: &str = "etcd_k8s_bench_node_heartbeats_total";
 pub const DROPPED_TOTAL: &str = "etcd_k8s_bench_dropped_total";
+pub const INFO: &str = "etcd_k8s_bench_info";
+pub const WATCH_EVENTS_TOTAL: &str = "etcd_k8s_bench_watch_events_total";
+pub const WATCH_EVENT_BYTES: &str = "etcd_k8s_bench_watch_event_bytes";
+pub const WATCH_CANCEL_TOTAL: &str = "etcd_k8s_bench_watch_cancel_total";
+pub const WATCH_RECONNECT_TOTAL: &str = "etcd_k8s_bench_watch_reconnect_total";
+pub const RANGE_PAGES: &str = "etcd_k8s_bench_range_pages";
+pub const RANGE_SNAPSHOT_REVISION: &str = "etcd_k8s_bench_range_snapshot_revision";
+pub const RANGE_SERVER_COUNT: &str = "etcd_k8s_bench_range_server_count";
+pub const RANGE_LAST_KEY_BYTES: &str = "etcd_k8s_bench_range_last_key_bytes";
+pub const RANGE_SELECTED: &str = "etcd_k8s_bench_range_selected";
+pub const RANGE_DISCARDED: &str = "etcd_k8s_bench_range_discarded";
 static MAX_REVISION: AtomicI64 = AtomicI64::new(0);
+static MAX_COMPACT_REVISION: AtomicI64 = AtomicI64::new(0);
+static WATCH_RECONNECTS: AtomicU64 = AtomicU64::new(0);
 static REVISION_GAUGE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static WATCH_RECONNECT_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static WATCH_RECONNECT_TEST_HOOK: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>> = Mutex::new(None);
 
 pub const INFLIGHT: &str = "etcd_k8s_bench_inflight";
 pub const REVISION: &str = "etcd_k8s_bench_revision";
+pub const COMPACT_REVISION: &str = "etcd_k8s_bench_compact_revision";
 pub const COMPACT_TOTAL: &str = "etcd_k8s_bench_compact_total";
-pub const INFO: &str = "etcd_k8s_bench_info";
 pub const POD_SIZE_BYTES: &str = "etcd_k8s_bench_pod_size_bytes";
 pub const NODES: &str = "etcd_k8s_bench_nodes";
+pub const COMPACTOR_STATE: &str = "etcd_k8s_bench_compactor_state";
+pub const COMPACTOR_ERRORS_TOTAL: &str = "etcd_k8s_bench_compactor_errors_total";
+pub const COMPACTOR_RECOVERIES_TOTAL: &str = "etcd_k8s_bench_compactor_recoveries_total";
 
 /// Labels which may safely be supplied by a workload configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +161,9 @@ pub enum Outcome {
     Success,
     GrpcError,
     Timeout,
+    /// The mutable request may have been processed, so the caller must
+    /// reconcile instead of blindly replaying it.
+    ResultUnknown,
 }
 
 impl Outcome {
@@ -147,6 +172,7 @@ impl Outcome {
             Self::Success => "success",
             Self::GrpcError => "grpc_error",
             Self::Timeout => "timeout",
+            Self::ResultUnknown => "result_unknown",
         }
     }
 }
@@ -323,6 +349,24 @@ pub fn record_operation(operation: Operation, resource: &ResourceName, outcome: 
     )
     .increment(1);
 }
+/// Publishes the last completed Range result without exposing keys as labels.
+/// The key itself remains available in the result path; metrics carry only its
+/// byte length to keep cardinality bounded.
+pub fn record_range_result(
+    pages: u64,
+    snapshot_revision: i64,
+    server_count: i64,
+    last_key: &[u8],
+    selected: u64,
+    discarded: u64,
+) {
+    metrics::gauge!(RANGE_PAGES).set(pages as f64);
+    metrics::gauge!(RANGE_SNAPSHOT_REVISION).set(snapshot_revision as f64);
+    metrics::gauge!(RANGE_SERVER_COUNT).set(server_count as f64);
+    metrics::gauge!(RANGE_LAST_KEY_BYTES).set(last_key.len() as f64);
+    metrics::gauge!(RANGE_SELECTED).set(selected as f64);
+    metrics::gauge!(RANGE_DISCARDED).set(discarded as f64);
+}
 
 pub fn record_request(rpc: Rpc, outcome: Outcome) {
     metrics::counter!(REQUESTS_TOTAL, "rpc" => rpc.as_str(), "outcome" => outcome.as_str())
@@ -383,6 +427,80 @@ pub fn record_dropped(reason: DropReason) {
     metrics::counter!(DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
+pub fn record_watch_response(response: &crate::pb::etcdserverpb::WatchResponse) {
+    let events = response.events.len() as u64;
+    let bytes: u64 = response
+        .events
+        .iter()
+        .map(|event| {
+            event
+                .kv
+                .as_ref()
+                .map_or(0, |kv| (kv.key.len() + kv.value.len()) as u64)
+                + event
+                    .prev_kv
+                    .as_ref()
+                    .map_or(0, |kv| (kv.key.len() + kv.value.len()) as u64)
+        })
+        .sum();
+    metrics::counter!(WATCH_EVENTS_TOTAL).increment(events);
+    metrics::counter!(WATCH_EVENT_BYTES).increment(bytes);
+}
+
+pub fn record_watch_cancel(reason: &'static str) {
+    metrics::counter!(WATCH_CANCEL_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn record_watch_reconnect() {
+    #[cfg(test)]
+    let total = WATCH_RECONNECTS.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(not(test))]
+    WATCH_RECONNECTS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    invoke_watch_reconnect_test_hook(total);
+    metrics::counter!(WATCH_RECONNECT_TOTAL).increment(1);
+    // Increment the gauge directly.  A fetch-then-set publication lets a
+    // slower transition overwrite a newer cumulative value when watches
+    // reconnect concurrently.
+    metrics::gauge!("etcd_k8s_bench_watch_reconnects").increment(1);
+}
+
+#[cfg(test)]
+fn invoke_watch_reconnect_test_hook(total: u64) {
+    let hook = WATCH_RECONNECT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(Arc::clone);
+    if let Some(hook) = hook {
+        hook(total);
+    }
+}
+
+#[cfg(test)]
+fn set_watch_reconnect_test_hook(hook: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
+    *WATCH_RECONNECT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+pub fn reset_watch_reconnects() {
+    WATCH_RECONNECTS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn lock_watch_reconnect_tests() -> std::sync::MutexGuard<'static, ()> {
+    WATCH_RECONNECT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub fn watch_reconnects_total() -> u64 {
+    WATCH_RECONNECTS.load(Ordering::Relaxed)
+}
+
 pub fn add_inflight(rpc: Rpc) {
     metrics::gauge!(INFLIGHT, "rpc" => rpc.as_str()).increment(1);
 }
@@ -401,8 +519,33 @@ pub fn set_revision(revision: i64) {
     metrics::gauge!(REVISION).set(maximum as f64);
 }
 
+/// Publish the latest compact revision observed locally or from a winning
+/// remote compactor.  It is monotonic for the same reason as the etcd header
+/// revision gauge, so a stale failure response cannot move it backwards.
+pub fn set_compact_revision(revision: i64) {
+    let maximum = MAX_COMPACT_REVISION
+        .fetch_max(revision, Ordering::Relaxed)
+        .max(revision);
+    metrics::gauge!(COMPACT_REVISION).set(maximum as f64);
+}
+
 pub fn record_compact(outcome: Outcome) {
     metrics::counter!(COMPACT_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+/// Publish the current compactor state as a numeric gauge:
+/// `0` means active and `1` means resync-required.
+pub fn set_compactor_state(state: &'static str) {
+    let value = if state == "active" { 0.0 } else { 1.0 };
+    metrics::gauge!(COMPACTOR_STATE).set(value);
+    metrics::gauge!(COMPACTOR_STATE, "state" => state).set(1.0);
+}
+
+pub fn record_compactor_error(error: &'static str) {
+    metrics::counter!(COMPACTOR_ERRORS_TOTAL, "error" => error).increment(1);
+}
+
+pub fn record_compactor_recovery(recovery: &'static str) {
+    metrics::counter!(COMPACTOR_RECOVERIES_TOTAL, "recovery" => recovery).increment(1);
 }
 
 pub fn record_info(version: &'static str, workload: &WorkloadName) {
@@ -420,6 +563,8 @@ pub fn set_nodes(nodes: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     #[test]
@@ -435,30 +580,48 @@ mod tests {
             LEASE_KEEPALIVE_TOTAL,
             NODE_HEARTBEATS_TOTAL,
             DROPPED_TOTAL,
+            INFO,
+            WATCH_EVENTS_TOTAL,
+            WATCH_EVENT_BYTES,
+            WATCH_CANCEL_TOTAL,
+            WATCH_RECONNECT_TOTAL,
+            RANGE_PAGES,
+            RANGE_SNAPSHOT_REVISION,
+            RANGE_SERVER_COUNT,
+            RANGE_LAST_KEY_BYTES,
+            RANGE_SELECTED,
+            RANGE_DISCARDED,
             INFLIGHT,
             REVISION,
+            COMPACT_REVISION,
             COMPACT_TOTAL,
-            INFO,
             POD_SIZE_BYTES,
             NODES,
+            COMPACTOR_STATE,
+            COMPACTOR_ERRORS_TOTAL,
+            COMPACTOR_RECOVERIES_TOTAL,
         ];
         assert!(names.iter().all(|name| name.starts_with("etcd_k8s_bench_")));
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 30);
     }
-
     #[test]
     fn outcome_mapping_is_fixed() {
         assert_eq!(Outcome::Success.as_str(), "success");
         assert_eq!(Outcome::GrpcError.as_str(), "grpc_error");
         assert_eq!(Outcome::Timeout.as_str(), "timeout");
+        assert_eq!(Outcome::ResultUnknown.as_str(), "result_unknown");
     }
 
     #[test]
     fn recorder_registers_all_recording_paths() {
+        let _serial = WATCH_RECONNECT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_watch_reconnects();
         let recorder = PrometheusBuilder::new().build_recorder();
         let resource = ResourceName::new("pods").unwrap();
         let pool = PoolName::new("events").unwrap();
-        let workload = WorkloadName::new("density").unwrap();
+        let workload = WorkloadName::new("mock_k8").unwrap();
 
         // Building a Prometheus recorder is the registration step.  Running
         // every recording path against it verifies all keys and labels are
@@ -477,10 +640,84 @@ mod tests {
             add_inflight(Rpc::Txn);
             remove_inflight(Rpc::Txn);
             set_revision(7);
+            set_compact_revision(6);
             record_compact(Outcome::Success);
+            set_compactor_state("active");
+            record_compactor_error("failure_kv_missing");
+            record_compactor_recovery("missing_key");
+            record_range_result(2, 7, 10, b"/registry/pods/z", 8, 2);
+            record_watch_reconnect();
+            record_watch_cancel("eof");
             record_info("0.1.0", &workload);
             set_pod_size(4096);
             set_nodes(2003);
         });
+        reset_watch_reconnects();
+    }
+
+    #[test]
+    fn reconnect_metric_is_deterministic_under_controlled_concurrency() {
+        let _serial = WATCH_RECONNECT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_watch_reconnects();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let start = Arc::new(Barrier::new(3));
+        let first_total_pause = Arc::new(Barrier::new(2));
+        let (first_total_tx, first_total_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let hook_pause = Arc::clone(&first_total_pause);
+        set_watch_reconnect_test_hook(Some(Arc::new(move |total| {
+            if total == 1 {
+                first_total_tx
+                    .send(())
+                    .expect("first reconnect hook receiver");
+                hook_pause.wait();
+            }
+        })));
+
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let start = Arc::clone(&start);
+                let completed_tx = completed_tx.clone();
+                let recorder = &recorder;
+                scope.spawn(move || {
+                    metrics::with_local_recorder(recorder, || {
+                        start.wait();
+                        record_watch_reconnect();
+                        completed_tx.send(()).expect("reconnect worker receiver");
+                    });
+                });
+            }
+            start.wait();
+            first_total_rx
+                .recv()
+                .expect("first reconnect total must be observed");
+            completed_rx
+                .recv()
+                .expect("second reconnect must publish before release");
+            first_total_pause.wait();
+        });
+
+        set_watch_reconnect_test_hook(None);
+        assert_eq!(watch_reconnects_total(), 2);
+        let rendered = recorder.handle().render();
+        assert_eq!(
+            rendered_metric_value(&rendered, "etcd_k8s_bench_watch_reconnects"),
+            2
+        );
+        assert_eq!(rendered_metric_value(&rendered, WATCH_RECONNECT_TOTAL), 2);
+        reset_watch_reconnects();
+    }
+
+    fn rendered_metric_value(rendered: &str, name: &str) -> u64 {
+        rendered
+            .lines()
+            .find_map(|line| {
+                let (metric, value) = line.split_once(' ')?;
+                (metric == name).then_some(value.parse::<f64>().ok()?)
+            })
+            .map(|value| value as u64)
+            .expect("metric must be rendered")
     }
 }

@@ -274,6 +274,12 @@ pub fn failure_version(response: &TxnResponse) -> Option<i64> {
     failure_kv(response).map(|kv| kv.version)
 }
 
+/// Return the coordination value from a failed compact CAS's embedded Range.
+/// The caller owns parsing because malformed remote values are observable input.
+pub fn failure_value(response: &TxnResponse) -> Option<&[u8]> {
+    failure_kv(response).map(|kv| kv.value.as_slice())
+}
+
 /// Apply a response and return the header revision observed by this attempt.
 /// Failure KV data comes from the Txn failure Range; this function never asks
 /// the caller to issue an independent Range.
@@ -562,12 +568,28 @@ mod tests {
             Some(TargetUnion::Version(7))
         );
         assert_eq!(compact.failure.len(), 1);
+        let recovery_probe = build_compact_revision_txn(b"30", 0);
+        assert_eq!(
+            recovery_probe.compare[0].target_union,
+            Some(TargetUnion::Version(0))
+        );
+        assert_eq!(recovery_probe.success.len(), 1);
+        match recovery_probe.failure[0].request.as_ref() {
+            Some(request_op::Request::RequestRange(range)) => {
+                assert_eq!(range.key, b"compact_rev_key");
+                assert!(range.range_end.is_empty());
+            }
+            other => panic!("unexpected recovery failure op: {other:?}"),
+        }
     }
 
     #[test]
-    fn compact_conflict_exposes_server_version_for_resync() {
-        assert_eq!(failure_version(&conflict(9, b"123", 4)), Some(4));
+    fn compact_conflict_exposes_server_version_and_value_for_resync() {
+        let response = conflict(9, b"123", 4);
+        assert_eq!(failure_version(&response), Some(4));
+        assert_eq!(failure_value(&response), Some(&b"123"[..]));
         assert_eq!(failure_version(&TxnResponse::default()), None);
+        assert_eq!(failure_value(&TxnResponse::default()), None);
     }
 
     #[test]

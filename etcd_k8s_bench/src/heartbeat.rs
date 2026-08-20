@@ -51,7 +51,7 @@ impl HeartbeatItem {
 }
 
 /// Planner settings.  The defaults are the Kubernetes heartbeat defaults used
-/// by the density workload.
+/// by the built-in profiles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeartbeatConfig {
     pub nodes: usize,
@@ -59,6 +59,7 @@ pub struct HeartbeatConfig {
     pub lease_jitter: f64,
     pub status_interval: Duration,
     pub seed: u64,
+    pub node_lease_enabled: bool,
 }
 
 impl Default for HeartbeatConfig {
@@ -69,6 +70,7 @@ impl Default for HeartbeatConfig {
             lease_jitter: 0.04,
             status_interval: Duration::from_secs(300),
             seed: 1,
+            node_lease_enabled: true,
         }
     }
 }
@@ -103,22 +105,25 @@ impl NodeHeartbeatPlanner {
         Self { config }
     }
 
-    /// Emit bootstrap items in node order.  Each node is created, its
-    /// Coordination NodeLease is created, and then its initial Ready update is
-    /// applied before any runtime item is emitted.
+    /// Emit bootstrap items in node order. Each node is created and receives
+    /// its initial Ready update; Coordination NodeLease creation is included
+    /// only when explicitly enabled.
     pub fn bootstrap(&self) -> Vec<HeartbeatItem> {
-        let mut result = Vec::with_capacity(self.config.nodes * 3);
+        let per_node = if self.config.node_lease_enabled { 3 } else { 2 };
+        let mut result = Vec::with_capacity(self.config.nodes * per_node);
         for node in 0..self.config.nodes {
             result.push(HeartbeatItem::new(
                 node,
                 HeartbeatItemKind::NodeCreate,
                 Duration::ZERO,
             ));
-            result.push(HeartbeatItem::new(
-                node,
-                HeartbeatItemKind::NodeLeaseCreate,
-                Duration::ZERO,
-            ));
+            if self.config.node_lease_enabled {
+                result.push(HeartbeatItem::new(
+                    node,
+                    HeartbeatItemKind::NodeLeaseCreate,
+                    Duration::ZERO,
+                ));
+            }
             result.push(HeartbeatItem::new(
                 node,
                 HeartbeatItemKind::NodeReady,
@@ -127,9 +132,8 @@ impl NodeHeartbeatPlanner {
         }
         result
     }
-
     /// Emit bootstrap and all runtime items whose timestamp is no later than
-    /// `window`.  A status update is never scheduled more than the configured
+    /// `window`. A status update is never scheduled more than the configured
     /// status interval apart; NodeLease renewal uses deterministic jitter.
     #[cfg(test)]
     pub fn plan_until(&self, window: Duration) -> Vec<HeartbeatItem> {
@@ -139,20 +143,22 @@ impl NodeHeartbeatPlanner {
         }
 
         for node in 0..self.config.nodes {
-            let mut lease_at = self.jittered_interval(node as u64, 0);
-            while lease_at <= window {
-                result.push(HeartbeatItem::new(
-                    node,
-                    HeartbeatItemKind::NodeLeaseRenew,
-                    lease_at,
-                ));
-                let next = lease_at.saturating_add(
-                    self.jittered_interval(node as u64, lease_at.as_nanos() as u64),
-                );
-                if next <= lease_at {
-                    break;
+            if self.config.node_lease_enabled {
+                let mut lease_at = self.jittered_interval(node as u64, 0);
+                while lease_at <= window {
+                    result.push(HeartbeatItem::new(
+                        node,
+                        HeartbeatItemKind::NodeLeaseRenew,
+                        lease_at,
+                    ));
+                    let next = lease_at.saturating_add(
+                        self.jittered_interval(node as u64, lease_at.as_nanos() as u64),
+                    );
+                    if next <= lease_at {
+                        break;
+                    }
+                    lease_at = next;
                 }
-                lease_at = next;
             }
 
             let mut status_at = self.config.status_interval;
@@ -168,7 +174,9 @@ impl NodeHeartbeatPlanner {
 
         // Runtime items are emitted in timestamp order, with NodeLease before
         // Node status at a tie and node index as the final stable tie-breaker.
-        result[3 * self.config.nodes..].sort_by_key(|item| {
+        let bootstrap_count =
+            self.config.nodes * if self.config.node_lease_enabled { 3 } else { 2 };
+        result[bootstrap_count..].sort_by_key(|item| {
             (
                 item.at,
                 match item.kind {
@@ -222,6 +230,29 @@ mod tests {
         assert_eq!(items[1].kind, HeartbeatItemKind::NodeLeaseCreate);
         assert_eq!(items[2].kind, HeartbeatItemKind::NodeReady);
         assert_eq!(items[3].node, 1);
+    }
+
+    #[test]
+    fn disabled_node_lease_bootstrap_and_plan_have_no_lease_items() {
+        let planner = NodeHeartbeatPlanner::new(HeartbeatConfig {
+            nodes: 2,
+            node_lease_enabled: false,
+            ..Default::default()
+        });
+        let items = planner.plan_until(Duration::from_secs(21));
+        assert!(items.iter().all(|item| {
+            !matches!(
+                item.kind,
+                HeartbeatItemKind::NodeLeaseCreate | HeartbeatItemKind::NodeLeaseRenew
+            )
+        }));
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == HeartbeatItemKind::NodeCreate)
+                .count(),
+            2
+        );
     }
 
     #[test]

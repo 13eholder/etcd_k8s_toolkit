@@ -3,9 +3,16 @@ use std::{fmt, fs, net::SocketAddr, path::Path, time::Duration};
 use crate::metrics::{PoolName, ResourceName, WorkloadName};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Profile {
+    MockK8,
+    RealK8,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub endpoint: String,
+    pub profile: Option<Profile>,
     pub workload: WorkloadSpec,
     pub pod_size: usize,
     pub nodes: u64,
@@ -45,9 +52,22 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub cas_conflicts: u64,
     #[serde(default)]
-    pub range_limit_10000_count: u64,
-    #[serde(default)]
     pub range_count_only_count: u64,
+    #[serde(default)]
+    pub watches: Vec<WatchSpec>,
+}
+
+/// One long-lived Kubernetes-style prefix Watch stream.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WatchSpec {
+    pub name: String,
+    pub key_prefix: String,
+    #[serde(default)]
+    pub start_revision: i64,
+    #[serde(default)]
+    pub prev_kv: bool,
+    #[serde(default)]
+    pub progress_notify: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -58,6 +78,13 @@ pub struct NodeSpec {
     pub lease_jitter: f64,
     pub status_retry_limit: u32,
     pub lease_retry_limit: u32,
+    /// Whether node heartbeats also create and renew Coordination NodeLeases.
+    #[serde(default = "default_node_lease_enabled")]
+    pub node_lease_enabled: bool,
+}
+
+fn default_node_lease_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -88,6 +115,15 @@ pub struct RangeSpec {
     pub limit: u64,
     pub count_only: bool,
     pub weight: f64,
+    /// Number of candidate KVs retained by the selector at a time. One means
+    /// an explicit all-match policy; larger values deterministically discard
+    /// every Nth candidate and trigger internal page growth.
+    #[serde(default = "default_selector_keep_every")]
+    pub selector_keep_every: u64,
+}
+
+fn default_selector_keep_every() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -223,6 +259,23 @@ impl WorkloadSpec {
         for (index, range) in self.ranges.iter().enumerate() {
             range.validate(index)?;
         }
+        for (index, watch) in self.watches.iter().enumerate() {
+            WorkloadName::new(watch.name.clone()).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "watches[{index}].name is not a valid metric label: {error}"
+                ))
+            })?;
+            if watch.key_prefix.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "watches[{index}].key_prefix must not be empty"
+                )));
+            }
+            if watch.start_revision < 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "watches[{index}].start_revision must be non-negative"
+                )));
+            }
+        }
         for (index, fixture) in self.range_fixtures.iter().enumerate() {
             fixture.validate(index, max_message_size)?;
         }
@@ -242,32 +295,6 @@ impl WorkloadSpec {
         if !self.master_lease_interval_s.is_finite() || self.master_lease_interval_s <= 0.0 {
             return Err(ConfigError::Invalid(
                 "master_lease_interval_s must be greater than zero".into(),
-            ));
-        }
-        let total_range_weight = self.ranges.iter().map(|range| range.weight).sum::<f64>();
-        let prefix_range_weight = self
-            .ranges
-            .iter()
-            .filter(|range| range.kind == "prefix")
-            .map(|range| range.weight)
-            .sum::<f64>();
-        let base_range_total = self
-            .timeline
-            .iter()
-            .map(|segment| (segment.range_rps * segment.duration_s).floor() as u64)
-            .sum::<u64>();
-        let prefix_capacity = if total_range_weight > 0.0 {
-            (base_range_total as f64 * prefix_range_weight / total_range_weight).floor() as u64
-        } else {
-            0
-        };
-        if self
-            .range_limit_10000_count
-            .saturating_add(self.range_count_only_count)
-            > prefix_capacity
-        {
-            return Err(ConfigError::Invalid(
-                "range shape counts must not exceed scheduled prefix Range capacity".into(),
             ));
         }
         Ok(())
@@ -350,7 +377,7 @@ impl ResourceSpec {
         }
         if self.value_size_bytes > max_message_size {
             return Err(ConfigError::Invalid(format!(
-                "resources[{index}].value_size_bytes ({}) exceeds max_message_size ({max_message_size})",
+                "resources[{index}].value_size_bytes ({}) exceeds max_message_size {max_message_size}",
                 self.value_size_bytes
             )));
         }
@@ -373,6 +400,11 @@ impl RangeSpec {
         if !self.weight.is_finite() || self.weight <= 0.0 {
             return Err(ConfigError::Invalid(format!(
                 "ranges[{index}].weight must be greater than zero"
+            )));
+        }
+        if self.selector_keep_every == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "ranges[{index}].selector_keep_every must be greater than zero"
             )));
         }
         Ok(())
@@ -436,10 +468,10 @@ mod tests {
     use super::*;
 
     fn embedded() -> WorkloadSpec {
-        WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap()
+        WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap()
     }
     #[test]
-    fn embedded_density_preserves_resource_and_lease_shapes() {
+    fn embedded_mock_k8_preserves_resource_and_lease_shapes() {
         let spec = embedded();
         assert_eq!(
             spec.timeline
@@ -450,7 +482,6 @@ mod tests {
         );
         assert_eq!(spec.master_lease_interval_s, 10.0);
         assert_eq!(spec.cas_conflicts, 0);
-        assert_eq!(spec.range_limit_10000_count, 2_720);
         assert_eq!(spec.range_count_only_count, 220);
         assert_eq!(spec.range_fixtures.len(), 2);
         assert_eq!(spec.pod_size_bytes, 4096);
@@ -474,6 +505,29 @@ mod tests {
         assert_eq!(pool.object_ttl_s + pool.reuse_s, 3_660.0);
         assert_eq!(pool.object_ttl_s, 3_600.0);
         assert_eq!(pool.reuse_s, 60.0);
+    }
+    #[test]
+    fn built_in_profiles_have_explicit_node_lease_modes() {
+        let mock = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        let real = WorkloadSpec::from_json(include_str!("../workloads/real_k8.json")).unwrap();
+        assert!(!mock.nodes.node_lease_enabled);
+        assert!(real.nodes.node_lease_enabled);
+    }
+    #[test]
+    fn custom_node_spec_can_explicitly_disable_leases() {
+        let node: NodeSpec = serde_json::from_str(
+            r#"{
+                "count": 1,
+                "status_interval_s": 300,
+                "lease_interval_s": 10,
+                "lease_jitter": 0.04,
+                "status_retry_limit": 5,
+                "lease_retry_limit": 5,
+                "node_lease_enabled": false
+            }"#,
+        )
+        .unwrap();
+        assert!(!node.node_lease_enabled);
     }
 
     #[test]
@@ -512,7 +566,7 @@ mod tests {
         let mut spec = embedded();
         spec.name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
-        spec.name = "density".into();
+        spec.name = "mock_k8".into();
         spec.resources[0].name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
         spec.resources[0].name = "pods".into();
@@ -524,50 +578,20 @@ mod tests {
     }
 
     #[test]
-    fn range_shape_validation_uses_scheduled_capacity_not_raw_weight() {
-        let mut spec = embedded();
-        spec.timeline = vec![TimelineSegment {
-            duration_s: 10.0,
-            application_txn_rps: 0.0,
-            range_rps: 100.0,
-        }];
-        spec.ranges = vec![RangeSpec {
-            key_pattern: "/registry/test/".into(),
-            kind: "prefix".into(),
-            limit: 500,
-            count_only: false,
-            weight: 1.0,
-        }];
-        spec.range_limit_10000_count = 10;
-        spec.range_count_only_count = 0;
-        assert!(spec.validate(64 * 1024 * 1024).is_ok());
+    fn range_selector_defaults_to_explicit_all_match() {
+        let spec = embedded();
+        assert!(
+            spec.ranges
+                .iter()
+                .all(|range| range.selector_keep_every == 1)
+        );
     }
 
     #[test]
-    fn range_shape_validation_uses_per_segment_capacity_floor() {
+    fn range_selector_rejects_zero() {
         let mut spec = embedded();
-        spec.timeline = vec![
-            TimelineSegment {
-                duration_s: 1.0,
-                application_txn_rps: 0.0,
-                range_rps: 0.5,
-            },
-            TimelineSegment {
-                duration_s: 1.0,
-                application_txn_rps: 0.0,
-                range_rps: 0.5,
-            },
-        ];
-        spec.ranges = vec![RangeSpec {
-            key_pattern: "/registry/test/".into(),
-            kind: "prefix".into(),
-            limit: 500,
-            count_only: false,
-            weight: 1.0,
-        }];
-        spec.range_limit_10000_count = 1;
-        spec.range_count_only_count = 0;
+        spec.ranges[0].selector_keep_every = 0;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
-        assert!(error.contains("scheduled prefix Range capacity"));
+        assert!(error.contains("selector_keep_every"));
     }
 }

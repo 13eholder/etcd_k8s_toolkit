@@ -6,6 +6,7 @@ mod lease;
 mod metrics;
 mod pb;
 mod scheduler;
+mod watch;
 mod workload;
 
 use clap::Parser;

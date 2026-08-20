@@ -1,5 +1,5 @@
 {
-  "name": "density",
+  "name": "mock_k8",
   "pod_size_bytes": 4096,
   "nodes": {
     "count": 2003,
@@ -7,7 +7,8 @@
     "lease_interval_s": 10,
     "lease_jitter": 0.04,
     "status_retry_limit": 5,
-    "lease_retry_limit": 5
+    "lease_retry_limit": 5,
+    "node_lease_enabled": false
   },
   "timeline": [
     {"duration_s":60,"application_txn_rps":192.042,"range_rps":40},
@@ -90,6 +91,14 @@
   "compact_interval_s": 300,
   "master_lease_interval_s": 10,
   "cas_conflicts": 0,
-  "range_limit_10000_count": 2720,
-  "range_count_only_count": 220
+  "range_count_only_count": 220,
+  "watches": [
+    {
+      "name": "pods",
+      "key_prefix": "/registry/pods/",
+      "start_revision": 0,
+      "prev_kv": true,
+      "progress_notify": true
+    }
+  ]
 }

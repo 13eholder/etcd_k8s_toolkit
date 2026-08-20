@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::Parser;
 
-use crate::config::{ConfigError, RuntimeConfig, WorkloadSpec};
+use crate::config::{ConfigError, Profile, RuntimeConfig, WorkloadSpec};
 #[cfg(test)]
 use crate::config::{DEFAULT_NODE_COUNT, DEFAULT_POD_SIZE_BYTES};
 
@@ -11,22 +11,26 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:2379";
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "etcd_k8s_bench",
-    about = "Replay the Kubernetes density workload against etcd"
+    about = "Replay a Kubernetes workload against etcd"
 )]
 pub struct Cli {
     /// etcd gRPC endpoint.
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
 
-    /// Workload JSON; defaults to the embedded density workload.
+    /// Workload JSON; mutually exclusive with an explicitly selected built-in profile.
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Built-in workload profile. Defaults to mock-k8 when omitted.
+    #[arg(long, value_parser = parse_profile)]
+    pub profile: Option<Profile>,
 
     /// Pod value size in bytes.
     #[arg(long, value_parser = parse_positive_usize)]
     pub pod_size: Option<usize>,
 
-    /// Number of Nodes and NodeLeases.
+    /// Number of Nodes (and NodeLeases when the selected workload enables them).
     #[arg(long, value_parser = parse_positive_u64)]
     pub nodes: Option<u64>,
 
@@ -69,9 +73,25 @@ pub struct Cli {
 
 impl Cli {
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
-        let mut workload = match &self.config {
-            Some(path) => WorkloadSpec::from_path(path)?,
-            None => WorkloadSpec::from_json(include_str!("../workloads/density.json"))?,
+        let (profile, mut workload) = match (&self.config, self.profile) {
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "--config and --profile are mutually exclusive".into(),
+                ));
+            }
+            (Some(path), None) => (None, WorkloadSpec::from_path(path)?),
+            (None, Some(profile @ Profile::MockK8)) => (
+                Some(profile),
+                WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json"))?,
+            ),
+            (None, Some(profile @ Profile::RealK8)) => (
+                Some(profile),
+                WorkloadSpec::from_json(include_str!("../workloads/real_k8.json"))?,
+            ),
+            (None, None) => (
+                Some(Profile::MockK8),
+                WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json"))?,
+            ),
         };
 
         if let Some(pod_size) = self.pod_size {
@@ -117,6 +137,7 @@ impl Cli {
 
         Ok(RuntimeConfig {
             endpoint: self.endpoint.clone(),
+            profile,
             pod_size: workload.pod_size_bytes,
             nodes: workload.nodes.count,
             workload,
@@ -193,7 +214,15 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
         .then_some(parsed)
         .ok_or_else(|| "value must be greater than zero".to_string())
 }
-
+fn parse_profile(value: &str) -> Result<Profile, String> {
+    match value {
+        "mock-k8" => Ok(Profile::MockK8),
+        "real-k8" => Ok(Profile::RealK8),
+        _ => Err(format!(
+            "unknown profile {value:?}; expected mock-k8 or real-k8"
+        )),
+    }
+}
 fn parse_positive_u64(value: &str) -> Result<u64, String> {
     let parsed = value
         .parse::<u64>()
@@ -269,12 +298,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_load_embedded_density() {
+    fn defaults_load_mock_k8_without_node_leases() {
         let config = Cli::load_from(["bench"]).unwrap();
+        assert_eq!(config.profile, Some(Profile::MockK8));
+        assert!(!config.workload.nodes.node_lease_enabled);
         assert_eq!(config.pod_size, DEFAULT_POD_SIZE_BYTES);
         assert_eq!(config.nodes, DEFAULT_NODE_COUNT);
         assert_eq!(config.rate_scale, 1.0);
         assert_eq!(config.request_timeout, Duration::from_secs(10));
+    }
+    #[test]
+    fn real_k8_enables_node_leases() {
+        let config = Cli::load_from(["bench", "--profile", "real-k8"]).unwrap();
+        assert_eq!(config.profile, Some(Profile::RealK8));
+        assert!(config.workload.nodes.node_lease_enabled);
+    }
+    #[test]
+    fn explicit_profile_and_custom_config_are_mutually_exclusive() {
+        let error = Cli::load_from(["bench", "--profile", "mock-k8", "--config", "custom.json"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mutually exclusive"));
     }
 
     #[test]
@@ -302,6 +346,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("nodes"));
+    }
+
+    #[test]
+    fn nodes_accepts_long_option_and_rejects_positional_compatibility() {
+        let cli = Cli::try_parse_from(["bench", "--nodes", "7"]).unwrap();
+        assert_eq!(cli.nodes, Some(7));
+        assert!(Cli::try_parse_from(["bench", "7"]).is_err());
     }
     #[test]
     fn queue_capacity_must_cover_workers() {

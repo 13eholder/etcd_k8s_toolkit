@@ -1,5 +1,5 @@
 use crate::{
-    client::ClientBundle,
+    client::{ClientBundle, RequestDisposition, RetryDecision, RpcMethod},
     config::{
         EtcdLeasePoolSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy, RuntimeConfig,
         WorkloadSpec,
@@ -13,12 +13,15 @@ use crate::{
     pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse},
     workload::{
         CasDecision, CasLoop, ExhaustedReason, KeyState, ResourceOperation,
-        RetryPolicy as CasRetryPolicy, TxnAttempt, build_compact_revision_txn, failure_version,
+        RetryPolicy as CasRetryPolicy, TxnAttempt, build_compact_revision_txn, failure_value,
+        failure_version,
     },
 };
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering},
@@ -26,7 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch as shutdown_watch},
+    task::JoinSet,
     time::{self, Instant as TokioInstant},
 };
 
@@ -39,7 +43,11 @@ pub enum WorkItem {
         value: Vec<u8>,
         pool: Option<String>,
     },
-    Range(RangeRequest),
+    Range {
+        request: RangeRequest,
+        selector_keep_every: u64,
+        target: u64,
+    },
     Heartbeat(HeartbeatItem),
     Bootstrap {
         item: HeartbeatItem,
@@ -52,10 +60,180 @@ pub enum WorkItem {
         done: oneshot::Sender<Result<(), String>>,
     },
     Status,
-    CompactTick {
-        observed_revision: i64,
-        previous_revision: Option<i64>,
-    },
+    CompactTick,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactorStatus {
+    Active,
+    ResyncRequired,
+}
+
+impl Default for CompactorStatus {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+impl CompactorStatus {
+    fn as_metric(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::ResyncRequired => "resync_required",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactorRecovery {
+    MissingKey,
+    InvalidValue,
+}
+
+impl CompactorRecovery {
+    fn as_metric(self) -> &'static str {
+        match self {
+            Self::MissingKey => "missing_key",
+            Self::InvalidValue => "invalid_value",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactorObservationError {
+    FailureKvMissing,
+    FailureValueNotUtf8,
+    FailureValueNotDecimal,
+    FailureVersionMissing,
+    FailureVersionInvalid,
+}
+
+impl CompactorObservationError {
+    fn as_metric(self) -> &'static str {
+        match self {
+            Self::FailureKvMissing => "failure_kv_missing",
+            Self::FailureValueNotUtf8 => "failure_value_not_utf8",
+            Self::FailureValueNotDecimal => "failure_value_not_decimal",
+            Self::FailureVersionMissing => "failure_version_missing",
+            Self::FailureVersionInvalid => "failure_version_invalid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompactorState {
+    compact_version: i64,
+    previous_txn_header_revision: i64,
+    status: CompactorStatus,
+    recovery: Option<CompactorRecovery>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactTxnObservation {
+    header_revision: i64,
+    compact_target: Option<i64>,
+    remote_compact_revision: Option<i64>,
+    succeeded: bool,
+    recovered: bool,
+    recovery: Option<CompactorRecovery>,
+}
+
+impl CompactorState {
+    fn txn_inputs(&self) -> (i64, i64) {
+        (self.compact_version, self.previous_txn_header_revision)
+    }
+
+    fn is_active(&self) -> bool {
+        self.status == CompactorStatus::Active
+    }
+
+    fn mark_resync_required(&mut self, header_revision: i64, recovery: CompactorRecovery) {
+        self.compact_version = 0;
+        self.previous_txn_header_revision = header_revision;
+        self.status = CompactorStatus::ResyncRequired;
+        self.recovery = Some(recovery);
+    }
+
+    fn mark_recovered(&mut self, header_revision: i64, version: i64) {
+        self.compact_version = version;
+        self.previous_txn_header_revision = header_revision;
+        self.status = CompactorStatus::Active;
+        self.recovery = None;
+    }
+
+    fn observe(
+        &mut self,
+        response: &TxnResponse,
+    ) -> Result<CompactTxnObservation, CompactorObservationError> {
+        let header_revision = response.header.as_ref().map_or(0, |header| header.revision);
+        let old_previous = self.previous_txn_header_revision;
+        let was_resync = !self.is_active();
+        if response.succeeded {
+            let recovery = self.recovery;
+            if was_resync {
+                // A Version==0 compare succeeding proves the journal key was
+                // absent.  Rebuilding it is safe and this tick must not
+                // compact anything based on the stale local header.
+                self.mark_recovered(header_revision, 1);
+            } else {
+                self.previous_txn_header_revision = header_revision;
+                self.compact_version = self.compact_version.saturating_add(1);
+            }
+            return Ok(CompactTxnObservation {
+                header_revision,
+                compact_target: (!was_resync && old_previous > 0).then_some(old_previous),
+                remote_compact_revision: None,
+                succeeded: true,
+                recovered: was_resync,
+                recovery,
+            });
+        }
+
+        let Some(value) = failure_value(response) else {
+            self.mark_resync_required(header_revision, CompactorRecovery::MissingKey);
+            return Err(CompactorObservationError::FailureKvMissing);
+        };
+        let value = match std::str::from_utf8(value) {
+            Ok(value) => value,
+            Err(_) => {
+                self.mark_resync_required(header_revision, CompactorRecovery::InvalidValue);
+                return Err(CompactorObservationError::FailureValueNotUtf8);
+            }
+        };
+        let remote_compact_revision = match value.parse::<i64>() {
+            Ok(value) if value >= 0 => value,
+            Ok(_) | Err(_) => {
+                self.mark_resync_required(header_revision, CompactorRecovery::InvalidValue);
+                return Err(CompactorObservationError::FailureValueNotDecimal);
+            }
+        };
+        let Some(version) = failure_version(response) else {
+            self.mark_resync_required(header_revision, CompactorRecovery::InvalidValue);
+            return Err(CompactorObservationError::FailureVersionMissing);
+        };
+        if version <= 0 {
+            self.mark_resync_required(header_revision, CompactorRecovery::InvalidValue);
+            return Err(CompactorObservationError::FailureVersionInvalid);
+        }
+        let recovery = self.recovery;
+        if was_resync {
+            // A Version==0 probe can only fail while the key exists.  A
+            // legal value/version pair therefore supplies a complete,
+            // auditable resync snapshot; no Compact is issued in this tick.
+            self.mark_recovered(header_revision, version);
+        } else {
+            self.previous_txn_header_revision = header_revision;
+            self.compact_version = version;
+        }
+        Ok(CompactTxnObservation {
+            header_revision,
+            compact_target: None,
+            remote_compact_revision: Some(remote_compact_revision),
+            succeeded: false,
+            recovered: was_resync,
+            recovery,
+        })
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScheduleStats {
@@ -451,16 +629,14 @@ impl RangeProducer {
 struct RangeShapePlan {
     prefix_total: u64,
     seen: u64,
-    limit_10000: u64,
     count_only: u64,
 }
 
 impl RangeShapePlan {
-    fn new(prefix_total: u64, limit_10000: u64, count_only: u64) -> Self {
+    fn new(prefix_total: u64, count_only: u64) -> Self {
         Self {
             prefix_total,
             seen: 0,
-            limit_10000,
             count_only,
         }
     }
@@ -477,16 +653,279 @@ impl RangeShapePlan {
     fn apply(&mut self, request: &mut RangeRequest) {
         let slot = self.seen;
         self.seen = self.seen.saturating_add(1);
-        let shaped_total = self.limit_10000.saturating_add(self.count_only);
-        if !Self::takes(slot, shaped_total, self.prefix_total) {
+        if !Self::takes(slot, self.count_only, self.prefix_total) {
             return;
         }
-        let shaped_before = slot as u128 * shaped_total as u128 / self.prefix_total.max(1) as u128;
-        let shaped_ordinal = shaped_before as u64;
-        if Self::takes(shaped_ordinal, self.count_only, shaped_total) {
-            request.count_only = true;
+        request.count_only = true;
+        request.limit = 0;
+    }
+}
+/// Explicit selector policy used by the Range pager. One means all candidates
+/// match; larger values deterministically discard every Nth candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeSelector {
+    All { target: Option<u64> },
+    DropEvery { every: usize, target: Option<u64> },
+}
+
+impl RangeSelector {
+    fn selected_in_page(self, key_count: usize, page_offset: usize) -> usize {
+        match self {
+            Self::All { .. } => key_count,
+            Self::DropEvery { every, .. } if every <= 1 => key_count,
+            Self::DropEvery { every, .. } => (0..key_count)
+                .filter(|index| (page_offset + *index + 1) % every != 0)
+                .count(),
+        }
+    }
+
+    fn target(self) -> Option<u64> {
+        match self {
+            Self::All { target } | Self::DropEvery { target, .. } => target,
+        }
+    }
+}
+
+fn configured_range_selector(selector_keep_every: u64, target: u64) -> RangeSelector {
+    let target = (target > 0).then_some(target);
+    if selector_keep_every <= 1 {
+        RangeSelector::All { target }
+    } else {
+        RangeSelector::DropEvery {
+            every: usize::try_from(selector_keep_every).unwrap_or(usize::MAX),
+            target,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RangeExecutionResult {
+    pages: u64,
+    snapshot_revision: i64,
+    server_count: i64,
+    last_key: Vec<u8>,
+    selected: u64,
+    discarded: u64,
+}
+#[derive(Debug)]
+struct RangeExecutionError {
+    outcome: Outcome,
+    message: String,
+}
+
+impl RangeExecutionError {
+    fn new(outcome: Outcome, message: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RangePageOutcome {
+    Complete,
+    Continue(RangeRequest),
+}
+
+#[derive(Clone, Debug)]
+struct RangePager {
+    request: RangeRequest,
+    paged: bool,
+    revision: Option<i64>,
+    page_limit: i64,
+    pages: u64,
+    server_count: i64,
+    last_key: Vec<u8>,
+    selected: u64,
+    discarded: u64,
+    target: Option<u64>,
+}
+
+impl RangePager {
+    const INITIAL_LIMIT: i64 = 500;
+    const MAX_LIMIT: i64 = 10_000;
+
+    fn new(mut request: RangeRequest, selector: RangeSelector) -> Self {
+        // Only bounded prefix LISTs use the internal 500-page pager.  An
+        // unbounded prefix (`limit=0`) preserves its one-shot wire shape.
+        let paged = !request.count_only && !request.range_end.is_empty() && request.limit > 0;
+        let page_limit = if paged {
+            Self::INITIAL_LIMIT
         } else {
-            request.limit = 10_000;
+            request.limit
+        };
+        if paged {
+            request.limit = page_limit;
+        }
+        Self {
+            request,
+            paged,
+            revision: None,
+            page_limit,
+            pages: 0,
+            server_count: 0,
+            last_key: Vec::new(),
+            selected: 0,
+            discarded: 0,
+            target: selector.target(),
+        }
+    }
+
+    fn request(&self) -> RangeRequest {
+        self.request.clone()
+    }
+
+    fn result(&self) -> RangeExecutionResult {
+        RangeExecutionResult {
+            pages: self.pages,
+            snapshot_revision: self.revision.unwrap_or_default(),
+            server_count: self.server_count,
+            last_key: self.last_key.clone(),
+            selected: self.selected,
+            discarded: self.discarded,
+        }
+    }
+
+    fn observe_response(
+        &mut self,
+        response: &crate::pb::etcdserverpb::RangeResponse,
+        selected_in_page: usize,
+    ) -> Result<RangePageOutcome, String> {
+        let response_revision = response.header.as_ref().map_or(0, |header| header.revision);
+        match self.revision {
+            None => self.revision = Some(response_revision),
+            Some(revision) if revision != response_revision => {
+                return Err(format!(
+                    "Range page revision changed from {revision} to {response_revision}"
+                ));
+            }
+            Some(_) => {}
+        }
+        self.pages = self.pages.saturating_add(1);
+        self.server_count = response.count;
+        if let Some(last) = response.kvs.last() {
+            self.last_key = last.key.clone();
+        }
+        let selected_in_page = selected_in_page.min(response.kvs.len());
+        self.selected = self.selected.saturating_add(selected_in_page as u64);
+        self.discarded = self
+            .discarded
+            .saturating_add((response.kvs.len() - selected_in_page) as u64);
+        if !self.paged {
+            return Ok(RangePageOutcome::Complete);
+        }
+        if response.more && response.kvs.is_empty() {
+            return Err("Range response has more=true but no KVs".to_string());
+        }
+        if self.target.is_some_and(|target| self.selected >= target) {
+            return Ok(RangePageOutcome::Complete);
+        }
+        if !response.more {
+            return Ok(RangePageOutcome::Complete);
+        }
+        let last_key = response
+            .kvs
+            .last()
+            .map(|kv| kv.key.clone())
+            .ok_or_else(|| "Range response has more=true but no KVs".to_string())?;
+        if selected_in_page < response.kvs.len() {
+            self.page_limit = self.page_limit.saturating_mul(2).min(Self::MAX_LIMIT);
+        }
+        self.request.key = {
+            let mut key = last_key;
+            key.push(0);
+            key
+        };
+        self.request.limit = self.page_limit;
+        self.request.revision = self.revision.unwrap_or_default();
+        Ok(RangePageOutcome::Continue(self.request()))
+    }
+}
+async fn execute_range(
+    client: &ClientBundle,
+    request: RangeRequest,
+    selector: RangeSelector,
+    timeout: Duration,
+    latest_revision: Arc<AtomicI64>,
+) -> Result<RangeExecutionResult, RangeExecutionError> {
+    const MAX_PAGE_ATTEMPTS: u32 = 8;
+    if timeout.is_zero() {
+        return Err(RangeExecutionError::new(
+            Outcome::Timeout,
+            "Range operation deadline is zero",
+        ));
+    }
+    let deadline = Instant::now() + timeout;
+    let mut pager = RangePager::new(request, selector);
+    let mut page_offset = 0usize;
+    loop {
+        let page_request = pager.request();
+        let mut attempts = 0;
+        let response = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                metrics::record_request(Rpc::Range, Outcome::Timeout);
+                break Err(RangeExecutionError::new(
+                    Outcome::Timeout,
+                    "Range operation deadline exceeded",
+                ));
+            }
+            attempts += 1;
+            let start = Instant::now();
+            metrics::add_inflight(Rpc::Range);
+            let result = time::timeout(remaining, client.range(page_request.clone())).await;
+            metrics::remove_inflight(Rpc::Range);
+            metrics::record_request_duration(Rpc::Range, start.elapsed());
+            metrics::record_request_bytes(
+                &ResourceName::new("range").unwrap(),
+                page_request.key.len() + page_request.range_end.len(),
+            );
+            match result {
+                Ok(Ok(response)) => {
+                    metrics::record_request(Rpc::Range, Outcome::Success);
+                    break Ok(response);
+                }
+                Ok(Err(error)) => {
+                    let decision =
+                        error.retry_decision(RpcMethod::Range, RequestDisposition::Unknown);
+                    let outcome = match decision {
+                        RetryDecision::ResultUnknown => Outcome::ResultUnknown,
+                        RetryDecision::NotSent | RetryDecision::Retry | RetryDecision::Stop => {
+                            Outcome::GrpcError
+                        }
+                    };
+                    metrics::record_request(Rpc::Range, outcome);
+                    if decision == RetryDecision::Retry && attempts < MAX_PAGE_ATTEMPTS {
+                        continue;
+                    }
+                    let message = if decision == RetryDecision::Retry {
+                        format!("Range retry limit reached: {error}")
+                    } else {
+                        error.to_string()
+                    };
+                    break Err(RangeExecutionError::new(outcome, message));
+                }
+                Err(_) => {
+                    metrics::record_request(Rpc::Range, Outcome::Timeout);
+                    break Err(RangeExecutionError::new(
+                        Outcome::Timeout,
+                        "Range page request deadline exceeded",
+                    ));
+                }
+            }
+        }?;
+        if let Some(header) = response.header.as_ref() {
+            update_revision(&latest_revision, header.revision);
+        }
+        let selected = selector.selected_in_page(response.kvs.len(), page_offset);
+        page_offset = page_offset.saturating_add(response.kvs.len());
+        match pager
+            .observe_response(&response, selected)
+            .map_err(|error| RangeExecutionError::new(Outcome::GrpcError, error))?
+        {
+            RangePageOutcome::Complete => return Ok(pager.result()),
+            RangePageOutcome::Continue(_) => {}
         }
     }
 }
@@ -508,25 +947,25 @@ fn range_shape_plan(
     prefix_total: u64,
     time_scale: f64,
 ) -> Result<RangeShapePlan, String> {
-    let limit_10000 = (workload.range_limit_10000_count as f64 * time_scale).round() as u64;
     let count_only = (workload.range_count_only_count as f64 * time_scale).round() as u64;
-    if limit_10000.saturating_add(count_only) > prefix_total {
+    if count_only > prefix_total {
         return Err(format!(
-            "scaled Range shape count ({}) exceeds scheduled prefix Range capacity ({prefix_total})",
-            limit_10000.saturating_add(count_only)
+            "scaled Range shape count ({count_only}) exceeds scheduled prefix Range capacity ({prefix_total})",
         ));
     }
-    Ok(RangeShapePlan::new(prefix_total, limit_10000, count_only))
-}
-
-fn deterministic_unit(seed: u64, n: u64) -> f64 {
-    splitmix(seed.wrapping_add(n)) as f64 / u64::MAX as f64
+    Ok(RangeShapePlan::new(prefix_total, count_only))
 }
 fn splitmix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
 }
+
+fn deterministic_unit(seed: u64, index: u64) -> f64 {
+    const MANTISSA_BITS: u32 = 53;
+    (splitmix(seed ^ index) >> (64 - MANTISSA_BITS)) as f64 / (1u64 << MANTISSA_BITS) as f64
+}
+
 fn stable_shard(key: &[u8], workers: usize) -> usize {
     if workers == 0 {
         0
@@ -617,6 +1056,103 @@ struct SharedPool {
     keep_alive: Option<Arc<KeepAliveHandle>>,
 }
 
+type WatchTaskOutput = (
+    String,
+    Result<crate::watch::WatchOutcome, crate::watch::WatchError>,
+);
+
+fn spawn_watches(
+    client: &ClientBundle,
+    specs: &[crate::config::WatchSpec],
+) -> (shutdown_watch::Sender<bool>, JoinSet<WatchTaskOutput>) {
+    let (shutdown, receiver) = shutdown_watch::channel(false);
+    let mut tasks = JoinSet::new();
+    for spec in specs.iter().cloned() {
+        let name = spec.name.clone();
+        let watch_receiver = receiver.clone();
+        let watch_client = client.clone();
+        tasks.spawn(async move {
+            let result = crate::watch::run(watch_client, spec, watch_receiver).await;
+            (name, result)
+        });
+    }
+    (shutdown, tasks)
+}
+
+fn watch_failure(
+    name: &str,
+    result: Result<crate::watch::WatchOutcome, crate::watch::WatchError>,
+) -> Option<String> {
+    match result {
+        Ok(outcome) if outcome.terminal == crate::watch::WatchTerminal::ContextCanceled => None,
+        Ok(outcome) => Some(format!("watch {name} terminated: {:?}", outcome.terminal)),
+        Err(error) => Some(format!("watch {name} failed: {error}")),
+    }
+}
+
+async fn stop_watches(
+    shutdown: shutdown_watch::Sender<bool>,
+    mut tasks: JoinSet<WatchTaskOutput>,
+    timeout: Duration,
+) {
+    let _ = shutdown.send(true);
+    let remaining = timeout;
+    match time::timeout(remaining, async {
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((name, result)) => {
+                    if let Some(error) = watch_failure(&name, result) {
+                        eprintln!("watch shutdown error: {error}");
+                    }
+                }
+                Err(error) => eprintln!("watch task failed during shutdown: {error}"),
+            }
+        }
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            eprintln!("watch shutdown timed out");
+        }
+    }
+}
+
+type CtrlCFuture = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
+
+enum ScheduleControl {
+    Deadline,
+    Interrupted,
+    WatchCompleted,
+}
+
+async fn wait_for_schedule_event(
+    tasks: &mut JoinSet<WatchTaskOutput>,
+    deadline: TokioInstant,
+    ctrl_c: &mut CtrlCFuture,
+) -> Result<ScheduleControl, String> {
+    tokio::select! {
+        biased;
+        watch_result = tasks.join_next(), if !tasks.is_empty() => {
+            match watch_result {
+                Some(Ok((name, result))) => {
+                    if let Some(error) = watch_failure(&name, result) {
+                        Err(error)
+                    } else {
+                        Ok(ScheduleControl::WatchCompleted)
+                    }
+                }
+                Some(Err(error)) => Err(format!("watch task failed: {error}")),
+                None => Ok(ScheduleControl::WatchCompleted),
+            }
+        }
+        _ = time::sleep_until(deadline) => Ok(ScheduleControl::Deadline),
+        _ = ctrl_c.as_mut() => Ok(ScheduleControl::Interrupted),
+    }
+}
+
 pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<ScheduleStats, String> {
     if config.queue_capacity < config.workers {
         return Err(format!(
@@ -633,7 +1169,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
     let cas_conflicts = Arc::new(AtomicU64::new(config.workload.cas_conflicts));
     let lease_epoch = TokioInstant::now();
     let mut stats = ScheduleStats::default();
-    let mut previous_compact_revision = None;
     let pools: Arc<HashMap<String, Arc<SharedPool>>> = Arc::new(
         config
             .workload
@@ -683,6 +1218,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             scheduler.workload.nodes.status_interval_s * scheduler.time_scale,
         ),
         seed: scheduler.seed,
+        node_lease_enabled: scheduler.workload.nodes.node_lease_enabled,
     });
     let started = TokioInstant::now();
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
@@ -763,6 +1299,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         drain_workers(senders, workers, pools, config.operation_timeout).await;
         return Ok(stats);
     }
+    let (watch_shutdown, mut watch_tasks) = spawn_watches(&client, &scheduler.workload.watches);
     let duration = scheduler.duration();
     let mut app = RateCursor::new(
         &scheduler.workload,
@@ -798,7 +1335,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         ranges.total(),
     );
     let mut range_shapes =
-        range_shape_plan(&scheduler.workload, prefix_total, scheduler.time_scale)?;
+        match range_shape_plan(&scheduler.workload, prefix_total, scheduler.time_scale) {
+            Ok(plan) => plan,
+            Err(error) => {
+                stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
+                drain_workers(senders, workers, pools, config.operation_timeout).await;
+                return Err(error);
+            }
+        };
     let mut heap = BinaryHeap::new();
     let mut sequence = 0u64;
     let push = |at: Duration,
@@ -822,25 +1366,29 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
     }
     let status_interval =
         Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s * scheduler.time_scale);
-    for node in 0..scheduler.nodes {
-        let lease_at = heartbeat_interval(
-            scheduler.seed,
-            node,
-            0,
-            Duration::from_secs_f64(
-                scheduler.workload.nodes.lease_interval_s * scheduler.time_scale,
-            ),
-            scheduler.workload.nodes.lease_jitter,
-        );
-        if lease_at <= duration {
-            push(
-                lease_at,
+    if scheduler.workload.nodes.node_lease_enabled {
+        for node in 0..scheduler.nodes {
+            let lease_at = heartbeat_interval(
+                scheduler.seed,
+                node,
                 0,
-                Source::NodeLease(node),
-                &mut heap,
-                &mut sequence,
+                Duration::from_secs_f64(
+                    scheduler.workload.nodes.lease_interval_s * scheduler.time_scale,
+                ),
+                scheduler.workload.nodes.lease_jitter,
             );
+            if lease_at <= duration {
+                push(
+                    lease_at,
+                    0,
+                    Source::NodeLease(node),
+                    &mut heap,
+                    &mut sequence,
+                );
+            }
         }
+    }
+    for node in 0..scheduler.nodes {
         if !status_interval.is_zero() {
             let status_at = node_status_phase(node, scheduler.nodes, status_interval);
             if status_at <= duration {
@@ -895,10 +1443,29 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             &mut sequence,
         );
     }
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let mut ctrl_c: CtrlCFuture = Box::pin(tokio::signal::ctrl_c());
     while let Some(event) = heap.pop() {
         let deadline = started + event.at;
-        tokio::select! { _ = time::sleep_until(deadline) => {}, _ = &mut ctrl_c => { break; } }
+        let control = match wait_for_schedule_event(&mut watch_tasks, deadline, &mut ctrl_c).await {
+            Ok(control) => control,
+            Err(error) => {
+                cleanup_watch_failure(
+                    watch_shutdown,
+                    watch_tasks,
+                    senders,
+                    workers,
+                    pools,
+                    config.operation_timeout,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        match control {
+            ScheduleControl::Deadline => {}
+            ScheduleControl::Interrupted => break,
+            ScheduleControl::WatchCompleted => continue,
+        }
         match event.source {
             Source::App => {
                 if let Some((at, _)) = app.next() {
@@ -948,9 +1515,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                         &ResourceName::new("range").unwrap(),
                     );
                     stats.scheduled += 1;
-                    match senders[stable_shard(&request.key, workers_count)]
-                        .try_send(WorkItem::Range(request))
-                    {
+                    match senders[stable_shard(&request.key, workers_count)].try_send(
+                        WorkItem::Range {
+                            request,
+                            selector_keep_every: scheduler.workload.ranges[index]
+                                .selector_keep_every,
+                            target: scheduler.workload.ranges[index].limit,
+                        },
+                    ) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             stats.dropped += 1;
@@ -1104,10 +1676,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 }
             }
             Source::Compact(tick) => {
-                let observed = latest_revision.load(AtomicOrdering::Relaxed);
-                let previous = previous_compact_revision.replace(observed);
                 let compact_key = ResourceName::new("compact_rev_key").unwrap();
-                let compact = ResourceName::new("compact").unwrap();
                 metrics::record_scheduled(
                     if tick == 0 {
                         Operation::Create
@@ -1117,15 +1686,9 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     &compact_key,
                 );
                 stats.scheduled += 1;
-                if previous.is_some_and(|revision| revision > 0) {
-                    metrics::record_scheduled(Operation::Compact, &compact);
-                    stats.scheduled += 1;
-                }
-                let item = WorkItem::CompactTick {
-                    observed_revision: observed,
-                    previous_revision: previous.filter(|revision| *revision > 0),
-                };
-                match senders[stable_shard(b"compact_rev_key", workers_count)].try_send(item) {
+                match senders[stable_shard(b"compact_rev_key", workers_count)]
+                    .try_send(WorkItem::CompactTick)
+                {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         stats.dropped += 1;
@@ -1140,6 +1703,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             }
         }
     }
+    stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
     drain_workers(senders, workers, pools, config.operation_timeout).await;
     Ok(stats)
 }
@@ -1150,6 +1714,17 @@ fn bootstrap_allows_main_load(interrupted: bool) -> bool {
 fn update_revision(latest_revision: &AtomicI64, revision: i64) {
     let previous = latest_revision.fetch_max(revision, AtomicOrdering::Relaxed);
     metrics::set_revision(previous.max(revision));
+}
+async fn cleanup_watch_failure(
+    watch_shutdown: shutdown_watch::Sender<bool>,
+    watch_tasks: JoinSet<WatchTaskOutput>,
+    senders: Vec<mpsc::Sender<WorkItem>>,
+    workers: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    pools: Arc<HashMap<String, Arc<SharedPool>>>,
+    timeout: Duration,
+) {
+    abort_workers(senders, workers, pools).await;
+    stop_watches(watch_shutdown, watch_tasks, timeout).await;
 }
 
 async fn drain_workers(
@@ -1162,8 +1737,36 @@ async fn drain_workers(
     let drain_deadline = TokioInstant::now() + timeout;
     for worker in workers {
         let remaining = drain_deadline.saturating_duration_since(TokioInstant::now());
-        let _ = time::timeout(remaining, worker).await;
+        let mut worker = worker;
+        tokio::select! {
+            result = &mut worker => {
+                let _ = result;
+            }
+            _ = time::sleep(remaining) => {
+                worker.abort();
+                let _ = worker.await;
+            }
+        }
     }
+    close_pools(pools).await;
+}
+
+async fn abort_workers(
+    senders: Vec<mpsc::Sender<WorkItem>>,
+    workers: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    pools: Arc<HashMap<String, Arc<SharedPool>>>,
+) {
+    drop(senders);
+    for worker in &workers {
+        worker.abort();
+    }
+    for worker in workers {
+        let _ = worker.await;
+    }
+    close_pools(pools).await;
+}
+
+async fn close_pools(pools: Arc<HashMap<String, Arc<SharedPool>>>) {
     if let Ok(pools) = Arc::try_unwrap(pools) {
         for (_, pool) in pools {
             if let Ok(mut pool) = Arc::try_unwrap(pool) {
@@ -1196,7 +1799,7 @@ async fn worker_loop(
     cas_conflicts: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let mut states = HashMap::new();
-    let mut compact_version = 0i64;
+    let mut compactor = CompactorState::default();
     while let Some(item) = receiver.recv().await {
         match item {
             WorkItem::Txn {
@@ -1259,28 +1862,36 @@ async fn worker_loop(
                     }
                 }
             }
-            WorkItem::Range(request) => {
-                let start = Instant::now();
-                metrics::add_inflight(Rpc::Range);
-                let result = client.range(request.clone()).await;
-                metrics::remove_inflight(Rpc::Range);
-                metrics::record_request_duration(Rpc::Range, start.elapsed());
-                metrics::record_request_bytes(
-                    &ResourceName::new("range").unwrap(),
-                    request.key.len() + request.range_end.len(),
-                );
+            WorkItem::Range {
+                request,
+                selector_keep_every,
+                target,
+            } => {
+                let selector = configured_range_selector(selector_keep_every, target);
                 let label = ResourceName::new("range").unwrap();
-                let outcome = match result {
-                    Ok(response) => {
-                        if let Some(header) = response.header.as_ref() {
-                            update_revision(&latest_revision, header.revision);
-                        }
-                        metrics::record_request(Rpc::Range, Outcome::Success);
+                let outcome = match execute_range(
+                    &client,
+                    request,
+                    selector,
+                    timeout,
+                    latest_revision.clone(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        metrics::record_range_result(
+                            result.pages,
+                            result.snapshot_revision,
+                            result.server_count,
+                            &result.last_key,
+                            result.selected,
+                            result.discarded,
+                        );
                         Outcome::Success
                     }
-                    Err(_) => {
-                        metrics::record_request(Rpc::Range, Outcome::GrpcError);
-                        Outcome::GrpcError
+                    Err(error) => {
+                        let _ = error.message;
+                        error.outcome
                     }
                 };
                 metrics::record_operation(Operation::Read, &label, outcome);
@@ -1349,136 +1960,168 @@ async fn worker_loop(
                 .await;
             }
             WorkItem::Status => {
-                let start = Instant::now();
-                metrics::add_inflight(Rpc::Status);
-                let result = client.status().await;
-                metrics::remove_inflight(Rpc::Status);
-                metrics::record_request_duration(Rpc::Status, start.elapsed());
-                metrics::record_request_bytes(&ResourceName::new("status").unwrap(), 0);
                 let label = ResourceName::new("status").unwrap();
-                let outcome = match result {
-                    Ok(response) => {
-                        if let Some(header) = response.header.as_ref() {
-                            update_revision(&latest_revision, header.revision);
-                        }
-                        metrics::record_request(Rpc::Status, Outcome::Success);
-                        Outcome::Success
-                    }
-                    Err(_) => {
-                        metrics::record_request(Rpc::Status, Outcome::GrpcError);
-                        Outcome::GrpcError
-                    }
-                };
+                let outcome = execute_status(&client, timeout, latest_revision.clone()).await;
                 metrics::record_operation(Operation::Read, &label, outcome);
             }
-            WorkItem::CompactTick {
-                observed_revision,
-                previous_revision,
-            } => {
-                execute_compact_tick(
-                    &client,
-                    observed_revision,
-                    previous_revision,
-                    &mut compact_version,
-                    timeout,
-                    latest_revision.clone(),
-                )
-                .await;
+            WorkItem::CompactTick => {
+                execute_compact_tick(&client, &mut compactor, timeout, latest_revision.clone())
+                    .await;
             }
         }
     }
     Ok(())
 }
+async fn execute_status(
+    client: &ClientBundle,
+    timeout: Duration,
+    latest_revision: Arc<AtomicI64>,
+) -> Outcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            metrics::record_request(Rpc::Status, Outcome::Timeout);
+            return Outcome::Timeout;
+        }
+        let start = Instant::now();
+        metrics::add_inflight(Rpc::Status);
+        let result = time::timeout(remaining, client.status()).await;
+        metrics::remove_inflight(Rpc::Status);
+        metrics::record_request_duration(Rpc::Status, start.elapsed());
+        metrics::record_request_bytes(&ResourceName::new("status").unwrap(), 0);
+        match result {
+            Ok(Ok(response)) => {
+                if let Some(header) = response.header.as_ref() {
+                    update_revision(&latest_revision, header.revision);
+                }
+                metrics::record_request(Rpc::Status, Outcome::Success);
+                return Outcome::Success;
+            }
+            Ok(Err(error)) => {
+                match error.retry_decision(RpcMethod::Status, RequestDisposition::Unknown) {
+                    RetryDecision::Retry => {
+                        metrics::record_request(Rpc::Status, Outcome::GrpcError);
+                        let delay = Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now()));
+                        if delay.is_zero() {
+                            return Outcome::Timeout;
+                        }
+                        time::sleep(delay).await;
+                    }
+                    RetryDecision::NotSent => {
+                        metrics::record_request(Rpc::Status, Outcome::GrpcError);
+                        return Outcome::GrpcError;
+                    }
+                    RetryDecision::ResultUnknown | RetryDecision::Stop => {
+                        metrics::record_request(Rpc::Status, Outcome::GrpcError);
+                        return Outcome::GrpcError;
+                    }
+                }
+            }
+            Err(_) => {
+                metrics::record_request(Rpc::Status, Outcome::Timeout);
+                return Outcome::Timeout;
+            }
+        }
+    }
+}
 async fn execute_compact_tick(
     client: &ClientBundle,
-    observed_revision: i64,
-    previous_revision: Option<i64>,
-    coordination_version: &mut i64,
+    compactor: &mut CompactorState,
     timeout: Duration,
     latest_revision: Arc<AtomicI64>,
 ) {
-    let coordination_revision = previous_revision.unwrap_or(observed_revision);
-    let value = coordination_revision.to_string();
+    let (coordination_version, previous_txn_header_revision) = compactor.txn_inputs();
+    let value = previous_txn_header_revision.to_string();
     let label = ResourceName::new("compact_rev_key").unwrap();
-    let operation = if previous_revision.is_none() {
+    let operation = if coordination_version == 0 {
         Operation::Create
     } else {
         Operation::Update
     };
-    let deadline = Instant::now() + timeout;
+    metrics::set_compactor_state(compactor.status.as_metric());
 
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            metrics::record_operation(operation, &label, Outcome::Timeout);
-            if previous_revision.is_some() {
-                metrics::record_operation(
-                    Operation::Compact,
-                    &ResourceName::new("compact").unwrap(),
-                    Outcome::Timeout,
-                );
-            }
-            return;
-        }
-        let request = build_compact_revision_txn(value.as_bytes(), *coordination_version);
-        let start = Instant::now();
-        metrics::add_inflight(Rpc::Txn);
-        let result = time::timeout(remaining, client.txn(request)).await;
-        metrics::remove_inflight(Rpc::Txn);
-        metrics::record_request_duration(Rpc::Txn, start.elapsed());
-        metrics::record_request_bytes(&label, b"compact_rev_key".len() + value.len());
-        let response = match result {
-            Ok(Ok(response)) => {
-                metrics::record_request(Rpc::Txn, Outcome::Success);
-                response
-            }
-            Ok(Err(_)) => {
-                metrics::record_request(Rpc::Txn, Outcome::GrpcError);
-                metrics::record_operation(operation, &label, Outcome::GrpcError);
-                if previous_revision.is_some() {
-                    metrics::record_operation(
-                        Operation::Compact,
-                        &ResourceName::new("compact").unwrap(),
-                        Outcome::GrpcError,
-                    );
-                }
-                return;
-            }
-            Err(_) => {
-                metrics::record_request(Rpc::Txn, Outcome::Timeout);
-                metrics::record_operation(operation, &label, Outcome::Timeout);
-                if previous_revision.is_some() {
-                    metrics::record_operation(
-                        Operation::Compact,
-                        &ResourceName::new("compact").unwrap(),
-                        Outcome::Timeout,
-                    );
-                }
-                return;
-            }
-        };
-        if let Some(header) = response.header.as_ref() {
-            update_revision(&latest_revision, header.revision);
-        }
-        metrics::record_txn(
-            &label,
-            TxnShape::CompactRevision,
-            if response.succeeded {
-                TxnResult::Committed
-            } else {
-                TxnResult::Conflict
-            },
-        );
-        if response.succeeded {
-            *coordination_version = coordination_version.saturating_add(1);
-            metrics::record_operation(operation, &label, Outcome::Success);
-            break;
-        }
-        *coordination_version = failure_version(&response).unwrap_or(0);
-        metrics::record_cas_retry(&label, operation);
+    let deadline = Instant::now() + timeout;
+    if timeout.is_zero() {
+        metrics::record_operation(operation, &label, Outcome::Timeout);
+        return;
     }
 
-    let Some(revision) = previous_revision else {
+    let request = build_compact_revision_txn(value.as_bytes(), coordination_version);
+    let start = Instant::now();
+    metrics::add_inflight(Rpc::Txn);
+    let result = time::timeout(timeout, client.txn(request)).await;
+    metrics::remove_inflight(Rpc::Txn);
+    metrics::record_request_duration(Rpc::Txn, start.elapsed());
+    metrics::record_request_bytes(&label, b"compact_rev_key".len() + value.len());
+    let response = match result {
+        Ok(Ok(response)) => {
+            metrics::record_request(Rpc::Txn, Outcome::Success);
+            response
+        }
+        Ok(Err(error)) => {
+            let decision = error.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown);
+            let outcome = match decision {
+                RetryDecision::ResultUnknown => Outcome::ResultUnknown,
+                RetryDecision::NotSent | RetryDecision::Retry | RetryDecision::Stop => {
+                    Outcome::GrpcError
+                }
+            };
+            metrics::record_request(Rpc::Txn, outcome);
+            metrics::record_operation(operation, &label, outcome);
+            return;
+        }
+        Err(_) => {
+            metrics::record_request(Rpc::Txn, Outcome::ResultUnknown);
+            metrics::record_operation(operation, &label, Outcome::ResultUnknown);
+            return;
+        }
+    };
+
+    if let Some(header) = response.header.as_ref() {
+        update_revision(&latest_revision, header.revision);
+    }
+    let observation = match compactor.observe(&response) {
+        Ok(observation) => observation,
+        Err(error) => {
+            metrics::record_txn(&label, TxnShape::CompactRevision, TxnResult::Conflict);
+            metrics::record_compactor_error(error.as_metric());
+            metrics::set_compactor_state(compactor.status.as_metric());
+            metrics::record_operation(operation, &label, Outcome::GrpcError);
+            return;
+        }
+    };
+    metrics::set_compactor_state(compactor.status.as_metric());
+    if observation.recovered {
+        if let Some(recovery) = observation.recovery {
+            metrics::record_compactor_recovery(recovery.as_metric());
+        } else {
+            metrics::record_compactor_recovery("resync");
+        }
+    }
+    metrics::record_txn(
+        &label,
+        TxnShape::CompactRevision,
+        if observation.succeeded {
+            TxnResult::Committed
+        } else {
+            TxnResult::Conflict
+        },
+    );
+    if !observation.succeeded {
+        // A CAS conflict is coordination, not a business-object retry.  The
+        // embedded Range supplies both the next logical version and the
+        // revision another compactor already published.
+        if let Some(revision) = observation.remote_compact_revision {
+            metrics::set_compact_revision(revision);
+        }
+        metrics::record_operation(operation, &label, Outcome::Success);
+        return;
+    }
+    metrics::record_operation(operation, &label, Outcome::Success);
+
+    let Some(revision) = observation.compact_target else {
         return;
     };
     let compact = ResourceName::new("compact").unwrap();
@@ -1505,18 +2148,21 @@ async fn execute_compact_tick(
             if let Some(header) = response.header.as_ref() {
                 update_revision(&latest_revision, header.revision);
             }
-            metrics::record_request(Rpc::Compact, Outcome::Success);
+            metrics::set_compact_revision(revision);
             Outcome::Success
         }
-        Ok(Err(_)) => {
-            metrics::record_request(Rpc::Compact, Outcome::GrpcError);
-            Outcome::GrpcError
+        Ok(Err(error)) => {
+            let decision = error.retry_decision(RpcMethod::Compact, RequestDisposition::Unknown);
+            match decision {
+                RetryDecision::ResultUnknown => Outcome::ResultUnknown,
+                RetryDecision::NotSent | RetryDecision::Retry | RetryDecision::Stop => {
+                    Outcome::GrpcError
+                }
+            }
         }
-        Err(_) => {
-            metrics::record_request(Rpc::Compact, Outcome::Timeout);
-            Outcome::Timeout
-        }
+        Err(_) => Outcome::ResultUnknown,
     };
+    metrics::record_request(Rpc::Compact, outcome);
     metrics::record_compact(outcome);
     metrics::record_operation(Operation::Compact, &compact, outcome);
 }
@@ -1551,12 +2197,12 @@ async fn acquire_lease(
                     id = Some(lease_id);
                 }
             }
-            LeaseEvent::Grant { ttl } => loop {
+            LeaseEvent::Grant { ttl } => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     metrics::record_request(Rpc::LeaseGrant, Outcome::Timeout);
                     failure = Some(Outcome::Timeout);
-                    break;
+                    continue;
                 }
                 let start = Instant::now();
                 metrics::add_inflight(Rpc::LeaseGrant);
@@ -1582,33 +2228,30 @@ async fn acquire_lease(
                         if let Some(handle) = &shared.keep_alive {
                             handle.register(response.id, ttl).await;
                         }
-                        break;
                     }
                     Ok(Ok(_)) => {
                         metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
                         failure = Some(Outcome::GrpcError);
-                        break;
                     }
                     Ok(Err(error)) => {
-                        metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
-                        failure = Some(Outcome::GrpcError);
-                        if !error.is_retriable() {
-                            break;
-                        }
-                        let delay = Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now()));
-                        if delay.is_zero() {
-                            break;
-                        }
-                        time::sleep(delay).await;
+                        let decision = error
+                            .retry_decision(RpcMethod::LeaseGrant, RequestDisposition::Unknown);
+                        let outcome = match decision {
+                            RetryDecision::ResultUnknown => Outcome::ResultUnknown,
+                            RetryDecision::NotSent | RetryDecision::Retry => Outcome::GrpcError,
+                            RetryDecision::Stop => Outcome::GrpcError,
+                        };
+                        metrics::record_request(Rpc::LeaseGrant, outcome);
+                        failure = Some(outcome);
                     }
+                    // A local deadline can race with a server-side grant.  The
+                    // lease id is therefore unknown; never submit another grant.
                     Err(_) => {
-                        metrics::record_request(Rpc::LeaseGrant, Outcome::Timeout);
-                        failure = Some(Outcome::Timeout);
-                        break;
+                        metrics::record_request(Rpc::LeaseGrant, Outcome::ResultUnknown);
+                        failure = Some(Outcome::ResultUnknown);
                     }
                 }
-            },
+            }
         }
     }
     id.ok_or_else(|| failure.unwrap_or(Outcome::GrpcError))
@@ -1654,7 +2297,6 @@ fn storage_operation_for_state(
         None
     }
 }
-
 fn take_storage_attempt(used: &mut u32, limit: u32) -> bool {
     if *used >= limit {
         return false;
@@ -1662,7 +2304,6 @@ fn take_storage_attempt(used: &mut u32, limit: u32) -> bool {
     *used = used.saturating_add(1);
     true
 }
-
 async fn execute_txn(
     client: &ClientBundle,
     label: &ResourceName,
@@ -1671,7 +2312,7 @@ async fn execute_txn(
     value: Vec<u8>,
     operation: ResourceOperation,
     mut inject_conflict: bool,
-    transport_policy: CasRetryPolicy,
+    _transport_policy: CasRetryPolicy,
     cas_policy: CasRetryPolicy,
     recreate_missing: bool,
     timeout: Duration,
@@ -1679,7 +2320,6 @@ async fn execute_txn(
     latest_revision: Arc<AtomicI64>,
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
-    let mut outer_attempt = 0u32;
     let mut current_value = value;
     let mut state = states.get(&key).cloned().unwrap_or_default();
     let mut storage_attempts = 0u32;
@@ -1695,7 +2335,6 @@ async fn execute_txn(
             metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
             return Outcome::Timeout;
         }
-        outer_attempt = outer_attempt.saturating_add(1);
         let mut attempt = match storage_operation {
             ResourceOperation::Create => TxnAttempt::create(key.clone(), current_value.clone()),
             ResourceOperation::GuaranteedUpdate => {
@@ -1709,7 +2348,8 @@ async fn execute_txn(
                 TxnAttempt::update(key.clone(), current_value.clone(), expected_revision)
             }
             ResourceOperation::ConditionalDelete => {
-                TxnAttempt::delete(key.clone(), state.mod_revision().unwrap_or(0))
+                let revision = state.mod_revision().unwrap_or(0);
+                TxnAttempt::delete(key.clone(), revision)
             }
         };
         let mut cas = CasLoop::new(attempt.clone(), cas_policy, deadline);
@@ -1739,25 +2379,28 @@ async fn execute_txn(
                     response
                 }
                 Err(_) => {
-                    metrics::record_request(Rpc::Txn, Outcome::Timeout);
-                    metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
-                    return Outcome::Timeout;
+                    // A local deadline can race with server-side execution.
+                    // Treat the mutable result as unknown and never replay.
+                    metrics::record_request(Rpc::Txn, Outcome::ResultUnknown);
+                    metrics::record_operation(
+                        operation_metric(operation),
+                        label,
+                        Outcome::ResultUnknown,
+                    );
+                    return Outcome::ResultUnknown;
                 }
                 Ok(Err(error)) => {
-                    metrics::record_request(Rpc::Txn, Outcome::GrpcError);
-                    if !error.is_retriable() || outer_attempt >= transport_policy.max_attempts {
-                        metrics::record_operation(
-                            operation_metric(operation),
-                            label,
-                            Outcome::GrpcError,
-                        );
-                        return Outcome::GrpcError;
-                    }
-                    let delay = transport_policy
-                        .delay_for(stable_shard(&key, usize::MAX) as u64, outer_attempt);
-                    time::sleep(delay.min(deadline.saturating_duration_since(Instant::now())))
-                        .await;
-                    break;
+                    let decision =
+                        error.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown);
+                    let outcome = match decision {
+                        RetryDecision::ResultUnknown => Outcome::ResultUnknown,
+                        RetryDecision::NotSent | RetryDecision::Retry | RetryDecision::Stop => {
+                            Outcome::GrpcError
+                        }
+                    };
+                    metrics::record_request(Rpc::Txn, outcome);
+                    metrics::record_operation(operation_metric(operation), label, outcome);
+                    return outcome;
                 }
             };
             metrics::record_txn(
@@ -1918,10 +2561,11 @@ async fn execute_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pb::{etcdserverpb::ResponseOp, mvccpb};
     #[test]
     fn lazy_cursor_has_bounded_state() {
         let workload = WorkloadSpec {
-            name: "x".into(),
+            name: "mock_k8".into(),
             pod_size_bytes: 4096,
             nodes: crate::config::NodeSpec {
                 count: 1,
@@ -1930,6 +2574,7 @@ mod tests {
                 lease_jitter: 0.0,
                 status_retry_limit: 5,
                 lease_retry_limit: 5,
+                node_lease_enabled: false,
             },
             timeline: vec![crate::config::TimelineSegment {
                 duration_s: 10.0,
@@ -1949,12 +2594,12 @@ mod tests {
             }],
             ranges: vec![],
             range_fixtures: vec![],
+            watches: vec![],
             etcd_lease_pools: vec![],
             status_count: 0,
             compact_interval_s: 300.0,
             master_lease_interval_s: 10.0,
             cas_conflicts: 0,
-            range_limit_10000_count: 0,
             range_count_only_count: 0,
         };
         let cursor = RateCursor::new(&workload, 1.0, true, 1.0, 1, 1);
@@ -1987,7 +2632,7 @@ mod tests {
     }
     #[test]
     fn embedded_ranges_scan_resource_prefixes() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
         let pods = workload
             .ranges
             .iter()
@@ -2009,7 +2654,7 @@ mod tests {
 
     #[test]
     fn application_quotas_are_exact_and_exclude_masterlease() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
         let total = application_operation_total(&workload, 1.0, 1.0);
         assert_eq!(total, 514_085);
         assert_eq!(application_operation_total(&workload, 1.0, 0.001), 514);
@@ -2065,7 +2710,7 @@ mod tests {
 
     #[test]
     fn range_shape_plan_emits_exact_trace_counts() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
         let ranges = RateCursor::new(&workload, 1.0, false, 1.0, 1, 0xB2);
         assert_eq!(ranges.total(), 22_080);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
@@ -2073,9 +2718,7 @@ mod tests {
         let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
         let mut plan = range_shape_plan(&workload, prefix_total, 1.0).unwrap();
         assert_eq!(plan.prefix_total, 16_875);
-        assert_eq!(plan.limit_10000, 2_720);
         assert_eq!(plan.count_only, 220);
-        let mut limit_10000 = 0;
         let mut count_only = 0;
         for _ in 0..plan.prefix_total {
             let mut request = RangeRequest {
@@ -2083,17 +2726,15 @@ mod tests {
                 ..Default::default()
             };
             plan.apply(&mut request);
-            limit_10000 += u64::from(request.limit == 10_000);
             count_only += u64::from(request.count_only);
         }
-        assert_eq!(limit_10000, 2_720);
         assert_eq!(count_only, 220);
     }
 
     #[test]
     fn range_shapes_follow_actual_prefix_slots() {
         let mut workload =
-            WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+            WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
         workload.ranges = vec![
             crate::config::RangeSpec {
                 key_pattern: "/registry/prefix/".into(),
@@ -2101,6 +2742,7 @@ mod tests {
                 limit: 500,
                 count_only: false,
                 weight: 1.0,
+                selector_keep_every: 1,
             },
             crate::config::RangeSpec {
                 key_pattern: "/registry/point".into(),
@@ -2108,9 +2750,9 @@ mod tests {
                 limit: 0,
                 count_only: false,
                 weight: 1.0,
+                selector_keep_every: 1,
             },
         ];
-        workload.range_limit_10000_count = 1;
         workload.range_count_only_count = 0;
         let weights = vec![1.0, 1.0];
         let producer = RangeProducer::new(weights.iter().copied());
@@ -2127,10 +2769,156 @@ mod tests {
                     ..Default::default()
                 };
                 plan.apply(&mut request);
-                shaped += u64::from(request.limit == 10_000);
+                shaped += u64::from(request.count_only);
             }
         }
-        assert_eq!(shaped, 1);
+        assert_eq!(shaped, 0);
+    }
+
+    fn range_page(
+        revision: i64,
+        keys: &[&[u8]],
+        more: bool,
+        count: i64,
+    ) -> crate::pb::etcdserverpb::RangeResponse {
+        crate::pb::etcdserverpb::RangeResponse {
+            header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                revision,
+                ..Default::default()
+            }),
+            kvs: keys
+                .iter()
+                .map(|key| crate::pb::mvccpb::KeyValue {
+                    key: key.to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+            more,
+            count,
+        }
+    }
+
+    #[test]
+    fn range_pager_pages_without_duplicates_and_fixes_revision() {
+        let request = RangeRequest {
+            key: b"/registry/pods/".to_vec(),
+            range_end: b"/registry/pods0".to_vec(),
+            limit: 10_000,
+            ..Default::default()
+        };
+        let mut pager = RangePager::new(request, RangeSelector::All { target: None });
+        assert_eq!(pager.request().limit, 500);
+        let first = range_page(42, &[b"a", b"b"], true, 4);
+        assert!(matches!(
+            pager.observe_response(&first, 2).unwrap(),
+            RangePageOutcome::Continue(_)
+        ));
+        let next = pager.request();
+        assert_eq!(next.key, b"b\0");
+        assert_eq!(next.range_end, b"/registry/pods0");
+        assert_eq!(next.revision, 42);
+        let second = range_page(42, &[b"c", b"d"], false, 4);
+        assert_eq!(
+            pager.observe_response(&second, 2).unwrap(),
+            RangePageOutcome::Complete
+        );
+        assert_eq!(pager.result().last_key, b"d");
+        assert_eq!(pager.result().selected, 4);
+        assert_eq!(pager.result().discarded, 0);
+        assert_eq!(pager.result().snapshot_revision, 42);
+    }
+
+    #[test]
+    fn range_pager_rejects_revision_change_and_empty_more_page() {
+        let request = RangeRequest {
+            key: b"/registry/pods/".to_vec(),
+            range_end: b"/registry/pods0".to_vec(),
+            limit: 500,
+            ..Default::default()
+        };
+        let mut pager = RangePager::new(request.clone(), RangeSelector::All { target: None });
+        let first = range_page(7, &[b"a"], true, 2);
+        assert!(pager.observe_response(&first, 1).is_ok());
+        let changed = range_page(8, &[b"b"], false, 2);
+        assert!(pager.observe_response(&changed, 1).is_err());
+
+        let mut empty = RangePager::new(request, RangeSelector::All { target: None });
+        let response = range_page(7, &[], true, 1);
+        let error = empty.observe_response(&response, 0).unwrap_err();
+        assert!(error.contains("more=true"));
+    }
+
+    #[test]
+    fn range_pager_selector_doubles_limit_to_ten_thousand() {
+        let request = RangeRequest {
+            key: b"/registry/pods/".to_vec(),
+            range_end: b"/registry/pods0".to_vec(),
+            limit: 10_000,
+            ..Default::default()
+        };
+        let spec = crate::config::RangeSpec {
+            key_pattern: "/registry/pods/".into(),
+            kind: "prefix".into(),
+            limit: 0,
+            count_only: false,
+            weight: 1.0,
+            selector_keep_every: 2,
+        };
+        let selector = configured_range_selector(spec.selector_keep_every, spec.limit);
+        let mut pager = RangePager::new(request, selector);
+        for expected_limit in [500, 1_000, 2_000, 4_000, 8_000, 10_000] {
+            assert_eq!(pager.request().limit, expected_limit);
+            let key = [expected_limit as u8];
+            let response = range_page(9, &[&key, b"keep"], expected_limit != 10_000, 12);
+            let selected = selector.selected_in_page(response.kvs.len(), 0);
+            let outcome = pager.observe_response(&response, selected).unwrap();
+            if expected_limit != 10_000 {
+                assert!(matches!(outcome, RangePageOutcome::Continue(_)));
+            } else {
+                assert_eq!(outcome, RangePageOutcome::Complete);
+            }
+        }
+        assert_eq!(pager.result().discarded, 6);
+    }
+
+    #[test]
+    fn range_pager_point_count_only_and_unbounded_prefix_are_single_request_shapes() {
+        for request in [
+            RangeRequest {
+                key: b"/registry/pods/item".to_vec(),
+                limit: 1,
+                ..Default::default()
+            },
+            RangeRequest {
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
+                count_only: true,
+                limit: 0,
+                ..Default::default()
+            },
+            RangeRequest {
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
+                limit: 0,
+                ..Default::default()
+            },
+        ] {
+            let original = request.clone();
+            let mut pager = RangePager::new(
+                request,
+                RangeSelector::DropEvery {
+                    every: 2,
+                    target: Some(100),
+                },
+            );
+            assert_eq!(pager.request(), original);
+            let response = range_page(3, &[b"a"], true, 1);
+            assert_eq!(
+                pager.observe_response(&response, 0).unwrap(),
+                RangePageOutcome::Complete
+            );
+            assert_eq!(pager.result().pages, 1);
+        }
     }
 
     #[test]
@@ -2164,7 +2952,7 @@ mod tests {
 
     #[test]
     fn embedded_read_only_prefixes_have_bootstrap_fixtures() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/density.json")).unwrap();
+        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
         for prefix in ["services", "endpointslices"] {
             let fixture = workload
                 .range_fixtures
@@ -2183,5 +2971,300 @@ mod tests {
     fn interrupted_bootstrap_blocks_main_load() {
         assert!(!bootstrap_allows_main_load(true));
         assert!(bootstrap_allows_main_load(false));
+    }
+
+    #[tokio::test]
+    async fn scheduler_watch_supervision_reports_terminal_before_deadline() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async {
+            (
+                "pods".to_string(),
+                Ok(crate::watch::WatchOutcome {
+                    terminal: crate::watch::WatchTerminal::Canceled {
+                        reason: "server canceled".into(),
+                    },
+                    state: crate::watch::WatchState::default(),
+                }),
+            )
+        });
+        let mut ctrl_c: CtrlCFuture =
+            Box::pin(std::future::pending::<Result<(), std::io::Error>>());
+
+        let result = wait_for_schedule_event(
+            &mut tasks,
+            TokioInstant::now() + Duration::from_secs(60),
+            &mut ctrl_c,
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("watch terminal should stop scheduling");
+        };
+        assert_eq!(
+            error,
+            "watch pods terminated: Canceled { reason: \"server canceled\" }"
+        );
+    }
+
+    #[test]
+    fn scheduler_watch_supervision_accepts_context_shutdown() {
+        let outcome = crate::watch::WatchOutcome {
+            terminal: crate::watch::WatchTerminal::ContextCanceled,
+            state: crate::watch::WatchState::default(),
+        };
+        assert_eq!(watch_failure("pods", Ok(outcome)), None);
+    }
+
+    #[tokio::test]
+    async fn watch_failure_aborts_queued_workers_before_returning() {
+        let mut watch_tasks = JoinSet::new();
+        watch_tasks.spawn(async {
+            (
+                "pods".to_string(),
+                Err(crate::watch::WatchError::Terminal(
+                    crate::watch::WatchOutcome {
+                        terminal: crate::watch::WatchTerminal::Canceled {
+                            reason: "server failed".into(),
+                        },
+                        state: crate::watch::WatchState::default(),
+                    },
+                )),
+            )
+        });
+        let mut ctrl_c: CtrlCFuture =
+            Box::pin(std::future::pending::<Result<(), std::io::Error>>());
+        let result = wait_for_schedule_event(
+            &mut watch_tasks,
+            TokioInstant::now() + Duration::from_secs(60),
+            &mut ctrl_c,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("watch failure should stop scheduling");
+        };
+        assert!(error.starts_with("watch pods failed: watch terminated: Canceled"));
+        assert!(error.contains("server failed"));
+
+        let (sender, mut receiver) = mpsc::channel(2);
+        let processed = Arc::new(AtomicU64::new(0));
+        let processed_by_worker = processed.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_by_worker = entered.clone();
+        let worker = tokio::spawn(async move {
+            while receiver.recv().await.is_some() {
+                processed_by_worker.fetch_add(1, AtomicOrdering::Relaxed);
+                entered_by_worker.notify_waiters();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        });
+        let entered_wait = entered.notified();
+        sender.send(WorkItem::Status).await.unwrap();
+        entered_wait.await;
+        sender.send(WorkItem::Status).await.unwrap();
+
+        let pool = Arc::new(SharedPool {
+            pool: Mutex::new(LeasePool::new(LeasePoolConfig::default())),
+            keep_alive: None,
+        });
+        let pool_weak = Arc::downgrade(&pool);
+        let mut pool_map = HashMap::new();
+        pool_map.insert("test".to_string(), pool.clone());
+        drop(pool);
+
+        let (watch_shutdown, _) = shutdown_watch::channel(false);
+        cleanup_watch_failure(
+            watch_shutdown,
+            watch_tasks,
+            vec![sender],
+            vec![worker],
+            Arc::new(pool_map),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(processed.load(AtomicOrdering::Relaxed), 1);
+        assert!(pool_weak.upgrade().is_none());
+    }
+
+    fn compact_response(
+        header_revision: i64,
+        succeeded: bool,
+        remote_version: i64,
+        remote_value: &[u8],
+    ) -> TxnResponse {
+        TxnResponse {
+            header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                revision: header_revision,
+                ..Default::default()
+            }),
+            succeeded,
+            responses: if succeeded {
+                Vec::new()
+            } else {
+                vec![ResponseOp {
+                    response: Some(
+                        crate::pb::etcdserverpb::response_op::Response::ResponseRange(
+                            crate::pb::etcdserverpb::RangeResponse {
+                                kvs: vec![mvccpb::KeyValue {
+                                    version: remote_version,
+                                    value: remote_value.to_vec(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                }]
+            },
+            ..Default::default()
+        }
+    }
+    fn compact_response_without_kv(header_revision: i64) -> TxnResponse {
+        TxnResponse {
+            header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                revision: header_revision,
+                ..Default::default()
+            }),
+            succeeded: false,
+            responses: vec![ResponseOp {
+                response: Some(
+                    crate::pb::etcdserverpb::response_op::Response::ResponseRange(
+                        crate::pb::etcdserverpb::RangeResponse::default(),
+                    ),
+                ),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compactor_first_tick_puts_zero_without_compacting() {
+        let mut state = CompactorState::default();
+        assert_eq!(state.txn_inputs(), (0, 0));
+        let observation = state.observe(&compact_response(11, true, 0, b"")).unwrap();
+        assert_eq!(observation.compact_target, None);
+        assert_eq!(
+            state,
+            CompactorState {
+                compact_version: 1,
+                previous_txn_header_revision: 11,
+                status: CompactorStatus::Active,
+                recovery: None,
+            }
+        );
+    }
+
+    #[test]
+    fn compactor_success_targets_previous_txn_header() {
+        let mut state = CompactorState::default();
+        state.observe(&compact_response(11, true, 0, b"")).unwrap();
+        assert_eq!(state.txn_inputs(), (1, 11));
+        let observation = state.observe(&compact_response(20, true, 0, b"")).unwrap();
+        assert_eq!(observation.compact_target, Some(11));
+        assert_eq!(state.txn_inputs(), (2, 20));
+    }
+
+    #[test]
+    fn compactor_cas_failure_syncs_remote_state_without_retry() {
+        let mut state = CompactorState {
+            compact_version: 2,
+            previous_txn_header_revision: 20,
+            status: CompactorStatus::Active,
+            recovery: None,
+        };
+        let observation = state
+            .observe(&compact_response(30, false, 7, b"19"))
+            .unwrap();
+        assert_eq!(observation.compact_target, None);
+        assert_eq!(observation.remote_compact_revision, Some(19));
+        assert_eq!(state.txn_inputs(), (7, 30));
+    }
+
+    #[test]
+    fn compactor_next_tick_after_failure_uses_own_header() {
+        let mut state = CompactorState {
+            compact_version: 2,
+            previous_txn_header_revision: 20,
+            status: CompactorStatus::Active,
+            recovery: None,
+        };
+        state
+            .observe(&compact_response(30, false, 7, b"19"))
+            .unwrap();
+        assert_eq!(state.txn_inputs(), (7, 30));
+        let observation = state.observe(&compact_response(40, true, 0, b"")).unwrap();
+        assert_eq!(observation.compact_target, Some(30));
+        assert_eq!(state.txn_inputs(), (8, 40));
+    }
+
+    #[test]
+    fn compactor_missing_failure_kv_requires_resync() {
+        let mut state = CompactorState {
+            compact_version: 7,
+            previous_txn_header_revision: 20,
+            status: CompactorStatus::Active,
+            recovery: None,
+        };
+        assert_eq!(
+            state.observe(&compact_response_without_kv(30)),
+            Err(CompactorObservationError::FailureKvMissing)
+        );
+        assert_eq!(state.status, CompactorStatus::ResyncRequired);
+        assert_eq!(state.recovery, Some(CompactorRecovery::MissingKey));
+        assert_eq!(state.txn_inputs(), (0, 30));
+
+        // The next tick is a single Version==0 CAS probe.  Its success
+        // rebuilds the journal and cannot trigger a stale Compact.
+        let recovery = state.observe(&compact_response(40, true, 0, b"")).unwrap();
+        assert!(recovery.recovered);
+        assert_eq!(recovery.compact_target, None);
+        assert_eq!(state.status, CompactorStatus::Active);
+        assert_eq!(state.recovery, None);
+        assert_eq!(state.txn_inputs(), (1, 40));
+
+        let next = state.observe(&compact_response(50, true, 0, b"")).unwrap();
+        assert_eq!(next.compact_target, Some(40));
+        assert_eq!(state.txn_inputs(), (2, 50));
+    }
+
+    #[test]
+    fn compactor_malformed_value_stays_explicit_until_legal_remote_state() {
+        let mut state = CompactorState {
+            compact_version: 7,
+            previous_txn_header_revision: 20,
+            status: CompactorStatus::Active,
+            recovery: None,
+        };
+        assert_eq!(
+            state.observe(&compact_response(30, false, 7, b"not-a-revision")),
+            Err(CompactorObservationError::FailureValueNotDecimal)
+        );
+        assert_eq!(state.status, CompactorStatus::ResyncRequired);
+        assert_eq!(state.recovery, Some(CompactorRecovery::InvalidValue));
+        // Every malformed tick coordinates again and remains explicit; it
+        // never carries forward the old version/header into Compact.
+        assert_eq!(
+            state.observe(&compact_response(40, false, 8, b"\xff")),
+            Err(CompactorObservationError::FailureValueNotUtf8)
+        );
+        assert_eq!(state.status, CompactorStatus::ResyncRequired);
+        assert_eq!(state.txn_inputs(), (0, 40));
+
+        // A legal remote value completes resync in the same failed Txn
+        // response, still without a Compact on this tick.
+        let recovery = state
+            .observe(&compact_response(50, false, 9, b"19"))
+            .unwrap();
+        assert!(recovery.recovered);
+        assert_eq!(recovery.compact_target, None);
+        assert_eq!(recovery.remote_compact_revision, Some(19));
+        assert_eq!(state.status, CompactorStatus::Active);
+        assert_eq!(state.recovery, None);
+        assert_eq!(state.txn_inputs(), (9, 50));
+
+        let next = state.observe(&compact_response(60, true, 0, b"")).unwrap();
+        assert_eq!(next.compact_target, Some(50));
+        assert_eq!(state.txn_inputs(), (10, 60));
     }
 }

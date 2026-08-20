@@ -1,28 +1,93 @@
+use std::pin::Pin;
 use std::time::Duration;
 
+use tokio_stream::Stream;
+use tonic::codec::Streaming;
+use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 use crate::pb::etcdserverpb::{
     CompactionRequest, CompactionResponse, LeaseGrantRequest, LeaseGrantResponse, RangeRequest,
-    RangeResponse, StatusRequest, StatusResponse, TxnRequest, TxnResponse, kv_client::KvClient,
-    lease_client::LeaseClient, maintenance_client::MaintenanceClient,
+    RangeResponse, StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest,
+    WatchResponse, kv_client::KvClient, lease_client::LeaseClient,
+    maintenance_client::MaintenanceClient, watch_client::WatchClient as GeneratedWatchClient,
 };
 
-/// Shared tonic transport and independently clonable etcd service clients.
-/// Cloning a bundle clones the HTTP/2 channel rather than opening another
-/// connection, which lets each worker own a client without a mutex hot path.
+pub type WatchRequestStream = Pin<Box<dyn Stream<Item = WatchRequest> + Send + 'static>>;
+pub const REQUIRE_LEADER_METADATA: &str = "hasleader";
+/// Construct the tonic Watch request with etcd's canonical require-leader
+/// metadata. Keeping construction separate makes the metadata observable
+/// before the request is handed to the generated client.
+pub fn watch_request<S>(requests: S) -> Request<S> {
+    let mut request = Request::new(requests);
+    request
+        .metadata_mut()
+        .insert(REQUIRE_LEADER_METADATA, MetadataValue::from_static("true"));
+    request
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextError {
+    Cancelled,
+    DeadlineExceeded,
+}
+
 #[derive(Clone)]
 pub struct ClientBundle {
     kv: KvClient<Channel>,
     lease: LeaseClient<Channel>,
     maintenance: MaintenanceClient<Channel>,
+    watch: GeneratedWatchClient<Channel>,
 }
 
 #[derive(Debug)]
 pub enum ClientError {
     Transport(tonic::transport::Error),
     Rpc(Status),
+    Context(ContextError),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcMutability {
+    ReadOnly,
+    Mutable,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcMethod {
+    Range,
+    Status,
+    Txn,
+    LeaseGrant,
+    Compact,
+}
+
+impl RpcMethod {
+    pub const fn mutability(self) -> RpcMutability {
+        match self {
+            Self::Range | Self::Status => RpcMutability::ReadOnly,
+            Self::Txn | Self::LeaseGrant | Self::Compact => RpcMutability::Mutable,
+        }
+    }
+
+    pub const fn is_mutable(self) -> bool {
+        matches!(self.mutability(), RpcMutability::Mutable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestDisposition {
+    /// A local, structured failure proved that no request bytes were sent.
+    NotSent,
+    /// The request was handed to tonic, but no response was received.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryDecision {
+    Retry,
+    NotSent,
+    ResultUnknown,
+    Stop,
 }
 
 impl std::fmt::Display for ClientError {
@@ -30,6 +95,7 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Transport(error) => write!(f, "etcd transport error: {error}"),
             Self::Rpc(error) => write!(f, "etcd RPC error: {error}"),
+            Self::Context(error) => write!(f, "etcd request context error: {error:?}"),
         }
     }
 }
@@ -40,16 +106,50 @@ impl From<Status> for ClientError {
     }
 }
 impl ClientError {
-    pub fn is_retriable(&self) -> bool {
+    /// Classify one error in the context of the concrete RPC method.
+    ///
+    /// The old method-free classifier was deliberately removed: replaying
+    /// a mutable request after a lost response can duplicate a lease or write.
+    /// `NotSent` is only supplied by callers with structured local evidence;
+    /// tonic RPC failures use `Unknown`.
+    pub fn retry_decision(
+        &self,
+        method: RpcMethod,
+        disposition: RequestDisposition,
+    ) -> RetryDecision {
+        if disposition == RequestDisposition::NotSent {
+            return RetryDecision::NotSent;
+        }
         match self {
-            Self::Transport(_) => true,
-            Self::Rpc(status) => matches!(
-                status.code(),
-                Code::Unavailable
-                    | Code::DeadlineExceeded
-                    | Code::ResourceExhausted
-                    | Code::Aborted
-            ),
+            Self::Context(_) => RetryDecision::Stop,
+            Self::Transport(_) if !method.is_mutable() => RetryDecision::Retry,
+            Self::Transport(_) => RetryDecision::ResultUnknown,
+            Self::Rpc(status) if !method.is_mutable() => {
+                if matches!(
+                    status.code(),
+                    Code::Unavailable
+                        | Code::DeadlineExceeded
+                        | Code::ResourceExhausted
+                        | Code::Aborted
+                ) {
+                    RetryDecision::Retry
+                } else {
+                    RetryDecision::Stop
+                }
+            }
+            Self::Rpc(status) => {
+                if matches!(
+                    status.code(),
+                    Code::Unavailable
+                        | Code::DeadlineExceeded
+                        | Code::ResourceExhausted
+                        | Code::Aborted
+                ) {
+                    RetryDecision::ResultUnknown
+                } else {
+                    RetryDecision::Stop
+                }
+            }
         }
     }
 }
@@ -72,18 +172,36 @@ impl ClientBundle {
         let lease = LeaseClient::new(channel.clone())
             .max_decoding_message_size(max_message_size)
             .max_encoding_message_size(max_message_size);
-        let maintenance = MaintenanceClient::new(channel)
+        let maintenance = MaintenanceClient::new(channel.clone())
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
+        let watch = GeneratedWatchClient::new(channel)
             .max_decoding_message_size(max_message_size)
             .max_encoding_message_size(max_message_size);
         Ok(Self {
             kv,
             lease,
             maintenance,
+            watch,
         })
     }
 
     pub fn lease_client(&self) -> LeaseClient<Channel> {
         self.lease.clone()
+    }
+
+    pub fn watch_client(&self) -> GeneratedWatchClient<Channel> {
+        self.watch.clone()
+    }
+
+    /// Open the single bidirectional Watch RPC with Kubernetes' require-leader
+    /// metadata. The request stream remains owned by the caller for backpressure.
+    pub async fn watch_stream<S>(&self, requests: S) -> Result<Streaming<WatchResponse>, Status>
+    where
+        S: Stream<Item = WatchRequest> + Send + 'static,
+    {
+        let mut client = self.watch.clone();
+        Ok(client.watch(watch_request(requests)).await?.into_inner())
     }
 
     pub async fn status(&self) -> Result<StatusResponse, ClientError> {
@@ -151,6 +269,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn watch_request_contains_canonical_require_leader_metadata() {
+        let request = watch_request(());
+        assert_eq!(
+            request
+                .metadata()
+                .get(REQUIRE_LEADER_METADATA)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
     fn preflight_request_is_canonical_full_keyspace_count_only() {
         assert_eq!(
             ClientBundle::preflight_request(),
@@ -163,5 +295,82 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+    #[test]
+    fn retry_classification_is_method_aware() {
+        let codes = [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+            Code::Aborted,
+        ];
+        for code in codes {
+            let error = ClientError::Rpc(Status::new(code, "transient"));
+            assert_eq!(
+                error.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
+                RetryDecision::Retry
+            );
+            assert_eq!(
+                error.retry_decision(RpcMethod::Status, RequestDisposition::Unknown),
+                RetryDecision::Retry
+            );
+            assert_eq!(
+                error.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
+                RetryDecision::ResultUnknown
+            );
+            assert_eq!(
+                error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::Unknown),
+                RetryDecision::ResultUnknown
+            );
+        }
+    }
+
+    #[test]
+    fn context_and_cas_errors_are_not_transport_retries() {
+        let cancelled = ClientError::Rpc(Status::cancelled("caller cancelled"));
+        assert_eq!(
+            cancelled.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
+            RetryDecision::Stop
+        );
+        assert_eq!(
+            cancelled.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
+            RetryDecision::Stop
+        );
+        let conflict = ClientError::Rpc(Status::aborted("cas conflict"));
+        assert_eq!(
+            conflict.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
+            RetryDecision::ResultUnknown
+        );
+    }
+
+    #[test]
+    fn explicit_not_sent_error_is_separately_classified() {
+        let error = ClientError::Rpc(Status::unavailable("before send"));
+        assert_eq!(
+            error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::NotSent),
+            RetryDecision::NotSent
+        );
+    }
+
+    #[test]
+    fn local_context_errors_stop_without_retry() {
+        let deadline = ClientError::Context(ContextError::DeadlineExceeded);
+        assert_eq!(
+            deadline.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
+            RetryDecision::Stop
+        );
+        let cancelled = ClientError::Context(ContextError::Cancelled);
+        assert_eq!(
+            cancelled.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
+            RetryDecision::Stop
+        );
+    }
+
+    #[test]
+    fn method_mutability_is_explicit() {
+        assert_eq!(RpcMethod::Range.mutability(), RpcMutability::ReadOnly);
+        assert_eq!(RpcMethod::Status.mutability(), RpcMutability::ReadOnly);
+        assert_eq!(RpcMethod::Txn.mutability(), RpcMutability::Mutable);
+        assert_eq!(RpcMethod::LeaseGrant.mutability(), RpcMutability::Mutable);
     }
 }
