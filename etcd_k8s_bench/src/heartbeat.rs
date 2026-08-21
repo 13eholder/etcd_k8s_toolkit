@@ -132,6 +132,7 @@ impl NodeHeartbeatPlanner {
         }
         result
     }
+
     /// Emit bootstrap and all runtime items whose timestamp is no later than
     /// `window`. A status update is never scheduled more than the configured
     /// status interval apart; NodeLease renewal uses deterministic jitter.

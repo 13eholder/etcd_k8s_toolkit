@@ -1,37 +1,30 @@
-use crate::{
-    client::{ClientBundle, RequestDisposition, RetryDecision, RpcMethod},
-    config::{
-        EtcdLeasePoolSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy, RuntimeConfig,
-        WorkloadSpec,
-    },
-    heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner},
-    lease::{KeepAliveHandle, LeaseEvent, LeasePool, LeasePoolConfig},
-    metrics::{
-        self, DropReason, HeartbeatKind, Operation, Outcome, PoolName, ResourceName, Rpc,
-        TxnResult, TxnShape,
-    },
-    pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse},
-    workload::{
-        CasDecision, CasLoop, ExhaustedReason, KeyState, ResourceOperation,
-        RetryPolicy as CasRetryPolicy, TxnAttempt, build_compact_revision_txn, failure_value,
-        failure_version,
-    },
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
+
+use tokio::sync::{Mutex, mpsc, oneshot, watch as shutdown_watch};
+use tokio::task::JoinSet;
+use tokio::time::{self, Instant as TokioInstant};
+
+use crate::client::{ClientBundle, RequestDisposition, RetryDecision, RpcMethod};
+use crate::config::{
+    EtcdLeasePoolSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy, RuntimeConfig, WorkloadSpec,
 };
-use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering},
-    },
-    time::{Duration, Instant},
+use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner};
+use crate::lease::{KeepAliveHandle, LeaseEvent, LeasePool, LeasePoolConfig};
+use crate::metrics::{
+    self, DropReason, HeartbeatKind, Operation, Outcome, PoolName, ResourceName, Rpc, TxnResult,
+    TxnShape,
 };
-use tokio::{
-    sync::{Mutex, mpsc, oneshot, watch as shutdown_watch},
-    task::JoinSet,
-    time::{self, Instant as TokioInstant},
+use crate::pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse};
+use crate::workload::{
+    CasDecision, CasLoop, ExhaustedReason, KeyState, ResourceOperation,
+    RetryPolicy as CasRetryPolicy, TxnAttempt, build_compact_revision_txn, failure_value,
+    failure_version,
 };
 
 #[derive(Debug)]
@@ -258,6 +251,7 @@ impl Scheduler {
             seed: config.seed,
         }
     }
+
     pub fn duration(&self) -> Duration {
         Duration::from_secs_f64(
             self.workload
@@ -349,6 +343,7 @@ impl RateCursor {
             ordinal: 0,
         }
     }
+
     fn next(&mut self) -> Option<(Duration, u64)> {
         loop {
             let segment = self.segments.get_mut(self.index)?;
@@ -365,9 +360,11 @@ impl RateCursor {
             self.index += 1;
         }
     }
+
     fn total(&self) -> u64 {
         self.segments.iter().map(|s| s.count).sum()
     }
+
     fn retarget_total(&mut self, total: u64, seed: u64) {
         let current = self.total();
         if current == total || current == 0 {
@@ -517,6 +514,7 @@ impl LifecycleProducer {
             total_weight,
         }
     }
+
     fn next(&mut self, specs: &[ResourceSpec]) -> Option<(usize, ResourceOperation, u64)> {
         let mut best: Option<(usize, f64)> = None;
         for (index, resource) in self.resources.iter_mut().enumerate() {
@@ -608,6 +606,7 @@ impl RangeProducer {
             deficits,
         }
     }
+
     fn next(&mut self, weights: &[f64]) -> Option<usize> {
         if self.deficits.is_empty() || self.total <= 0.0 {
             return None;
@@ -2561,7 +2560,8 @@ async fn execute_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pb::{etcdserverpb::ResponseOp, mvccpb};
+    use crate::pb::etcdserverpb::ResponseOp;
+    use crate::pb::mvccpb;
     #[test]
     fn lazy_cursor_has_bounded_state() {
         let workload = WorkloadSpec {

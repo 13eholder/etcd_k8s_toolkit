@@ -3,7 +3,8 @@ use std::pin::Pin;
 
 use tokio::sync::watch as shutdown_channel;
 use tokio::time::{Duration, sleep};
-use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Code, Status};
 
 use crate::client::ClientBundle;
@@ -306,6 +307,7 @@ fn record_reconnect(state: &mut WatchState) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
     use tokio::sync::{Mutex, oneshot};
 
     use super::*;

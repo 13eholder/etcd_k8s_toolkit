@@ -10,7 +10,6 @@ mod watch;
 mod workload;
 
 use clap::Parser;
-
 use cli::Cli;
 use client::ClientBundle;
 

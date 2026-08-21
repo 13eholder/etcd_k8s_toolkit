@@ -1,7 +1,11 @@
-use std::{fmt, fs, net::SocketAddr, path::Path, time::Duration};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
+use std::{fmt, fs};
+
+use serde::{Deserialize, Serialize};
 
 use crate::metrics::{PoolName, ResourceName, WorkloadName};
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Profile {

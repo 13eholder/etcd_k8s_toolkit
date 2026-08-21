@@ -7,11 +7,14 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
+use crate::pb::etcdserverpb::kv_client::KvClient;
+use crate::pb::etcdserverpb::lease_client::LeaseClient;
+use crate::pb::etcdserverpb::maintenance_client::MaintenanceClient;
+use crate::pb::etcdserverpb::watch_client::WatchClient as GeneratedWatchClient;
 use crate::pb::etcdserverpb::{
     CompactionRequest, CompactionResponse, LeaseGrantRequest, LeaseGrantResponse, RangeRequest,
     RangeResponse, StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest,
-    WatchResponse, kv_client::KvClient, lease_client::LeaseClient,
-    maintenance_client::MaintenanceClient, watch_client::WatchClient as GeneratedWatchClient,
+    WatchResponse,
 };
 
 pub type WatchRequestStream = Pin<Box<dyn Stream<Item = WatchRequest> + Send + 'static>>;

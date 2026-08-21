@@ -8,12 +8,13 @@
 
 use std::time::{Duration, Instant};
 
-use crate::pb::{etcdserverpb, mvccpb};
+use etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
 use etcdserverpb::{
     Compare, DeleteRangeRequest, PutRequest, RangeRequest, RequestOp, TxnRequest, TxnResponse,
-    compare::{CompareResult, CompareTarget, TargetUnion},
     request_op, response_op,
 };
+
+use crate::pb::{etcdserverpb, mvccpb};
 
 /// The storage operation represented by one logical resource operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +205,7 @@ impl TxnAttempt {
             }
         }
     }
+
     /// Build the transaction and attach a TTL lease to its successful Put.
     /// Lease attachment is intentionally limited to Put operations; CAS
     /// compare/failure Range shape remains unchanged.
@@ -505,8 +507,9 @@ impl RetryPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use etcdserverpb::ResponseOp;
+
+    use super::*;
     fn header(revision: i64) -> etcdserverpb::ResponseHeader {
         etcdserverpb::ResponseHeader {
             revision,

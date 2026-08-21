@@ -110,6 +110,8 @@ impl Kv for ProxyService {
 
 #[tonic::async_trait]
 impl Maintenance for ProxyService {
+    type SnapshotStream = tonic::codec::Streaming<SnapshotResponse>;
+
     async fn alarm(
         &self,
         request: Request<AlarmRequest>,
@@ -156,8 +158,6 @@ impl Maintenance for ProxyService {
         let mut maintenance_client = self.maintenance_client.clone();
         maintenance_client.hash_kv(request).await
     }
-
-    type SnapshotStream = tonic::codec::Streaming<SnapshotResponse>;
 
     async fn snapshot(
         &self,

@@ -4,20 +4,20 @@
 //! ordinary KV transactions planned by `heartbeat`.  This module is for TTL
 //! leases (notably Event objects) returned by `LeaseGrant`.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::{
-    sync::{Mutex, mpsc, watch},
-    task::JoinHandle,
-    time::{self, Instant},
-};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{self, Instant};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
-use crate::{
-    metrics::{self, Outcome, PoolName, ResourceName, Rpc},
-    pb::etcdserverpb::{LeaseKeepAliveRequest, lease_client::LeaseClient},
-};
+use crate::metrics::{self, Outcome, PoolName, ResourceName, Rpc};
+use crate::pb::etcdserverpb::LeaseKeepAliveRequest;
+use crate::pb::etcdserverpb::lease_client::LeaseClient;
 
 /// Pool defaults from Kubernetes' Event TTL lease manager.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +96,7 @@ impl LeasePool {
             .object_ttl
             .saturating_add(self.config.reuse_window)
     }
+
     pub fn start_keep_alive(
         &self,
         client: LeaseClient<Channel>,
@@ -105,6 +106,7 @@ impl LeasePool {
             .keep_alive
             .then(|| KeepAliveHandle::start(client, self.grant_ttl(), pool))
     }
+
     /// Plan allocation of one object.  Reuse is strictly before the reuse
     /// boundary and strictly below the object cap.  Crossing either boundary
     /// emits Expire followed by Grant.
@@ -137,6 +139,7 @@ impl LeasePool {
             objects: 1,
         });
     }
+
     pub fn invalidate(&mut self, lease_id: i64) {
         if matches!(self.current.as_ref(), Some(slot) if slot.id == lease_id) {
             self.current = None;
@@ -204,6 +207,7 @@ impl KeepAliveHandle {
             },
         );
     }
+
     pub async fn is_active(&self, lease_id: i64) -> bool {
         self.leases.lock().await.contains_key(&lease_id)
     }
