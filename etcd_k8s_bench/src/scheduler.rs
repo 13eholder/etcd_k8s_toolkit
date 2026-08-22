@@ -400,7 +400,11 @@ impl RateCursor {
     }
 }
 
-fn application_operation_total(workload: &WorkloadSpec, rate_scale: f64, time_scale: f64) -> u64 {
+pub(crate) fn application_operation_total(
+    workload: &WorkloadSpec,
+    rate_scale: f64,
+    time_scale: f64,
+) -> u64 {
     let weight: f64 = workload
         .resources
         .iter()
@@ -408,6 +412,13 @@ fn application_operation_total(workload: &WorkloadSpec, rate_scale: f64, time_sc
         .map(|resource| resource.create_weight + resource.update_weight + resource.delete_weight)
         .sum();
     (weight * rate_scale * time_scale).round() as u64
+}
+
+/// Total number of independent Range requests the scheduler will emit for
+/// this workload at base scale, using the same per-segment deterministic
+/// rounding as the runtime cursor.
+pub(crate) fn range_request_total(workload: &WorkloadSpec, seed: u64) -> u64 {
+    RateCursor::new(workload, 1.0, false, 1.0, seed, 0xB2).total()
 }
 
 struct ResourceQuota {
@@ -941,8 +952,36 @@ fn exact_prefix_total(
         .count() as u64
 }
 
-fn range_shape_plan(
-    workload: &WorkloadSpec,
+/// Exact number of prefix-kind requests among `range_total` scheduled Range
+/// requests, using the same deterministic producer sequence as the runtime.
+/// Monotone in `range_total` (longer schedules extend the same sequence).
+pub(crate) fn exact_prefix_capacity(workload: &WorkloadSpec, range_total: u64) -> u64 {
+    let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
+    let producer = RangeProducer::new(weights.iter().copied());
+    exact_prefix_total(producer, &weights, &workload.ranges, range_total)
+}
+
+/// Masterlease tick time for `ordinal`, bounded by both the configured
+/// ordinal count and the workload duration so periodic traffic never
+/// outlives the run.  Computes the prospective time without overflowing
+/// even for huge intervals or ordinals.
+fn masterlease_tick_at(
+    interval: Duration,
+    count: u64,
+    ordinal: u64,
+    duration: Duration,
+) -> Option<Duration> {
+    if ordinal >= count {
+        return None;
+    }
+    let secs = interval.as_secs_f64() * (ordinal + 1) as f64;
+    if !secs.is_finite() || secs > duration.as_secs_f64() {
+        return None;
+    }
+    Some(Duration::from_secs_f64(secs))
+}
+
+fn range_shape_plan(    workload: &WorkloadSpec,
     prefix_total: u64,
     time_scale: f64,
 ) -> Result<RangeShapePlan, String> {
@@ -1407,9 +1446,9 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         if spec.retry_policy == ConfigRetryPolicy::MasterLease {
             let count =
                 (spec.create_weight + spec.update_weight + spec.delete_weight).round() as u64;
-            if count > 0 && master_lease_interval <= duration {
+            if let Some(at) = masterlease_tick_at(master_lease_interval, count, 0, duration) {
                 push(
-                    master_lease_interval,
+                    at,
                     0,
                     Source::MasterLease {
                         resource,
@@ -1497,6 +1536,11 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                             metrics::record_dropped(DropReason::QueueClosed);
                         }
                     }
+                } else {
+                    // Producer ran out of schedulable operations before the
+                    // rate cursor did: count it instead of skipping silently.
+                    stats.dropped += 1;
+                    metrics::record_dropped(DropReason::Exhausted);
                 }
             }
             Source::Range => {
@@ -1563,14 +1607,15 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 }
                 let count =
                     (spec.create_weight + spec.update_weight + spec.delete_weight).round() as u64;
-                let next_ordinal = ordinal + 1;
-                if next_ordinal < count {
+                if let Some(at) =
+                    masterlease_tick_at(master_lease_interval, count, ordinal + 1, duration)
+                {
                     push(
-                        master_lease_interval.mul_f64((next_ordinal + 1) as f64),
+                        at,
                         0,
                         Source::MasterLease {
                             resource,
-                            ordinal: next_ordinal,
+                            ordinal: ordinal + 1,
                         },
                         &mut heap,
                         &mut sequence,
@@ -2706,6 +2751,55 @@ mod tests {
             }
         }
         assert_eq!(total, 15_423);
+    }
+
+    #[test]
+    fn rolling_update_workload_schedules_exact_budget() {
+        let base = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        let base_range = range_request_total(&base, 1);
+        let base_app = application_operation_total(&base, 1.0, 1.0);
+        let (nodes, batch) = (100u64, 10u64);
+        let waves = nodes.div_ceil(batch);
+        let workload = base
+            .rolling_update(nodes, batch, 500.0, "rolling-test", base_range, base_app)
+            .unwrap();
+        let expected = 8 * nodes + 1 + 2 * waves;
+        assert_eq!(application_operation_total(&workload, 1.0, 1.0), expected);
+        let cursor = RateCursor::new(&workload, 1.0, true, 1.0, 1, 0xA1);
+        assert_eq!(cursor.total(), expected);
+        let ranges = RateCursor::new(&workload, 1.0, false, 1.0, 1, 0xB2);
+        let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
+        let producer = RangeProducer::new(weights.iter().copied());
+        let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
+        range_shape_plan(&workload, prefix_total, 1.0).unwrap();
+    }
+
+    #[test]
+    fn masterlease_ticks_stop_at_workload_duration() {
+        let interval = Duration::from_secs(10);
+        let duration = Duration::from_secs(15);
+        // Derived short run: only the ordinal-0 tick at t=10s fits.
+        assert_eq!(masterlease_tick_at(interval, 231, 0, duration), Some(interval));
+        assert_eq!(masterlease_tick_at(interval, 231, 1, duration), None);
+        // An interval longer than the run suppresses even the initial tick.
+        assert_eq!(
+            masterlease_tick_at(Duration::from_secs(300), 231, 0, duration),
+            None
+        );
+        // Trace mode: exactly 231 ticks, the last one lands on t == duration.
+        let trace_duration = Duration::from_secs(2310);
+        let ticks = (0..231)
+            .filter(|&ordinal| {
+                masterlease_tick_at(interval, 231, ordinal, trace_duration).is_some()
+            })
+            .count();
+        assert_eq!(ticks, 231);
+        assert_eq!(masterlease_tick_at(interval, 231, 231, trace_duration), None);
+        // Huge intervals cannot overflow even while ordinals remain.
+        assert_eq!(
+            masterlease_tick_at(Duration::from_secs_f64(1e19), 2, 1, trace_duration),
+            None
+        );
     }
 
     #[test]

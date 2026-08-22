@@ -290,6 +290,10 @@ impl HeartbeatKind {
 pub enum DropReason {
     Backpressure,
     QueueClosed,
+    /// The application producer ran out of schedulable operations while the
+    /// rate cursor still had events (possible when a workload with heavy
+    /// delete churn is run at `--rate-scale`/`--time-scale` other than 1).
+    Exhausted,
 }
 
 impl DropReason {
@@ -297,6 +301,7 @@ impl DropReason {
         match self {
             Self::Backpressure => "backpressure",
             Self::QueueClosed => "queue_closed",
+            Self::Exhausted => "exhausted",
         }
     }
 }

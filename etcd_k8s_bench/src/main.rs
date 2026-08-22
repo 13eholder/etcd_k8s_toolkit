@@ -10,7 +10,7 @@ mod watch;
 mod workload;
 
 use clap::Parser;
-use cli::Cli;
+use cli::{Cli, Command};
 use client::ClientBundle;
 
 #[tokio::main]
@@ -23,7 +23,21 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let config = cli
+    let args = match cli.command {
+        Command::GenProfile(args) => {
+            let path = args
+                .generate()
+                .map_err(|error| format!("generate profile: {error}"))?;
+            eprintln!("derived profile written to {}", path.display());
+            eprintln!(
+                "run it with: etcd_k8s_bench run --config {}",
+                path.display()
+            );
+            return Ok(());
+        }
+        Command::Run(args) => args,
+    };
+    let config = args
         .load()
         .map_err(|error| format!("configuration: {error}"))?;
     metrics::install_exporter(config.metrics_listen)
