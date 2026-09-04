@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, oneshot, watch as shutdown_watch};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch as shutdown_watch};
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant as TokioInstant};
 
@@ -32,13 +32,14 @@ use crate::workload::{
 };
 
 #[derive(Debug)]
-pub enum WorkItem {
+enum WorkItem {
     Txn {
         resource: usize,
         key: Vec<u8>,
         operation: ResourceOperation,
         value: Vec<u8>,
         pool: Option<String>,
+        completion: Option<Arc<PhaseTracker>>,
     },
     Range {
         request: RangeRequest,
@@ -246,7 +247,6 @@ pub struct ScheduleStats {
 pub struct Scheduler {
     workload: WorkloadSpec,
     nodes: usize,
-    rate_scale: f64,
     time_scale: f64,
     seed: u64,
 }
@@ -255,7 +255,6 @@ impl Scheduler {
         Self {
             workload: config.workload.clone(),
             nodes: config.nodes as usize,
-            rate_scale: config.rate_scale,
             time_scale: config.time_scale,
             seed: config.seed,
         }
@@ -275,13 +274,20 @@ impl Scheduler {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
-    App,
     Range,
-    MasterLease { resource: usize, ordinal: u64 },
+    MasterLease {
+        resource: usize,
+        id: u64,
+        ordinal: u64,
+    },
     NodeLease(usize),
-    NodeStatus { node: usize, tick: u64 },
+    NodeStatus {
+        node: usize,
+        tick: u64,
+    },
     Status(u64),
     Compact(u64),
+    PhaseEnd,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Scheduled {
@@ -317,23 +323,12 @@ struct RateCursor {
     ordinal: u64,
 }
 impl RateCursor {
-    fn new(
-        workload: &WorkloadSpec,
-        rate_scale: f64,
-        app: bool,
-        time_scale: f64,
-        seed: u64,
-        tag: u64,
-    ) -> Self {
+    fn new(workload: &WorkloadSpec, time_scale: f64, seed: u64, tag: u64) -> Self {
         let mut offset = Duration::ZERO;
         let mut segments = Vec::with_capacity(workload.timeline.len());
         for (index, segment) in workload.timeline.iter().enumerate() {
             let duration = Duration::from_secs_f64(segment.duration_s * time_scale);
-            let rate = if app {
-                segment.application_txn_rps * rate_scale
-            } else {
-                segment.range_rps
-            };
+            let rate = segment.range_rps;
             let expected = rate.max(0.0) * duration.as_secs_f64();
             let base = expected.floor() as u64;
             let count = base
@@ -373,249 +368,279 @@ impl RateCursor {
     fn total(&self) -> u64 {
         self.segments.iter().map(|s| s.count).sum()
     }
-
-    fn retarget_total(&mut self, total: u64, seed: u64) {
-        let current = self.total();
-        if current == total || current == 0 {
-            return;
-        }
-        let exact: Vec<f64> = self
-            .segments
-            .iter()
-            .map(|segment| total as f64 * segment.count as f64 / current as f64)
-            .collect();
-        let mut assigned = 0u64;
-        for (segment, value) in self.segments.iter_mut().zip(&exact) {
-            segment.count = value.floor() as u64;
-            segment.emitted = 0;
-            assigned += segment.count;
-        }
-        let mut order: Vec<usize> = (0..self.segments.len()).collect();
-        order.sort_by(|a, b| {
-            exact[*b]
-                .fract()
-                .partial_cmp(&exact[*a].fract())
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| splitmix(seed ^ *a as u64).cmp(&splitmix(seed ^ *b as u64)))
-        });
-        for index in order
-            .into_iter()
-            .take(total.saturating_sub(assigned) as usize)
-        {
-            self.segments[index].count += 1;
-        }
-        self.index = 0;
-        self.ordinal = 0;
-    }
 }
 
 pub(crate) fn application_operation_total(
     workload: &WorkloadSpec,
-    rate_scale: f64,
-    time_scale: f64,
+    _rate_scale: f64,
+    _time_scale: f64,
 ) -> u64 {
-    let weight: f64 = workload
+    workload
         .resources
         .iter()
         .filter(|resource| resource.retry_policy != ConfigRetryPolicy::MasterLease)
-        .map(|resource| resource.create_weight + resource.update_weight + resource.delete_weight)
-        .sum();
-    (weight * rate_scale * time_scale).round() as u64
+        .try_fold(0u64, |total, resource| {
+            let count = workload
+                .resource_count(resource)
+                .expect("workload resource counts were validated");
+            let updates = count
+                .checked_mul(resource.update_amplification)
+                .expect("workload update target was validated");
+            total
+                .checked_add(count)
+                .and_then(|value| value.checked_add(updates))
+        })
+        .expect("workload application target was validated")
 }
 
 /// Total number of independent Range requests the scheduler will emit for
 /// this workload at base scale, using the same per-segment deterministic
 /// rounding as the runtime cursor.
 pub(crate) fn range_request_total(workload: &WorkloadSpec, seed: u64) -> u64 {
-    RateCursor::new(workload, 1.0, false, 1.0, seed, 0xB2).total()
+    RateCursor::new(workload, 1.0, seed, 0xB2).total()
 }
 
-struct ResourceQuota {
-    spec_index: usize,
-    remaining: [u64; 3],
-    deficits: [f64; 3],
-    total_weight: f64,
-    next_id: u64,
-    present: Vec<bool>,
-    present_cursor: usize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedOperation {
+    resource: usize,
+    id: u64,
 }
-struct LifecycleProducer {
-    resources: Vec<ResourceQuota>,
-    resource_deficits: Vec<f64>,
-    total_weight: f64,
+
+#[derive(Clone, Debug)]
+struct PlannedResource {
+    resource: usize,
+    count: u64,
+    update_amplification: u64,
 }
-impl LifecycleProducer {
-    fn new(workload: &WorkloadSpec, total: u64, seed: u64) -> Self {
-        let total_weight: f64 = workload
-            .resources
-            .iter()
-            .filter(|resource| resource.retry_policy != ConfigRetryPolicy::MasterLease)
-            .map(|r| r.create_weight + r.update_weight + r.delete_weight)
-            .sum();
-        let mut exact = Vec::with_capacity(workload.resources.len());
-        let mut floors = 0u64;
-        for spec in &workload.resources {
-            if spec.retry_policy == ConfigRetryPolicy::MasterLease {
-                exact.push(0.0);
-                continue;
-            }
-            let weight = spec.create_weight + spec.update_weight + spec.delete_weight;
-            let value = if total_weight > 0.0 {
-                total as f64 * weight / total_weight
-            } else {
-                0.0
-            };
-            floors += value.floor() as u64;
-            exact.push(value);
-        }
-        let mut quotas: Vec<u64> = exact.iter().map(|value| value.floor() as u64).collect();
-        let mut left = total.saturating_sub(floors);
-        let mut order: Vec<usize> = (0..exact.len()).collect();
-        order.sort_by(|a, b| {
-            exact[*b]
-                .fract()
-                .partial_cmp(&exact[*a].fract())
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| splitmix(seed ^ *a as u64).cmp(&splitmix(seed ^ *b as u64)))
-        });
-        for index in order {
-            if left == 0 {
-                break;
-            }
-            quotas[index] += 1;
-            left -= 1;
-        }
+
+#[derive(Clone, Debug)]
+struct WorkloadPlan {
+    resources: Vec<PlannedResource>,
+    total_creates: u64,
+    total_updates: u64,
+}
+
+impl WorkloadPlan {
+    fn build(workload: &WorkloadSpec) -> Result<Self, String> {
         let mut resources = Vec::with_capacity(workload.resources.len());
-        for (index, spec) in workload.resources.iter().enumerate() {
-            if spec.retry_policy == ConfigRetryPolicy::MasterLease {
-                continue;
-            }
-            let weight = spec.create_weight + spec.update_weight + spec.delete_weight;
-            let quota = quotas[index];
-            let op_weights = [spec.create_weight, spec.update_weight, spec.delete_weight];
-            let mut remaining = [0; 3];
-            let mut assigned = 0;
-            for op in 0..3 {
-                let value = if weight > 0.0 {
-                    quota as f64 * op_weights[op] / weight
-                } else {
-                    0.0
-                };
-                remaining[op] = value.floor() as u64;
-                assigned += remaining[op];
-            }
-            let mut op_left = quota.saturating_sub(assigned);
-            for op in 0..3 {
-                if op_left > 0 && op_weights[op] > 0.0 {
-                    remaining[op] += 1;
-                    op_left -= 1;
-                }
-            }
-            let object_count = workload
+        let mut total_creates = 0u64;
+        let mut total_updates = 0u64;
+        for (resource, spec) in workload.resources.iter().enumerate() {
+            let count = workload
                 .resource_count(spec)
-                .expect("workload resource counts were validated");
-            let create_overflow = remaining[0].saturating_sub(object_count);
-            remaining[0] -= create_overflow;
-            if op_weights[1] > 0.0 {
-                remaining[1] += create_overflow;
-            } else {
-                remaining[2] += create_overflow;
-            }
-            resources.push(ResourceQuota {
-                spec_index: index,
-                remaining,
-                deficits: [0.0; 3],
-                total_weight: weight,
-                next_id: 0,
-                present: vec![false; object_count as usize],
-                present_cursor: splitmix(seed ^ index as u64) as usize,
+                .map_err(|error| error.to_string())?;
+            let updates = count
+                .checked_mul(spec.update_amplification)
+                .ok_or_else(|| format!("resource {:?} update target overflows u64", spec.name))?;
+            total_creates = total_creates
+                .checked_add(count)
+                .ok_or_else(|| "total create target overflows u64".to_string())?;
+            total_updates = total_updates
+                .checked_add(updates)
+                .ok_or_else(|| "total update target overflows u64".to_string())?;
+            resources.push(PlannedResource {
+                resource,
+                count,
+                update_amplification: spec.update_amplification,
             });
         }
-        Self {
-            resource_deficits: vec![0.0; resources.len()],
+        Ok(Self {
             resources,
-            total_weight,
-        }
+            total_creates,
+            total_updates,
+        })
     }
 
-    fn next(&mut self, specs: &[ResourceSpec]) -> Option<(usize, ResourceOperation, u64)> {
-        let mut best: Option<(usize, f64)> = None;
+    fn total_creates(&self) -> u64 {
+        self.total_creates
+    }
+
+    fn total_updates(&self) -> u64 {
+        self.total_updates
+    }
+
+    fn creates(&self) -> CreateCursor<'_> {
+        CreateCursor {
+            resources: &self.resources,
+            resource_index: 0,
+            id: 0,
+        }
+    }
+}
+
+struct CreateCursor<'a> {
+    resources: &'a [PlannedResource],
+    resource_index: usize,
+    id: u64,
+}
+
+impl Iterator for CreateCursor<'_> {
+    type Item = PlannedOperation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let resource = self.resources.get(self.resource_index)?;
+            if self.id < resource.count {
+                let operation = PlannedOperation {
+                    resource: resource.resource,
+                    id: self.id,
+                };
+                self.id += 1;
+                return Some(operation);
+            }
+            self.resource_index += 1;
+            self.id = 0;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UpdateResource {
+    resource: usize,
+    count: u64,
+    remaining: u64,
+    weight: u64,
+    emitted: u64,
+    deficit: i128,
+    start_id: u64,
+}
+
+struct UpdateCursor {
+    resources: Vec<UpdateResource>,
+    total: u64,
+    remaining: u64,
+}
+
+impl UpdateCursor {
+    fn new(plan: &WorkloadPlan, seed: u64) -> Self {
+        let resources: Vec<_> = plan
+            .resources
+            .iter()
+            .filter(|resource| resource.update_amplification > 0)
+            .map(|resource| {
+                let target = resource
+                    .count
+                    .checked_mul(resource.update_amplification)
+                    .expect("workload update target was validated");
+                UpdateResource {
+                    resource: resource.resource,
+                    count: resource.count,
+                    weight: target,
+                    remaining: target,
+                    emitted: 0,
+                    deficit: 0,
+                    start_id: splitmix(seed ^ resource.resource as u64) % resource.count,
+                }
+            })
+            .collect();
+        Self {
+            resources,
+            total: plan.total_updates,
+            remaining: plan.total_updates,
+        }
+    }
+}
+
+impl Iterator for UpdateCursor {
+    type Item = PlannedOperation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let mut best = None;
         for (index, resource) in self.resources.iter_mut().enumerate() {
-            let eligible = (resource.remaining[0] > 0
-                && resource.next_id < resource.present.len() as u64)
-                || (resource.remaining[1] > 0 && resource.present.iter().any(|p| *p))
-                || (resource.remaining[2] > 0 && resource.present.iter().any(|p| *p));
-            if !eligible {
+            if resource.remaining == 0 {
                 continue;
             }
-            self.resource_deficits[index] += resource.total_weight;
-            if best.map_or(true, |(_, deficit)| self.resource_deficits[index] > deficit) {
-                best = Some((index, self.resource_deficits[index]));
+            resource.deficit += resource.weight as i128;
+            if best.is_none_or(|(_, deficit)| resource.deficit > deficit) {
+                best = Some((index, resource.deficit));
             }
         }
         let (index, _) = best?;
-        self.resource_deficits[index] -= self.total_weight;
         let resource = &mut self.resources[index];
-        let spec = &specs[resource.spec_index];
-        let weights = [spec.create_weight, spec.update_weight, spec.delete_weight];
-        for op in 0..3 {
-            resource.deficits[op] += weights[op];
-        }
-        let op = (0..3)
-            .filter(|op| {
-                resource.remaining[*op] > 0
-                    && match *op {
-                        0 => resource.next_id < resource.present.len() as u64,
-                        _ => resource.present.iter().any(|p| *p),
-                    }
-            })
-            .max_by(|a, b| {
-                resource.deficits[*a]
-                    .partial_cmp(&resource.deficits[*b])
-                    .unwrap_or(Ordering::Equal)
-            })?;
-        resource.deficits[op] -= resource.total_weight;
-        resource.remaining[op] -= 1;
-        let id = match op {
-            0 => {
-                let id = resource.next_id;
-                resource.next_id += 1;
-                resource.present[id as usize] = true;
-                id
-            }
-            1 => next_present_id(resource)?,
-            _ => {
-                let id = next_present_id(resource)?;
-                resource.present[id as usize] = false;
-                id
-            }
-        };
-        Some((
-            resource.spec_index,
-            match op {
-                0 => ResourceOperation::Create,
-                1 => ResourceOperation::GuaranteedUpdate,
-                _ => ResourceOperation::ConditionalDelete,
-            },
+        resource.deficit -= self.total as i128;
+        let id = ((resource.start_id as u128 + resource.emitted as u128) % resource.count as u128)
+            as u64;
+        resource.emitted += 1;
+        resource.remaining -= 1;
+        self.remaining -= 1;
+        Some(PlannedOperation {
+            resource: resource.resource,
             id,
-        ))
+        })
     }
 }
-fn next_present_id(resource: &mut ResourceQuota) -> Option<u64> {
-    let len = resource.present.len();
-    if len == 0 {
-        return None;
-    }
-    let start = resource.present_cursor % len;
-    for offset in 0..len {
-        let id = (start + offset) % len;
-        if resource.present[id] {
-            resource.present_cursor = (id + 1) % len;
-            return Some(id as u64);
+
+#[derive(Debug)]
+struct PhaseTracker {
+    target: u64,
+    completed: AtomicU64,
+    succeeded: AtomicU64,
+    notify: Notify,
+}
+
+impl PhaseTracker {
+    fn new(target: u64) -> Self {
+        Self {
+            target,
+            completed: AtomicU64::new(0),
+            succeeded: AtomicU64::new(0),
+            notify: Notify::new(),
         }
     }
-    None
+
+    fn record(&self, outcome: Outcome) {
+        if outcome == Outcome::Success {
+            self.succeeded.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let completed = self.completed.fetch_add(1, AtomicOrdering::Release) + 1;
+        if completed >= self.target {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn result(&self, phase: &str) -> Result<(), String> {
+        let completed = self.completed.load(AtomicOrdering::Acquire);
+        let succeeded = self.succeeded.load(AtomicOrdering::Acquire);
+        let deficit = self.target.saturating_sub(succeeded);
+        if completed == self.target && deficit == 0 {
+            Ok(())
+        } else {
+            Err(self.status(phase, completed, succeeded, deficit))
+        }
+    }
+
+    fn deadline_error(&self, phase: &str) -> String {
+        let completed = self.completed.load(AtomicOrdering::Acquire);
+        let succeeded = self.succeeded.load(AtomicOrdering::Acquire);
+        let deficit = self.target.saturating_sub(succeeded);
+        format!(
+            "{phase} phase deadline exceeded: {}",
+            self.status(phase, completed, succeeded, deficit)
+        )
+    }
+
+    fn status(&self, phase: &str, completed: u64, succeeded: u64, deficit: u64) -> String {
+        format!(
+            "{phase} phase incomplete: target={}, completed={completed}, succeeded={succeeded}, deficit={deficit}",
+            self.target
+        )
+    }
+    async fn wait_until(&self, phase: &str, deadline: TokioInstant) -> Result<(), String> {
+        loop {
+            let notified = self.notify.notified();
+            if self.completed.load(AtomicOrdering::Acquire) >= self.target {
+                return self.result(phase);
+            }
+            if time::timeout_at(deadline, notified).await.is_err() {
+                return Err(self.deadline_error(phase));
+            }
+        }
+    }
 }
+
 #[derive(Clone)]
 struct RangeProducer {
     deficits: Vec<f64>,
@@ -974,19 +999,10 @@ pub(crate) fn exact_prefix_capacity(workload: &WorkloadSpec, range_total: u64) -
     exact_prefix_total(producer, &weights, &workload.ranges, range_total)
 }
 
-/// Masterlease tick time for `ordinal`, bounded by both the configured
-/// ordinal count and the workload duration so periodic traffic never
-/// outlives the run.  Computes the prospective time without overflowing
-/// even for huge intervals or ordinals.
-fn masterlease_tick_at(
-    interval: Duration,
-    count: u64,
-    ordinal: u64,
-    duration: Duration,
-) -> Option<Duration> {
-    if ordinal >= count {
-        return None;
-    }
+/// Masterlease tick time for `ordinal`, bounded by workload duration so
+/// periodic traffic never outlives the run. Computes the prospective time
+/// without overflowing even for huge intervals or ordinals.
+fn masterlease_tick_at(interval: Duration, ordinal: u64, duration: Duration) -> Option<Duration> {
     let secs = interval.as_secs_f64() * (ordinal + 1) as f64;
     if !secs.is_finite() || secs > duration.as_secs_f64() {
         return None;
@@ -1205,6 +1221,81 @@ async fn wait_for_schedule_event(
     }
 }
 
+async fn run_create_phase(
+    workload: &WorkloadSpec,
+    plan: &WorkloadPlan,
+    senders: &[mpsc::Sender<WorkItem>],
+    workers: usize,
+    timeout: Duration,
+) -> Result<u64, String> {
+    let tracker = Arc::new(PhaseTracker::new(plan.total_creates()));
+    let deadline = TokioInstant::now() + timeout;
+    let mut scheduled = 0u64;
+    for operation in plan.creates() {
+        let spec = &workload.resources[operation.resource];
+        let key = resource_key(spec, operation.id);
+        let label = ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
+        let item = WorkItem::Txn {
+            resource: operation.resource,
+            key: key.clone(),
+            operation: ResourceOperation::Create,
+            value: resource_value(spec, operation.id, 0),
+            pool: spec.lease_pool.clone(),
+            completion: Some(Arc::clone(&tracker)),
+        };
+        match time::timeout_at(deadline, senders[stable_shard(&key, workers)].send(item)).await {
+            Ok(Ok(())) => {
+                metrics::record_scheduled(Operation::Create, &label);
+                scheduled += 1;
+            }
+            Ok(Err(_)) => return Err("create phase worker queue closed".to_string()),
+            Err(_) => return Err(tracker.deadline_error("create")),
+        }
+    }
+    tracker.wait_until("create", deadline).await?;
+    Ok(scheduled)
+}
+
+async fn run_update_phase(
+    workload: WorkloadSpec,
+    plan: WorkloadPlan,
+    senders: Vec<mpsc::Sender<WorkItem>>,
+    workers: usize,
+    seed: u64,
+    started: TokioInstant,
+    duration: Duration,
+) -> Result<u64, String> {
+    let total = plan.total_updates();
+    let tracker = Arc::new(PhaseTracker::new(total));
+    let deadline = started + duration;
+    let mut scheduled = 0u64;
+    for (ordinal, operation) in UpdateCursor::new(&plan, seed).enumerate() {
+        let at = started + duration.mul_f64(ordinal as f64 / total as f64);
+        time::sleep_until(at).await;
+        let spec = &workload.resources[operation.resource];
+        let key = resource_key(spec, operation.id);
+        let label = ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
+        let item = WorkItem::Txn {
+            resource: operation.resource,
+            key: key.clone(),
+            operation: ResourceOperation::GuaranteedUpdate,
+            value: resource_value(spec, operation.id, ordinal as u64 + 1),
+            pool: spec.lease_pool.clone(),
+            completion: Some(Arc::clone(&tracker)),
+        };
+        match time::timeout_at(deadline, senders[stable_shard(&key, workers)].send(item)).await {
+            Ok(Ok(())) => {
+                metrics::record_scheduled(Operation::Update, &label);
+                scheduled += 1;
+            }
+            Ok(Err(_)) => return Err("update phase worker queue closed".to_string()),
+            Err(_) => return Err(tracker.deadline_error("update")),
+        }
+    }
+    tracker.wait_until("update", deadline).await?;
+    Ok(scheduled)
+}
+
 pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<ScheduleStats, String> {
     if config.queue_capacity < config.workers {
         return Err(format!(
@@ -1268,7 +1359,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         seed: scheduler.seed,
         node_lease_enabled: scheduler.workload.nodes.node_lease_enabled,
     });
-    let started = TokioInstant::now();
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let mut bootstrap_interrupted = false;
     let mut bootstrap_acks = Vec::with_capacity(scheduler.nodes.saturating_mul(3));
@@ -1347,33 +1437,47 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         drain_workers(senders, workers, pools, config.operation_timeout).await;
         return Ok(stats);
     }
+    let plan = WorkloadPlan::build(&scheduler.workload)?;
+    let create_result = tokio::select! {
+        _ = &mut ctrl_c => None,
+        result = run_create_phase(
+            &scheduler.workload,
+            &plan,
+            &senders,
+            workers_count,
+            config.operation_timeout,
+        ) => Some(result),
+    };
+    match create_result {
+        Some(Ok(scheduled)) => stats.scheduled += scheduled,
+        Some(Err(error)) => {
+            abort_workers(senders, workers, pools).await;
+            return Err(error);
+        }
+        None => {
+            abort_workers(senders, workers, pools).await;
+            return Ok(stats);
+        }
+    }
+
     let (watch_shutdown, mut watch_tasks) = spawn_watches(&client, &scheduler.workload.watches);
     let duration = scheduler.duration();
-    let mut app = RateCursor::new(
-        &scheduler.workload,
-        scheduler.rate_scale,
-        true,
-        scheduler.time_scale,
+    let started = TokioInstant::now();
+    let update_task = tokio::spawn(run_update_phase(
+        scheduler.workload.clone(),
+        plan,
+        senders.clone(),
+        workers_count,
         scheduler.seed,
-        0xA1,
-    );
-    app.retarget_total(
-        application_operation_total(
-            &scheduler.workload,
-            scheduler.rate_scale,
-            scheduler.time_scale,
-        ),
-        scheduler.seed ^ 0xA1,
-    );
+        started,
+        duration,
+    ));
     let mut ranges = RateCursor::new(
         &scheduler.workload,
-        1.0,
-        false,
         scheduler.time_scale,
         scheduler.seed,
         0xB2,
     );
-    let mut lifecycle = LifecycleProducer::new(&scheduler.workload, app.total(), scheduler.seed);
     let mut range_producer = RangeProducer::new(scheduler.workload.ranges.iter().map(|r| r.weight));
     let weights: Vec<f64> = scheduler.workload.ranges.iter().map(|r| r.weight).collect();
     let prefix_total = exact_prefix_total(
@@ -1406,9 +1510,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         });
         *sequence = sequence.wrapping_add(1);
     };
-    if let Some((at, _)) = app.next() {
-        push(at, 1, Source::App, &mut heap, &mut sequence);
-    }
     if let Some((at, _)) = ranges.next() {
         push(at, 2, Source::Range, &mut heap, &mut sequence);
     }
@@ -1454,19 +1555,24 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         Duration::from_secs_f64(scheduler.workload.master_lease_interval_s * scheduler.time_scale);
     for (resource, spec) in scheduler.workload.resources.iter().enumerate() {
         if spec.retry_policy == ConfigRetryPolicy::MasterLease {
-            let count =
-                (spec.create_weight + spec.update_weight + spec.delete_weight).round() as u64;
-            if let Some(at) = masterlease_tick_at(master_lease_interval, count, 0, duration) {
-                push(
-                    at,
-                    0,
-                    Source::MasterLease {
-                        resource,
-                        ordinal: 0,
-                    },
-                    &mut heap,
-                    &mut sequence,
-                );
+            let count = scheduler
+                .workload
+                .resource_count(spec)
+                .expect("validated masterlease count");
+            if let Some(at) = masterlease_tick_at(master_lease_interval, 0, duration) {
+                for id in 0..count {
+                    push(
+                        at,
+                        0,
+                        Source::MasterLease {
+                            resource,
+                            id,
+                            ordinal: 0,
+                        },
+                        &mut heap,
+                        &mut sequence,
+                    );
+                }
             }
         }
     }
@@ -1491,12 +1597,16 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             &mut sequence,
         );
     }
+    push(duration, 5, Source::PhaseEnd, &mut heap, &mut sequence);
+    let mut interrupted = false;
     let mut ctrl_c: CtrlCFuture = Box::pin(tokio::signal::ctrl_c());
     while let Some(event) = heap.pop() {
         let deadline = started + event.at;
         let control = match wait_for_schedule_event(&mut watch_tasks, deadline, &mut ctrl_c).await {
             Ok(control) => control,
             Err(error) => {
+                update_task.abort();
+                let _ = update_task.await;
                 cleanup_watch_failure(
                     watch_shutdown,
                     watch_tasks,
@@ -1511,48 +1621,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         };
         match control {
             ScheduleControl::Deadline => {}
-            ScheduleControl::Interrupted => break,
+            ScheduleControl::Interrupted => {
+                interrupted = true;
+                break;
+            }
             ScheduleControl::WatchCompleted => continue,
         }
         match event.source {
-            Source::App => {
-                if let Some((at, _)) = app.next() {
-                    push(at, 1, Source::App, &mut heap, &mut sequence);
-                }
-                if let Some((resource, operation, id)) =
-                    lifecycle.next(&scheduler.workload.resources)
-                {
-                    let spec = &scheduler.workload.resources[resource];
-                    let key = resource_key(spec, id);
-                    let label =
-                        ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
-                    metrics::record_scheduled(operation_metric(operation), &label);
-                    stats.scheduled += 1;
-                    let item = WorkItem::Txn {
-                        resource,
-                        key: key.clone(),
-                        operation,
-                        value: resource_value(spec, id, event.sequence),
-                        pool: spec.lease_pool.clone(),
-                    };
-                    match senders[stable_shard(&key, workers_count)].try_send(item) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            stats.dropped += 1;
-                            metrics::record_dropped(DropReason::Backpressure);
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            stats.dropped += 1;
-                            metrics::record_dropped(DropReason::QueueClosed);
-                        }
-                    }
-                } else {
-                    // Producer ran out of schedulable operations before the
-                    // rate cursor did: count it instead of skipping silently.
-                    stats.dropped += 1;
-                    metrics::record_dropped(DropReason::Exhausted);
-                }
-            }
+            Source::PhaseEnd => {}
             Source::Range => {
                 if let Some((at, _)) = ranges.next() {
                     push(at, 2, Source::Range, &mut heap, &mut sequence);
@@ -1585,14 +1661,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     }
                 }
             }
-            Source::MasterLease { resource, ordinal } => {
+            Source::MasterLease {
+                resource,
+                id,
+                ordinal,
+            } => {
                 let spec = &scheduler.workload.resources[resource];
-                let operation = if ordinal == 0 {
-                    ResourceOperation::Create
-                } else {
-                    ResourceOperation::GuaranteedUpdate
-                };
-                let key = resource_key(spec, 0);
+                let operation = ResourceOperation::GuaranteedUpdate;
+                let key = resource_key(spec, id);
                 let label =
                     ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
                 metrics::record_scheduled(operation_metric(operation), &label);
@@ -1601,8 +1677,9 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     resource,
                     key: key.clone(),
                     operation,
-                    value: resource_value(spec, 0, ordinal),
+                    value: resource_value(spec, id, ordinal),
                     pool: spec.lease_pool.clone(),
+                    completion: None,
                 };
                 match senders[stable_shard(&key, workers_count)].try_send(item) {
                     Ok(()) => {}
@@ -1615,16 +1692,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                         metrics::record_dropped(DropReason::QueueClosed);
                     }
                 }
-                let count =
-                    (spec.create_weight + spec.update_weight + spec.delete_weight).round() as u64;
-                if let Some(at) =
-                    masterlease_tick_at(master_lease_interval, count, ordinal + 1, duration)
+                if let Some(at) = masterlease_tick_at(master_lease_interval, ordinal + 1, duration)
                 {
                     push(
                         at,
                         0,
                         Source::MasterLease {
                             resource,
+                            id,
                             ordinal: ordinal + 1,
                         },
                         &mut heap,
@@ -1757,8 +1832,29 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             }
         }
     }
+    if interrupted {
+        update_task.abort();
+        let _ = update_task.await;
+        stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
+        abort_workers(senders, workers, pools).await;
+        return Ok(stats);
+    }
+    let update_result = match update_task.await {
+        Ok(Ok(scheduled)) => scheduled,
+        Ok(Err(error)) => {
+            stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
+            abort_workers(senders, workers, pools).await;
+            return Err(error);
+        }
+        Err(error) => {
+            stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
+            abort_workers(senders, workers, pools).await;
+            return Err(format!("update phase task failed: {error}"));
+        }
+    };
     stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
     drain_workers(senders, workers, pools, config.operation_timeout).await;
+    stats.scheduled += update_result;
     Ok(stats)
 }
 fn bootstrap_allows_main_load(interrupted: bool) -> bool {
@@ -1852,44 +1948,50 @@ async fn worker_loop(
                 operation,
                 value,
                 pool,
+                completion,
             } => {
-                if let Some(spec) = workload.resources.get(resource) {
-                    if let Ok(label) = ResourceName::try_from(spec.name.as_str()) {
-                        let operation_started = Instant::now();
-                        let lease_pool = if operation.uses_native_lease() {
-                            pool.as_deref()
-                                .and_then(|name| pools.get(name))
-                                .map(|pool| pool.as_ref())
-                        } else {
-                            None
-                        };
-                        let remaining_timeout = timeout.saturating_sub(operation_started.elapsed());
-                        let inject_conflict = operation == ResourceOperation::GuaranteedUpdate
-                            && cas_conflicts
-                                .fetch_update(
-                                    AtomicOrdering::Relaxed,
-                                    AtomicOrdering::Relaxed,
-                                    |remaining| remaining.checked_sub(1),
-                                )
-                                .is_ok();
-                        let _ = execute_txn(
-                            &client,
-                            &label,
-                            &mut states,
-                            key,
-                            value,
-                            operation,
-                            inject_conflict,
-                            retry_policy(spec),
-                            CasRetryPolicy::generic_controller(),
-                            spec.retry_policy == ConfigRetryPolicy::MasterLease,
-                            remaining_timeout,
-                            lease_pool,
-                            lease_epoch,
-                            latest_revision.clone(),
+                let spec = workload
+                    .resources
+                    .get(resource)
+                    .ok_or_else(|| format!("unknown resource index {resource}"))?;
+                let label = ResourceName::try_from(spec.name.as_str())
+                    .map_err(|error| error.to_string())?;
+                let operation_started = Instant::now();
+                let lease_pool = if operation.uses_native_lease() {
+                    pool.as_deref()
+                        .and_then(|name| pools.get(name))
+                        .map(|pool| pool.as_ref())
+                } else {
+                    None
+                };
+                let remaining_timeout = timeout.saturating_sub(operation_started.elapsed());
+                let inject_conflict = operation == ResourceOperation::GuaranteedUpdate
+                    && cas_conflicts
+                        .fetch_update(
+                            AtomicOrdering::Relaxed,
+                            AtomicOrdering::Relaxed,
+                            |remaining| remaining.checked_sub(1),
                         )
-                        .await;
-                    }
+                        .is_ok();
+                let outcome = execute_txn(
+                    &client,
+                    &label,
+                    &mut states,
+                    key,
+                    value,
+                    operation,
+                    inject_conflict,
+                    retry_policy(spec),
+                    CasRetryPolicy::generic_controller(),
+                    spec.retry_policy == ConfigRetryPolicy::MasterLease,
+                    remaining_timeout,
+                    lease_pool,
+                    lease_epoch,
+                    latest_revision.clone(),
+                )
+                .await;
+                if let Some(completion) = completion {
+                    completion.record(outcome);
                 }
             }
             WorkItem::Range {
@@ -2583,9 +2685,6 @@ async fn execute_heartbeat(
         key_pattern: item.key.clone(),
         count: ResourceCountSpec::Fixed { count: 1 },
         update_amplification: 1,
-        create_weight: 1.0,
-        update_weight: 1.0,
-        delete_weight: 0.0,
         value_size_bytes: if resource == "nodes" { 2048 } else { 256 },
         retry_policy: ConfigRetryPolicy::GuaranteedUpdate,
         lease_pool: None,
@@ -2822,6 +2921,69 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct CreatePhaseProbe {
+        requests: Arc<std::sync::Mutex<Vec<crate::pb::etcdserverpb::TxnRequest>>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::pb::etcdserverpb::kv_server::Kv for CreatePhaseProbe {
+        async fn range(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::RangeRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::RangeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "range is not part of this probe",
+            ))
+        }
+
+        async fn put(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::PutRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::PutResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "put is not part of this probe",
+            ))
+        }
+
+        async fn delete_range(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::DeleteRangeRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::DeleteRangeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "delete_range is not part of this probe",
+            ))
+        }
+
+        async fn txn(
+            &self,
+            request: tonic::Request<crate::pb::etcdserverpb::TxnRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::TxnResponse>, tonic::Status> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.into_inner());
+            Ok(tonic::Response::new(crate::pb::etcdserverpb::TxnResponse {
+                header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                    revision: requests.len() as i64,
+                    ..Default::default()
+                }),
+                succeeded: true,
+                ..Default::default()
+            }))
+        }
+
+        async fn compact(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::CompactionRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::CompactionResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "compact is not part of this probe",
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn guaranteed_update_reacquires_native_lease_for_each_attempt() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2893,6 +3055,108 @@ mod tests {
         server.abort();
         let _ = server.await;
     }
+    #[tokio::test]
+    async fn create_barrier_precedes_exact_successful_update_phase() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let probe = CreatePhaseProbe::default();
+        let requests = Arc::clone(&probe.requests);
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(probe))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let client = ClientBundle::connect(
+            &format!("http://{address}"),
+            Duration::from_secs(1),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let mut workload = exact_phase_workload();
+        workload
+            .resources
+            .retain(|resource| resource.name == "pods");
+        workload.etcd_lease_pools.clear();
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        let pools = Arc::new(HashMap::new());
+        let (sender, receiver) = mpsc::channel(2);
+        let worker = tokio::spawn(worker_loop(
+            receiver,
+            client,
+            workload.clone(),
+            Duration::from_secs(1),
+            Arc::clone(&pools),
+            Arc::new(AtomicI64::new(0)),
+            TokioInstant::now(),
+            Arc::new(AtomicU64::new(0)),
+        ));
+
+        let scheduled = run_create_phase(
+            &workload,
+            &plan,
+            std::slice::from_ref(&sender),
+            1,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scheduled, 4);
+        assert_eq!(requests.lock().unwrap().len(), 4);
+
+        let updates = run_update_phase(
+            workload.clone(),
+            plan,
+            vec![sender.clone()],
+            1,
+            7,
+            TokioInstant::now(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updates, 8);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 12);
+        for request in &requests[..4] {
+            assert!(matches!(
+                request.compare[0].target_union,
+                Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                    0
+                ))
+            ));
+        }
+        for request in &requests[4..] {
+            assert!(matches!(
+                request.compare[0].target_union,
+                Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                    revision
+                )) if revision > 0
+            ));
+        }
+        drop(requests);
+
+        drop(sender);
+        worker.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn phase_tracker_deadline_reports_remaining_success_deficit() {
+        let tracker = PhaseTracker::new(2);
+        tracker.record(Outcome::Success);
+        let error = tracker
+            .wait_until("update", TokioInstant::now() + Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("target=2"));
+        assert!(error.contains("succeeded=1"));
+        assert!(error.contains("deficit=1"));
+    }
+
     #[test]
     fn lazy_cursor_has_bounded_state() {
         let workload = WorkloadSpec {
@@ -2902,6 +3166,7 @@ mod tests {
                 node_count: 1,
                 pod_count: 10_000,
             },
+            relationships: crate::config::ResourceRelationshipsSpec::default(),
             nodes: crate::config::NodeSpec {
                 status_interval_s: 300.0,
                 lease_interval_s: 10.0,
@@ -2912,8 +3177,8 @@ mod tests {
             },
             timeline: vec![crate::config::TimelineSegment {
                 duration_s: 10.0,
-                application_txn_rps: 1000.0,
-                range_rps: 0.0,
+                application_txn_rps: 0.0,
+                range_rps: 1000.0,
             }],
             resources: vec![ResourceSpec {
                 name: "pods".into(),
@@ -2923,9 +3188,6 @@ mod tests {
                     denominator: 1,
                 },
                 update_amplification: 1,
-                create_weight: 1.0,
-                update_weight: 1.0,
-                delete_weight: 0.0,
                 value_size_bytes: 4096,
                 retry_policy: ConfigRetryPolicy::GuaranteedUpdate,
                 lease_pool: None,
@@ -2940,7 +3202,7 @@ mod tests {
             cas_conflicts: 0,
             range_count_only_count: 0,
         };
-        let cursor = RateCursor::new(&workload, 1.0, true, 1.0, 1, 1);
+        let cursor = RateCursor::new(&workload, 1.0, 1, 1);
         assert_eq!(cursor.total(), 10000);
     }
     #[test]
@@ -2951,22 +3213,6 @@ mod tests {
     fn prefix_end_handles_ff() {
         assert_eq!(prefix_end(vec![0xff]), vec![0]);
         assert_eq!(prefix_end(vec![b'a', 0xff]), vec![b'b']);
-    }
-    #[test]
-    fn present_keys_rotate_deterministically() {
-        let mut resource = ResourceQuota {
-            spec_index: 0,
-            remaining: [0, 0, 0],
-            deficits: [0.0; 3],
-            total_weight: 0.0,
-            next_id: 3,
-            present: vec![true, true, true],
-            present_cursor: 0,
-        };
-        assert_eq!(next_present_id(&mut resource), Some(0));
-        assert_eq!(next_present_id(&mut resource), Some(1));
-        assert_eq!(next_present_id(&mut resource), Some(2));
-        assert_eq!(next_present_id(&mut resource), Some(0));
     }
     #[test]
     fn embedded_ranges_scan_resource_prefixes() {
@@ -2991,29 +3237,13 @@ mod tests {
     }
 
     #[test]
-    fn application_quotas_are_exact_and_exclude_masterlease() {
+    fn application_targets_are_exact_and_exclude_masterlease_updates() {
         let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
-        let total = application_operation_total(&workload, 1.0, 1.0);
-        assert_eq!(total, 514_085);
-        assert_eq!(application_operation_total(&workload, 1.0, 0.001), 514);
-        let producer = LifecycleProducer::new(&workload, total, 1);
-        assert!(producer.resources.iter().all(|quota| {
-            workload.resources[quota.spec_index].retry_policy != ConfigRetryPolicy::MasterLease
-        }));
-        assert_eq!(
-            producer
-                .resources
-                .iter()
-                .flat_map(|quota| quota.remaining)
-                .sum::<u64>(),
-            total
-        );
-        assert!(producer.resources.iter().all(|quota| {
-            quota.remaining[0]
-                <= workload
-                    .resource_count(&workload.resources[quota.spec_index])
-                    .unwrap()
-        }));
+        assert_eq!(application_operation_total(&workload, 1.0, 1.0), 520_061);
+        assert_eq!(application_operation_total(&workload, 1.0, 0.001), 520_061);
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        assert_eq!(plan.total_creates(), 87_681);
+        assert_eq!(plan.total_updates(), 432_381);
     }
 
     #[test]
@@ -3061,9 +3291,7 @@ mod tests {
             .unwrap();
         let expected = 8 * nodes + 1 + 2 * waves;
         assert_eq!(application_operation_total(&workload, 1.0, 1.0), expected);
-        let cursor = RateCursor::new(&workload, 1.0, true, 1.0, 1, 0xA1);
-        assert_eq!(cursor.total(), expected);
-        let ranges = RateCursor::new(&workload, 1.0, false, 1.0, 1, 0xB2);
+        let ranges = RateCursor::new(&workload, 1.0, 1, 0xB2);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
         let producer = RangeProducer::new(weights.iter().copied());
         let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
@@ -3075,31 +3303,23 @@ mod tests {
         let interval = Duration::from_secs(10);
         let duration = Duration::from_secs(15);
         // Derived short run: only the ordinal-0 tick at t=10s fits.
-        assert_eq!(
-            masterlease_tick_at(interval, 231, 0, duration),
-            Some(interval)
-        );
-        assert_eq!(masterlease_tick_at(interval, 231, 1, duration), None);
+        assert_eq!(masterlease_tick_at(interval, 0, duration), Some(interval));
+        assert_eq!(masterlease_tick_at(interval, 1, duration), None);
         // An interval longer than the run suppresses even the initial tick.
         assert_eq!(
-            masterlease_tick_at(Duration::from_secs(300), 231, 0, duration),
+            masterlease_tick_at(Duration::from_secs(300), 0, duration),
             None
         );
         // Trace mode: exactly 231 ticks, the last one lands on t == duration.
         let trace_duration = Duration::from_secs(2310);
         let ticks = (0..231)
-            .filter(|&ordinal| {
-                masterlease_tick_at(interval, 231, ordinal, trace_duration).is_some()
-            })
+            .filter(|&ordinal| masterlease_tick_at(interval, ordinal, trace_duration).is_some())
             .count();
         assert_eq!(ticks, 231);
-        assert_eq!(
-            masterlease_tick_at(interval, 231, 231, trace_duration),
-            None
-        );
+        assert_eq!(masterlease_tick_at(interval, 231, trace_duration), None);
         // Huge intervals cannot overflow even while ordinals remain.
         assert_eq!(
-            masterlease_tick_at(Duration::from_secs_f64(1e19), 2, 1, trace_duration),
+            masterlease_tick_at(Duration::from_secs_f64(1e19), 1, trace_duration),
             None
         );
     }
@@ -3107,7 +3327,7 @@ mod tests {
     #[test]
     fn range_shape_plan_emits_exact_trace_counts() {
         let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
-        let ranges = RateCursor::new(&workload, 1.0, false, 1.0, 1, 0xB2);
+        let ranges = RateCursor::new(&workload, 1.0, 1, 0xB2);
         assert_eq!(ranges.total(), 22_080);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
         let producer = RangeProducer::new(weights.iter().copied());
@@ -3347,18 +3567,18 @@ mod tests {
     }
 
     #[test]
-    fn embedded_read_only_prefixes_have_bootstrap_fixtures() {
+    fn embedded_read_only_resources_are_created_before_ranges() {
         let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
-        for prefix in ["services", "endpointslices"] {
-            let fixture = workload
-                .range_fixtures
+        for name in ["services", "endpointslices"] {
+            let resource = workload
+                .resources
                 .iter()
-                .find(|fixture| fixture.name.starts_with(prefix))
+                .find(|resource| resource.name == name)
                 .unwrap();
-            assert_eq!(fixture.count, 100);
+            assert_eq!(workload.resource_count(resource).unwrap(), 100);
             assert!(
-                patterned_key(&fixture.key_pattern, 0)
-                    .starts_with(format!("/registry/{prefix}/bench-bench/").as_bytes())
+                patterned_key(&resource.key_pattern, 0)
+                    .starts_with(format!("/registry/{name}/bench-bench/").as_bytes())
             );
         }
     }
@@ -3662,5 +3882,108 @@ mod tests {
         let next = state.observe(&compact_response(60, true, 0, b"")).unwrap();
         assert_eq!(next.compact_target, Some(50));
         assert_eq!(state.txn_inputs(), (10, 60));
+    }
+    fn exact_phase_workload() -> WorkloadSpec {
+        let mut workload =
+            WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        workload.topology.node_count = 2;
+        workload.topology.pod_count = 4;
+        workload
+            .resources
+            .retain(|resource| resource.name == "pods" || resource.name == "events");
+        workload.relationships = crate::config::ResourceRelationshipsSpec::default();
+        let pods = workload
+            .resources
+            .iter_mut()
+            .find(|resource| resource.name == "pods")
+            .unwrap();
+        pods.count = ResourceCountSpec::Pods {
+            numerator: 1,
+            denominator: 1,
+        };
+        pods.update_amplification = 2;
+        let events = workload
+            .resources
+            .iter_mut()
+            .find(|resource| resource.name == "events")
+            .unwrap();
+        events.count = ResourceCountSpec::Pods {
+            numerator: 1,
+            denominator: 1,
+        };
+        events.update_amplification = 1;
+        workload
+    }
+
+    #[test]
+    fn workload_plan_has_exact_create_and_update_totals() {
+        let workload = exact_phase_workload();
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        assert_eq!(plan.total_creates(), 8);
+        assert_eq!(plan.total_updates(), 12);
+        let creates: Vec<_> = plan.creates().collect();
+        assert_eq!(creates.len(), 8);
+        assert_eq!(
+            creates
+                .iter()
+                .filter(|operation| operation.resource == 0)
+                .count(),
+            4
+        );
+        assert_eq!(
+            creates
+                .iter()
+                .filter(|operation| operation.resource == 1)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn workload_plan_scales_to_two_thousand_nodes_and_forty_thousand_pods() {
+        let mut workload = exact_phase_workload();
+        workload.topology.node_count = 2_000;
+        workload.topology.pod_count = 40_000;
+        workload
+            .resources
+            .iter_mut()
+            .find(|resource| resource.name == "pods")
+            .unwrap()
+            .update_amplification = 10;
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        assert_eq!(plan.resources[0].count, 40_000);
+        assert_eq!(plan.resources[1].count, 40_000);
+        assert_eq!(plan.total_creates(), 80_000);
+        assert_eq!(plan.total_updates(), 440_000);
+        assert_eq!(plan.creates().count(), 80_000);
+    }
+
+    #[test]
+    fn update_cursor_hits_every_key_exact_amplification_times() {
+        let workload = exact_phase_workload();
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        let mut counts = HashMap::new();
+        for operation in UpdateCursor::new(&plan, 7) {
+            *counts
+                .entry((operation.resource, operation.id))
+                .or_insert(0u64) += 1;
+        }
+        for id in 0..4 {
+            assert_eq!(counts.get(&(0, id)), Some(&2));
+            assert_eq!(counts.get(&(1, id)), Some(&1));
+        }
+        assert_eq!(counts.values().sum::<u64>(), 12);
+    }
+
+    #[test]
+    fn phase_result_rejects_any_success_deficit() {
+        let tracker = PhaseTracker::new(3);
+        tracker.record(Outcome::Success);
+        tracker.record(Outcome::ResultUnknown);
+        tracker.record(Outcome::Success);
+        let error = tracker.result("create").unwrap_err();
+        assert!(error.contains("target=3"));
+        assert!(error.contains("succeeded=2"));
+        assert!(error.contains("deficit=1"));
     }
 }

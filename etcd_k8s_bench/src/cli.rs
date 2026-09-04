@@ -157,7 +157,13 @@ impl BaseArgs {
             }
         }
         if let Some(nodes) = self.nodes {
+            let previous = workload.topology.node_count;
             workload.topology.node_count = nodes;
+            for group in &mut workload.relationships.daemon_set_groups {
+                if group.eligible_nodes_per_daemonset == previous {
+                    group.eligible_nodes_per_daemonset = nodes;
+                }
+            }
         }
     }
 }
@@ -584,9 +590,8 @@ mod tests {
             .iter()
             .find(|resource| resource.name == "pods")
             .unwrap();
-        assert_eq!(spec.resource_count(pods).unwrap(), 200);
-        assert_eq!(pods.create_weight, 200.0);
-        assert_eq!(pods.delete_weight, 100.0);
+        assert_eq!(spec.resource_count(pods).unwrap(), 100);
+        assert_eq!(pods.update_amplification, 4);
         let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
         let _ = std::fs::remove_dir_all(&dir);

@@ -48,6 +48,7 @@ pub struct WorkloadSpec {
     pub name: String,
     pub pod_size_bytes: usize,
     pub topology: TopologySpec,
+    pub relationships: ResourceRelationshipsSpec,
     pub nodes: NodeSpec,
     pub timeline: Vec<TimelineSegment>,
     pub resources: Vec<ResourceSpec>,
@@ -95,6 +96,57 @@ pub enum ResourceCountSpec {
     Fixed { count: u64 },
     Pods { numerator: u64, denominator: u64 },
     Nodes { numerator: u64, denominator: u64 },
+    Derived { relation: DerivedResourceKind },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivedResourceKind {
+    DaemonSets,
+    Services,
+    EndpointSlices,
+}
+impl DerivedResourceKind {
+    const fn resource_name(self) -> &'static str {
+        match self {
+            Self::DaemonSets => "daemonsets",
+            Self::Services => "services",
+            Self::EndpointSlices => "endpointslices",
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonSets => "daemon_sets",
+            Self::Services => "services",
+            Self::EndpointSlices => "endpoint_slices",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRelationshipsSpec {
+    pub daemon_set_groups: Vec<DaemonSetGroupSpec>,
+    pub service_groups: Vec<ServiceGroupSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonSetGroupSpec {
+    pub count: u64,
+    pub eligible_nodes_per_daemonset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceGroupSpec {
+    pub count: u64,
+    pub backend_pods_per_service: u64,
+    pub endpoint_groups_per_service: u64,
+    pub endpoints_per_group: u64,
+    pub max_endpoints_per_slice: u64,
+    pub extra_slices_per_group: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -128,9 +180,6 @@ pub struct ResourceSpec {
     pub key_pattern: String,
     pub count: ResourceCountSpec,
     pub update_amplification: u64,
-    pub create_weight: f64,
-    pub update_weight: f64,
-    pub delete_weight: f64,
     pub value_size_bytes: usize,
     pub retry_policy: RetryPolicy,
     #[serde(default)]
@@ -264,7 +313,7 @@ impl WorkloadSpec {
                     resource.name
                 )));
             }
-            resource.validate(index, &self.topology, max_message_size)?;
+            resource.validate(index, &self.topology, &self.relationships, max_message_size)?;
             let requires_native_lease = matches!(
                 &resource.retry_policy,
                 RetryPolicy::Event | RetryPolicy::MasterLease
@@ -307,6 +356,24 @@ impl WorkloadSpec {
                 self.topology.pod_count
             )));
         }
+        self.relationships.validate(self)?;
+        self.resources
+            .iter()
+            .try_fold((0u64, 0u64), |(objects, updates), resource| {
+                let count = self.resource_count(resource)?;
+                let update_target = count
+                    .checked_mul(resource.update_amplification)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid("total update target overflows u64".into())
+                    })?;
+                let objects = objects.checked_add(count).ok_or_else(|| {
+                    ConfigError::Invalid("total object target overflows u64".into())
+                })?;
+                let updates = updates.checked_add(update_target).ok_or_else(|| {
+                    ConfigError::Invalid("total update target overflows u64".into())
+                })?;
+                Ok::<_, ConfigError>((objects, updates))
+            })?;
         for (index, range) in self.ranges.iter().enumerate() {
             range.validate(index)?;
         }
@@ -359,26 +426,21 @@ impl WorkloadSpec {
     }
 
     pub fn resource_count(&self, resource: &ResourceSpec) -> Result<u64, ConfigError> {
-        resource.count.resolve(&self.topology, &resource.name)
+        resource
+            .count
+            .resolve(&self.topology, &self.relationships, &resource.name)
     }
 
-    /// Build a Kubernetes DaemonSet rolling-update workload from this base
-    /// spec at a caller-chosen application transaction rate. The total
-    /// budget is fixed by the shape — initial deploy (N Pods plus events
-    /// and the DaemonSet) plus one full rolling pass (recreate every Pod
-    /// under a fresh key with two status patches each, plus events and
-    /// per-wave DaemonSet updates) — and the timeline is a single segment
-    /// whose duration is `budget / txn_rps`. Quotas are run-wide; the
-    /// deficit producer interleaves operations freely, so early operation
-    /// is create-dominated (updates/deletes need present keys) and later
-    /// operation is mixed churn. The Pod pool is 2N, so creates never
-    /// exceed the resolved resource count and no slot recycling is needed.
-    /// The Range rate follows the trace read/write ratio: `base_range_rps` scaled by
-    /// `txn_rps / base_app_rps`. Periodic traffic (heartbeats, masterlease,
-    /// compact, watches) keeps this base spec's cadence unchanged.
+    /// Build a deterministic DaemonSet-update pressure profile from this
+    /// base spec. The generated workload preserves the prior operation
+    /// budget without replaying controller create/delete ordering: N Pod
+    /// objects receive four successful updates each, 3N Event objects are
+    /// created, and one DaemonSet receives two updates per wave. The timeline
+    /// is a single update phase whose duration is `budget / txn_rps`.
     ///
     /// `base_range_total`/`base_app_total` must come from the scheduler's
-    /// total helpers so rates match the runtime cursor's rounding.
+    /// total helpers so the generated background read rate keeps the selected
+    /// base profile's read/write ratio.
     pub fn rolling_update(
         &self,
         nodes: u64,
@@ -412,8 +474,8 @@ impl WorkloadSpec {
             .ok_or_else(|| ConfigError::Invalid("base workload has no pods resource".into()))?;
         let events = find("events");
         let daemonsets = find("daemonsets");
-        // Fresh keys per rolling generation rely on {id} expansion; a static
-        // pattern would collapse the 2N pool onto one key.
+        // Deterministic keys rely on {id} expansion; a static pattern would
+        // collapse the planned objects onto one key.
         for resource in [pods].into_iter().chain(events) {
             if !resource.key_pattern.contains("{id}") {
                 return Err(ConfigError::Invalid(format!(
@@ -455,9 +517,16 @@ impl WorkloadSpec {
         let mut spec = self.clone();
         spec.name = name.to_string();
         spec.topology.node_count = nodes;
-        spec.topology.pod_count = nodes
-            .checked_mul(2)
-            .ok_or_else(|| ConfigError::Invalid("rolling Pod count overflows u64".into()))?;
+        spec.topology.pod_count = nodes;
+        spec.relationships.service_groups.clear();
+        spec.relationships.daemon_set_groups = if daemonsets.is_some() {
+            vec![DaemonSetGroupSpec {
+                count: 1,
+                eligible_nodes_per_daemonset: nodes,
+            }]
+        } else {
+            Vec::new()
+        };
         spec.timeline = vec![TimelineSegment {
             duration_s: seconds,
             application_txn_rps: txn_rps,
@@ -469,29 +538,22 @@ impl WorkloadSpec {
                 numerator: 1,
                 denominator: 1,
             },
-            update_amplification: 1,
-            create_weight: (2 * nodes) as f64,
-            update_weight: (2 * nodes) as f64,
-            delete_weight: nodes as f64,
+            update_amplification: 4,
             ..pods.clone()
         }];
         if let Some(events) = events {
             resources.push(ResourceSpec {
                 count: ResourceCountSpec::Fixed { count: 3 * nodes },
                 update_amplification: 0,
-                create_weight: (3 * nodes) as f64,
-                update_weight: 0.0,
-                delete_weight: 0.0,
                 ..events.clone()
             });
         }
         if let Some(daemonsets) = daemonsets {
             resources.push(ResourceSpec {
-                count: ResourceCountSpec::Fixed { count: 1 },
+                count: ResourceCountSpec::Derived {
+                    relation: DerivedResourceKind::DaemonSets,
+                },
                 update_amplification: 2 * waves,
-                create_weight: 1.0,
-                update_weight: (2 * waves) as f64,
-                delete_weight: 0.0,
                 ..daemonsets.clone()
             });
         }
@@ -546,8 +608,161 @@ impl TopologySpec {
     }
 }
 
+impl ResourceRelationshipsSpec {
+    pub fn daemon_set_objects(&self, topology: &TopologySpec) -> Result<u64, ConfigError> {
+        self.daemon_set_groups
+            .iter()
+            .try_fold(0u64, |total, group| {
+                validate_daemon_set_group(group, topology)?;
+                total.checked_add(group.count).ok_or_else(|| {
+                    ConfigError::Invalid("daemon set object count overflows u64".into())
+                })
+            })
+    }
+
+    pub fn daemon_set_pods(&self, topology: &TopologySpec) -> Result<u64, ConfigError> {
+        self.daemon_set_groups
+            .iter()
+            .try_fold(0u64, |total, group| {
+                validate_daemon_set_group(group, topology)?;
+                let pods = group
+                    .count
+                    .checked_mul(group.eligible_nodes_per_daemonset)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid("daemon set Pod count overflows u64".into())
+                    })?;
+                total.checked_add(pods).ok_or_else(|| {
+                    ConfigError::Invalid("daemon set Pod count overflows u64".into())
+                })
+            })
+    }
+
+    pub fn service_objects(&self, topology: &TopologySpec) -> Result<u64, ConfigError> {
+        self.service_groups.iter().try_fold(0u64, |total, group| {
+            validate_service_group(group, topology)?;
+            total
+                .checked_add(group.count)
+                .ok_or_else(|| ConfigError::Invalid("Service object count overflows u64".into()))
+        })
+    }
+
+    pub fn endpoint_slice_objects(&self, topology: &TopologySpec) -> Result<u64, ConfigError> {
+        self.service_groups.iter().try_fold(0u64, |total, group| {
+            validate_service_group(group, topology)?;
+            let ideal = group
+                .endpoints_per_group
+                .div_ceil(group.max_endpoints_per_slice);
+            let slices_per_group =
+                ideal
+                    .checked_add(group.extra_slices_per_group)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid("EndpointSlice group count overflows u64".into())
+                    })?;
+            let slices = group
+                .count
+                .checked_mul(group.endpoint_groups_per_service)
+                .and_then(|value| value.checked_mul(slices_per_group))
+                .ok_or_else(|| {
+                    ConfigError::Invalid("EndpointSlice object count overflows u64".into())
+                })?;
+            total.checked_add(slices).ok_or_else(|| {
+                ConfigError::Invalid("EndpointSlice object count overflows u64".into())
+            })
+        })
+    }
+
+    fn validate(&self, workload: &WorkloadSpec) -> Result<(), ConfigError> {
+        let topology = &workload.topology;
+        let daemon_set_pods = self.daemon_set_pods(topology)?;
+        if daemon_set_pods > topology.pod_count {
+            return Err(ConfigError::Invalid(format!(
+                "daemon set Pods ({daemon_set_pods}) exceed topology.pod_count ({})",
+                topology.pod_count
+            )));
+        }
+        validate_relationship_resource(workload, "daemonsets", self.daemon_set_objects(topology)?)?;
+        validate_relationship_resource(workload, "services", self.service_objects(topology)?)?;
+        validate_relationship_resource(
+            workload,
+            "endpointslices",
+            self.endpoint_slice_objects(topology)?,
+        )
+    }
+}
+
+fn validate_daemon_set_group(
+    group: &DaemonSetGroupSpec,
+    topology: &TopologySpec,
+) -> Result<(), ConfigError> {
+    if group.count == 0 {
+        return Err(ConfigError::Invalid(
+            "daemon_set_groups.count must be greater than zero".into(),
+        ));
+    }
+    if group.eligible_nodes_per_daemonset == 0
+        || group.eligible_nodes_per_daemonset > topology.node_count
+    {
+        return Err(ConfigError::Invalid(
+            "daemon_set_groups.eligible_nodes_per_daemonset must be in 1..=topology.node_count"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_service_group(
+    group: &ServiceGroupSpec,
+    topology: &TopologySpec,
+) -> Result<(), ConfigError> {
+    if group.count == 0
+        || group.backend_pods_per_service == 0
+        || group.endpoint_groups_per_service == 0
+        || group.endpoints_per_group == 0
+    {
+        return Err(ConfigError::Invalid(
+            "service group counts and endpoint inputs must be greater than zero".into(),
+        ));
+    }
+    if group.backend_pods_per_service > topology.pod_count {
+        return Err(ConfigError::Invalid(
+            "service_groups.backend_pods_per_service exceeds topology.pod_count".into(),
+        ));
+    }
+    if !(1..=1_000).contains(&group.max_endpoints_per_slice) {
+        return Err(ConfigError::Invalid(
+            "service_groups.max_endpoints_per_slice must be in 1..=1000".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relationship_resource(
+    workload: &WorkloadSpec,
+    name: &str,
+    expected: u64,
+) -> Result<(), ConfigError> {
+    let actual = workload
+        .resources
+        .iter()
+        .find(|resource| resource.name == name)
+        .map(|resource| workload.resource_count(resource))
+        .transpose()?
+        .unwrap_or(0);
+    if actual != expected {
+        return Err(ConfigError::Invalid(format!(
+            "{name} resource count ({actual}) must equal relationship-derived count ({expected})"
+        )));
+    }
+    Ok(())
+}
+
 impl ResourceCountSpec {
-    pub fn resolve(&self, topology: &TopologySpec, resource: &str) -> Result<u64, ConfigError> {
+    pub fn resolve(
+        &self,
+        topology: &TopologySpec,
+        relationships: &ResourceRelationshipsSpec,
+        resource: &str,
+    ) -> Result<u64, ConfigError> {
         match *self {
             Self::Fixed { count } => {
                 if count == 0 {
@@ -573,6 +788,13 @@ impl ResourceCountSpec {
                 resource,
                 "nodes",
             ),
+            Self::Derived { relation } => match relation {
+                DerivedResourceKind::DaemonSets => relationships.daemon_set_objects(topology),
+                DerivedResourceKind::Services => relationships.service_objects(topology),
+                DerivedResourceKind::EndpointSlices => {
+                    relationships.endpoint_slice_objects(topology)
+                }
+            },
         }
     }
 }
@@ -647,6 +869,7 @@ impl ResourceSpec {
         &self,
         index: usize,
         topology: &TopologySpec,
+        relationships: &ResourceRelationshipsSpec,
         max_message_size: usize,
     ) -> Result<(), ConfigError> {
         if self.name.trim().is_empty() {
@@ -654,12 +877,21 @@ impl ResourceSpec {
                 "resources[{index}].name must not be empty"
             )));
         }
+        if let ResourceCountSpec::Derived { relation } = self.count
+            && self.name != relation.resource_name()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "derived relation {} requires resource name {:?}",
+                relation.as_str(),
+                relation.resource_name()
+            )));
+        }
         if self.key_pattern.trim().is_empty() {
             return Err(ConfigError::Invalid(format!(
                 "resources[{index}].key_pattern must not be empty"
             )));
         }
-        let count = self.count.resolve(topology, &self.name)?;
+        let count = self.count.resolve(topology, relationships, &self.name)?;
         if usize::try_from(count).is_err() {
             return Err(ConfigError::Invalid(format!(
                 "resources[{index}] count exceeds platform capacity"
@@ -670,20 +902,15 @@ impl ResourceSpec {
             .ok_or_else(|| {
                 ConfigError::Invalid(format!("resources[{index}] update target overflows u64"))
             })?;
-        for (field, value) in [
-            ("create_weight", self.create_weight),
-            ("update_weight", self.update_weight),
-            ("delete_weight", self.delete_weight),
-        ] {
-            if !value.is_finite() || value < 0.0 {
-                return Err(ConfigError::Invalid(format!(
-                    "resources[{index}].{field} must be non-negative"
-                )));
-            }
-        }
-        if self.create_weight + self.update_weight + self.delete_weight <= 0.0 {
+        if self.update_amplification > 0
+            && matches!(
+                self.retry_policy,
+                RetryPolicy::CreateOnly | RetryPolicy::ConditionalDelete | RetryPolicy::MasterLease
+            )
+        {
             return Err(ConfigError::Invalid(format!(
-                "resources[{index}] operation weights must sum to a positive value"
+                "resources[{index}] retry_policy {:?} cannot have update_amplification",
+                self.retry_policy
             )));
         }
         if self.value_size_bytes == 0 {
@@ -808,7 +1035,7 @@ mod tests {
                 numerator: 1,
                 denominator: 1,
             }
-            .resolve(&topology, "events")
+            .resolve(&topology, &ResourceRelationshipsSpec::default(), "events",)
             .unwrap(),
             40_000
         );
@@ -817,13 +1044,21 @@ mod tests {
                 numerator: 1,
                 denominator: 1,
             }
-            .resolve(&topology, "node_leases")
+            .resolve(
+                &topology,
+                &ResourceRelationshipsSpec::default(),
+                "node_leases",
+            )
             .unwrap(),
             2_000
         );
         assert_eq!(
             ResourceCountSpec::Fixed { count: 20 }
-                .resolve(&topology, "deployments")
+                .resolve(
+                    &topology,
+                    &ResourceRelationshipsSpec::default(),
+                    "deployments",
+                )
                 .unwrap(),
             20
         );
@@ -839,7 +1074,7 @@ mod tests {
             numerator: 1,
             denominator: 3,
         }
-        .resolve(&topology, "events")
+        .resolve(&topology, &ResourceRelationshipsSpec::default(), "events")
         .unwrap_err()
         .to_string();
         assert!(nonintegral.contains("must resolve to an integer"));
@@ -848,7 +1083,7 @@ mod tests {
             numerator: u64::MAX,
             denominator: 1,
         }
-        .resolve(&topology, "events")
+        .resolve(&topology, &ResourceRelationshipsSpec::default(), "events")
         .unwrap_err()
         .to_string();
         assert!(overflow.contains("overflows"));
@@ -864,8 +1099,66 @@ mod tests {
                 denominator: 0,
             },
         ] {
-            assert!(count.resolve(&topology, "invalid").is_err());
+            assert!(
+                count
+                    .resolve(&topology, &ResourceRelationshipsSpec::default(), "invalid",)
+                    .is_err()
+            );
         }
+    }
+
+    #[test]
+    fn special_resource_relationships_resolve_exact_counts() {
+        let topology = TopologySpec {
+            node_count: 2_000,
+            pod_count: 40_000,
+        };
+        let relationships = ResourceRelationshipsSpec {
+            daemon_set_groups: vec![DaemonSetGroupSpec {
+                count: 2,
+                eligible_nodes_per_daemonset: 1_500,
+            }],
+            service_groups: vec![ServiceGroupSpec {
+                count: 10,
+                backend_pods_per_service: 200,
+                endpoint_groups_per_service: 2,
+                endpoints_per_group: 200,
+                max_endpoints_per_slice: 100,
+                extra_slices_per_group: 1,
+            }],
+        };
+        assert_eq!(relationships.daemon_set_objects(&topology).unwrap(), 2);
+        assert_eq!(relationships.daemon_set_pods(&topology).unwrap(), 3_000);
+        assert_eq!(relationships.service_objects(&topology).unwrap(), 10);
+        assert_eq!(relationships.endpoint_slice_objects(&topology).unwrap(), 60);
+    }
+
+    #[test]
+    fn special_resource_relationships_reject_invalid_topology() {
+        let mut spec = embedded();
+        spec.relationships.daemon_set_groups[0].eligible_nodes_per_daemonset =
+            spec.topology.node_count + 1;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("eligible_nodes_per_daemonset"));
+
+        let mut spec = embedded();
+        spec.relationships.service_groups[0].max_endpoints_per_slice = 1_001;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("max_endpoints_per_slice"));
+    }
+
+    #[test]
+    fn derived_count_relation_must_match_resource_name() {
+        let mut spec = embedded();
+        spec.resources
+            .iter_mut()
+            .find(|resource| resource.name == "services")
+            .unwrap()
+            .count = ResourceCountSpec::Derived {
+            relation: DerivedResourceKind::EndpointSlices,
+        };
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("derived relation endpoint_slices requires resource name"));
     }
 
     #[test]
@@ -941,7 +1234,7 @@ mod tests {
         assert_eq!(spec.master_lease_interval_s, 10.0);
         assert_eq!(spec.cas_conflicts, 0);
         assert_eq!(spec.range_count_only_count, 220);
-        assert_eq!(spec.range_fixtures.len(), 2);
+        assert!(spec.range_fixtures.is_empty());
         assert_eq!(spec.pod_size_bytes, 4096);
         assert_eq!(spec.topology.node_count, 2003);
 
@@ -951,9 +1244,7 @@ mod tests {
             .find(|resource| resource.name == "events")
             .unwrap();
         assert_eq!(spec.resource_count(event).unwrap(), 45_432);
-        assert_eq!(event.create_weight, 45_432.0);
-        assert_eq!(event.update_weight, 266.0);
-        assert_eq!(event.delete_weight, 1.0);
+        assert_eq!(event.update_amplification, 0);
 
         let pool = spec
             .etcd_lease_pools
@@ -1080,7 +1371,12 @@ mod tests {
         spec.etcd_lease_pools[0].name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
         spec.etcd_lease_pools[0].name = "events".into();
-        spec.range_fixtures[0].name = "invalid label".into();
+        spec.range_fixtures.push(RangeFixtureSpec {
+            name: "invalid label".into(),
+            key_pattern: "/registry/test/{id}".into(),
+            count: 1,
+            value_size_bytes: 1,
+        });
         assert!(spec.validate(64 * 1024 * 1024).is_err());
     }
 
@@ -1129,16 +1425,11 @@ mod tests {
             base_range_rps * 500.0 / base_app_rps
         );
         let pods = spec.resources.iter().find(|r| r.name == "pods").unwrap();
-        assert_eq!(pods.update_amplification, 1);
-        assert_eq!(spec.resource_count(pods).unwrap(), 200);
-        assert_eq!(pods.create_weight, 200.0);
-        assert_eq!(pods.update_weight, 200.0);
-        assert_eq!(pods.delete_weight, 100.0);
+        assert_eq!(pods.update_amplification, 4);
+        assert_eq!(spec.resource_count(pods).unwrap(), 100);
         let events = spec.resources.iter().find(|r| r.name == "events").unwrap();
         assert_eq!(events.update_amplification, 0);
         assert_eq!(spec.resource_count(events).unwrap(), 300);
-        assert_eq!(events.create_weight, 300.0);
-        assert_eq!(events.delete_weight, 0.0);
         let daemonsets = spec
             .resources
             .iter()
@@ -1146,14 +1437,8 @@ mod tests {
             .unwrap();
         assert_eq!(daemonsets.update_amplification, 20);
         assert_eq!(spec.resource_count(daemonsets).unwrap(), 1);
-        assert_eq!(daemonsets.update_weight, 20.0);
         // Total conservation: 8N + 1 + 2w application operations.
-        let total: u64 = spec
-            .resources
-            .iter()
-            .filter(|r| r.retry_policy != RetryPolicy::MasterLease)
-            .map(|r| (r.create_weight + r.update_weight + r.delete_weight) as u64)
-            .sum();
+        let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
         // Masterlease resources are preserved unchanged.
         assert!(
@@ -1210,12 +1495,7 @@ mod tests {
                 .all(|r| r.name != "events" && r.name != "daemonsets")
         );
         // Budget 5N (deploy N + rolling 4N) = 500 at 500 rps -> 1s.
-        let total: u64 = spec
-            .resources
-            .iter()
-            .filter(|r| r.retry_policy != RetryPolicy::MasterLease)
-            .map(|r| (r.create_weight + r.update_weight + r.delete_weight) as u64)
-            .sum();
+        let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
         assert_eq!(total, 5 * 100);
         assert_eq!(spec.timeline[0].duration_s, 1.0);
         spec.validate(64 * 1024 * 1024).unwrap();

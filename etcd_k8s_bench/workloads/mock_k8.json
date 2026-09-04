@@ -2,6 +2,10 @@
   "name": "mock_k8",
   "pod_size_bytes": 4096,
   "topology": {"node_count":2003,"pod_count":42001},
+  "relationships": {
+    "daemon_set_groups": [{"count":1,"eligible_nodes_per_daemonset":2003}],
+    "service_groups": [{"count":100,"backend_pods_per_service":100,"endpoint_groups_per_service":1,"endpoints_per_group":100,"max_endpoints_per_slice":100,"extra_slices_per_group":0}]
+  },
   "nodes": {
     "status_interval_s": 300,
     "lease_interval_s": 10,
@@ -52,13 +56,15 @@
     {"duration_s":30,"application_txn_rps":117.14562,"range_rps":10}
   ],
   "resources": [
-    {"name":"pods","key_pattern":"/registry/pods/bench-{ns}/{id}","count":{"basis":"pods","numerator":1,"denominator":1},"update_amplification":10,"create_weight":42001,"update_weight":413972,"delete_weight":2,"value_size_bytes":4096,"retry_policy":"guaranteed_update"},
-    {"name":"events","key_pattern":"/registry/events/bench-{ns}/{id}","count":{"basis":"pods","numerator":45432,"denominator":42001},"update_amplification":0,"create_weight":45432,"update_weight":266,"delete_weight":1,"value_size_bytes":677,"retry_policy":"event","lease_pool":"events"},
-    {"name":"replicasets","key_pattern":"/registry/replicasets/bench-{ns}/{id}","count":{"basis":"fixed","count":20},"update_amplification":168,"create_weight":20,"update_weight":3359,"delete_weight":0,"value_size_bytes":22660,"retry_policy":"guaranteed_update"},
-    {"name":"deployments","key_pattern":"/registry/deployments/bench-{ns}/{id}","count":{"basis":"fixed","count":20},"update_amplification":170,"create_weight":20,"update_weight":3398,"delete_weight":0,"value_size_bytes":22863,"retry_policy":"guaranteed_update"},
-    {"name":"leases","key_pattern":"/registry/leases/bench-{ns}/{id}","count":{"basis":"fixed","count":6},"update_amplification":534,"create_weight":6,"update_weight":3200,"delete_weight":0,"value_size_bytes":466,"retry_policy":"guaranteed_update"},
-    {"name":"daemonsets","key_pattern":"/registry/daemonsets/bench-{ns}/{id}","count":{"basis":"fixed","count":1},"update_amplification":2407,"create_weight":1,"update_weight":2407,"delete_weight":0,"value_size_bytes":2858,"retry_policy":"guaranteed_update"},
-    {"name":"masterleases","key_pattern":"/registry/masterleases/{id}","count":{"basis":"fixed","count":1},"update_amplification":0,"create_weight":1,"update_weight":230,"delete_weight":0,"value_size_bytes":66,"retry_policy":"master_lease","lease_pool":"masterleases"}
+    {"name":"pods","key_pattern":"/registry/pods/bench-{ns}/{id}","count":{"basis":"pods","numerator":1,"denominator":1},"update_amplification":10,"value_size_bytes":4096,"retry_policy":"guaranteed_update"},
+    {"name":"events","key_pattern":"/registry/events/bench-{ns}/{id}","count":{"basis":"pods","numerator":45432,"denominator":42001},"update_amplification":0,"value_size_bytes":677,"retry_policy":"event","lease_pool":"events"},
+    {"name":"replicasets","key_pattern":"/registry/replicasets/bench-{ns}/{id}","count":{"basis":"fixed","count":20},"update_amplification":168,"value_size_bytes":22660,"retry_policy":"guaranteed_update"},
+    {"name":"deployments","key_pattern":"/registry/deployments/bench-{ns}/{id}","count":{"basis":"fixed","count":20},"update_amplification":170,"value_size_bytes":22863,"retry_policy":"guaranteed_update"},
+    {"name":"leases","key_pattern":"/registry/leases/bench-{ns}/{id}","count":{"basis":"fixed","count":6},"update_amplification":534,"value_size_bytes":466,"retry_policy":"guaranteed_update"},
+    {"name":"daemonsets","key_pattern":"/registry/daemonsets/bench-{ns}/{id}","count":{"basis":"derived","relation":"daemon_sets"},"update_amplification":2407,"value_size_bytes":2858,"retry_policy":"guaranteed_update"},
+    {"name":"services","key_pattern":"/registry/services/bench-{ns}/{id}","count":{"basis":"derived","relation":"services"},"update_amplification":0,"value_size_bytes":1024,"retry_policy":"create_only"},
+    {"name":"endpointslices","key_pattern":"/registry/endpointslices/bench-{ns}/{id}","count":{"basis":"derived","relation":"endpoint_slices"},"update_amplification":0,"value_size_bytes":1024,"retry_policy":"create_only"},
+    {"name":"masterleases","key_pattern":"/registry/masterleases/{id}","count":{"basis":"fixed","count":1},"update_amplification":0,"value_size_bytes":66,"retry_policy":"master_lease","lease_pool":"masterleases"}
   ],
   "ranges": [
     {"key_pattern":"/registry/pods/bench-{ns}/","kind":"prefix","limit":500,"count_only":false,"weight":5440},
@@ -79,10 +85,7 @@
     {"key_pattern":"/registry/resourcequotas","kind":"point","limit":0,"count_only":false,"weight":40},
     {"key_pattern":"/registry/persistentvolumeclaims","kind":"point","limit":0,"count_only":false,"weight":40}
   ],
-  "range_fixtures": [
-    {"name":"services_fixture","key_pattern":"/registry/services/bench-{ns}/{id}","count":100,"value_size_bytes":1024},
-    {"name":"endpointslices_fixture","key_pattern":"/registry/endpointslices/bench-{ns}/{id}","count":100,"value_size_bytes":1024}
-  ],
+  "range_fixtures": [],
   "etcd_lease_pools": [
     {"name":"events","object_ttl_s":3600,"reuse_s":60,"max_objects":1000},
     {"name":"masterleases","object_ttl_s":15,"reuse_s":60,"max_objects":1}
