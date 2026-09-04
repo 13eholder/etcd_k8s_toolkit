@@ -52,12 +52,6 @@ enum WorkItem {
         item: HeartbeatItem,
         done: oneshot::Sender<Result<(), String>>,
     },
-    BootstrapFixture {
-        name: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        done: oneshot::Sender<Result<(), String>>,
-    },
     Status,
     CompactTick,
 }
@@ -371,11 +365,7 @@ impl RateCursor {
     }
 }
 
-pub(crate) fn application_operation_total(
-    workload: &WorkloadSpec,
-    _rate_scale: f64,
-    _time_scale: f64,
-) -> u64 {
+pub(crate) fn application_operation_total(workload: &WorkloadSpec) -> u64 {
     workload
         .resources
         .iter()
@@ -1335,6 +1325,14 @@ async fn run_create_phase(
     result
 }
 
+const UPDATE_DISPATCH_FRACTION: f64 = 0.95;
+
+fn update_dispatch_at(duration: Duration, ordinal: u64, total: u64) -> Duration {
+    debug_assert!(total > 0);
+    debug_assert!(ordinal < total);
+    duration.mul_f64(UPDATE_DISPATCH_FRACTION * ordinal as f64 / total as f64)
+}
+
 async fn run_update_phase(
     workload: WorkloadSpec,
     plan: WorkloadPlan,
@@ -1352,7 +1350,7 @@ async fn run_update_phase(
     let result: Result<u64, String> = async {
         let mut scheduled = 0u64;
         for (ordinal, operation) in UpdateCursor::new(&plan, seed).enumerate() {
-            let at = started + duration.mul_f64(ordinal as f64 / total as f64);
+            let at = started + update_dispatch_at(duration, ordinal as u64, total);
             time::sleep_until(at).await;
             let spec = &workload.resources[operation.resource];
             let key = resource_key(spec, operation.id);
@@ -1495,36 +1493,6 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         metrics::record_scheduled(operation, &resource.unwrap());
         stats.scheduled += 1;
         bootstrap_acks.push(done_rx);
-    }
-    if !bootstrap_interrupted {
-        'fixture_send: for fixture in &scheduler.workload.range_fixtures {
-            let label = ResourceName::new(fixture.name.clone()).expect("validated fixture label");
-            for id in 0..fixture.count {
-                let key = patterned_key(&fixture.key_pattern, id);
-                let shard = stable_shard(&key, workers_count);
-                let (done_tx, done_rx) = oneshot::channel();
-                let item = WorkItem::BootstrapFixture {
-                    name: fixture.name.clone(),
-                    value: patterned_value(fixture.value_size_bytes, id, 0),
-                    key,
-                    done: done_tx,
-                };
-                let send_result = tokio::select! {
-                    _ = &mut ctrl_c => {
-                        bootstrap_interrupted = true;
-                        break 'fixture_send;
-                    }
-                    result = senders[shard].send(item) => result,
-                };
-                if send_result.is_err() {
-                    abort_workers(senders, workers, pools).await;
-                    return Err("bootstrap worker closed".to_string());
-                }
-                metrics::record_scheduled(Operation::Create, &label);
-                stats.scheduled += 1;
-                bootstrap_acks.push(done_rx);
-            }
-        }
     }
     if !bootstrap_interrupted {
         'bootstrap_ack: for done_rx in bootstrap_acks {
@@ -2127,45 +2095,6 @@ async fn worker_loop(
                 .await;
                 let _ = done.send(result);
             }
-            WorkItem::BootstrapFixture {
-                name,
-                key,
-                value,
-                done,
-            } => {
-                let result = match ResourceName::new(name) {
-                    Ok(label) => {
-                        let policy = CasRetryPolicy {
-                            max_attempts: 1,
-                            delay: Duration::ZERO,
-                            jitter_ratio: 0.0,
-                        };
-                        match execute_txn(
-                            &client,
-                            &label,
-                            &mut states,
-                            key,
-                            value,
-                            ResourceOperation::Create,
-                            false,
-                            policy,
-                            policy,
-                            false,
-                            timeout,
-                            None,
-                            TokioInstant::now(),
-                            latest_revision.clone(),
-                        )
-                        .await
-                        {
-                            Outcome::Success => Ok(()),
-                            outcome => Err(format!("range fixture create failed: {outcome:?}")),
-                        }
-                    }
-                    Err(error) => Err(error.to_string()),
-                };
-                let _ = done.send(result);
-            }
             WorkItem::Heartbeat(item) => {
                 let _ = execute_heartbeat(
                     &client,
@@ -2530,6 +2459,19 @@ fn take_storage_attempt(used: &mut u32, limit: u32) -> bool {
     *used = used.saturating_add(1);
     true
 }
+fn cas_retry_delay(
+    policy: CasRetryPolicy,
+    key: &[u8],
+    attempt: u32,
+    remaining: Duration,
+) -> Option<Duration> {
+    let seed = key
+        .iter()
+        .fold(0u64, |state, byte| splitmix(state ^ u64::from(*byte)));
+    let delay = policy.delay_for(seed, attempt);
+    (delay < remaining).then_some(delay)
+}
+
 async fn execute_txn(
     client: &ClientBundle,
     label: &ResourceName,
@@ -2692,6 +2634,19 @@ async fn execute_txn(
                 }
                 CasDecision::Retry { latest, .. } => {
                     metrics::record_cas_retry(label, operation_metric(operation));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let Some(delay) = cas_retry_delay(cas_policy, &key, attempt.number, remaining)
+                    else {
+                        metrics::record_operation(
+                            operation_metric(operation),
+                            label,
+                            Outcome::Timeout,
+                        );
+                        return Outcome::Timeout;
+                    };
+                    if !delay.is_zero() {
+                        time::sleep(delay).await;
+                    }
                     current_value = if storage_operation == ResourceOperation::ConditionalDelete {
                         Vec::new()
                     } else {
@@ -3242,9 +3197,23 @@ mod tests {
     }
 
     #[test]
+    fn update_dispatch_reserves_time_for_completion() {
+        let duration = Duration::from_secs(100);
+        assert_eq!(update_dispatch_at(duration, 0, 10), Duration::ZERO);
+        assert_eq!(
+            update_dispatch_at(duration, 9, 10),
+            Duration::from_millis(85_500)
+        );
+        assert_eq!(
+            update_dispatch_at(duration, 9_999, 10_000),
+            Duration::from_nanos(94_990_500_000)
+        );
+    }
+
+    #[test]
     fn lazy_cursor_has_bounded_state() {
         let workload = WorkloadSpec {
-            name: "mock_k8".into(),
+            name: "k8s".into(),
             pod_size_bytes: 4096,
             topology: TopologySpec {
                 node_count: 1,
@@ -3261,7 +3230,6 @@ mod tests {
             },
             timeline: vec![crate::config::TimelineSegment {
                 duration_s: 10.0,
-                application_txn_rps: 0.0,
                 range_rps: 1000.0,
             }],
             resources: vec![ResourceSpec {
@@ -3277,7 +3245,6 @@ mod tests {
                 lease_pool: None,
             }],
             ranges: vec![],
-            range_fixtures: vec![],
             watches: vec![],
             etcd_lease_pools: vec![],
             status_count: 0,
@@ -3328,7 +3295,8 @@ mod tests {
     }
     #[test]
     fn embedded_ranges_scan_resource_prefixes() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        let workload =
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let pods = workload
             .ranges
             .iter()
@@ -3350,12 +3318,12 @@ mod tests {
 
     #[test]
     fn application_targets_are_exact_and_exclude_masterlease_updates() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
-        assert_eq!(application_operation_total(&workload, 1.0, 1.0), 520_061);
-        assert_eq!(application_operation_total(&workload, 1.0, 0.001), 520_061);
+        let workload =
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
+        assert_eq!(application_operation_total(&workload), 492_618);
         let plan = WorkloadPlan::build(&workload).unwrap();
-        assert_eq!(plan.total_creates(), 87_681);
-        assert_eq!(plan.total_updates(), 432_381);
+        assert_eq!(plan.total_creates(), 80_248);
+        assert_eq!(plan.total_updates(), 412_371);
     }
 
     #[test]
@@ -3377,7 +3345,7 @@ mod tests {
 
     #[test]
     fn node_status_ticks_follow_each_nodes_phase_until_deadline() {
-        let nodes = 2003;
+        let nodes = 2000;
         let interval = Duration::from_secs(300);
         let duration = Duration::from_secs(2310);
         let mut total = 0;
@@ -3388,21 +3356,22 @@ mod tests {
                 at = at.saturating_add(interval);
             }
         }
-        assert_eq!(total, 15_423);
+        assert_eq!(total, 15_400);
     }
 
     #[test]
     fn rolling_update_workload_schedules_exact_budget() {
-        let base = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        let base =
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let base_range = range_request_total(&base, 1);
-        let base_app = application_operation_total(&base, 1.0, 1.0);
+        let base_app = application_operation_total(&base);
         let (nodes, batch) = (100u64, 10u64);
         let waves = nodes.div_ceil(batch);
         let workload = base
             .rolling_update(nodes, batch, 500.0, "rolling-test", base_range, base_app)
             .unwrap();
         let expected = 8 * nodes + 1 + 2 * waves;
-        assert_eq!(application_operation_total(&workload, 1.0, 1.0), expected);
+        assert_eq!(application_operation_total(&workload), expected);
         let ranges = RateCursor::new(&workload, 1.0, 1, 0xB2);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
         let producer = RangeProducer::new(weights.iter().copied());
@@ -3438,7 +3407,8 @@ mod tests {
 
     #[test]
     fn range_shape_plan_emits_exact_trace_counts() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        let workload =
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let ranges = RateCursor::new(&workload, 1.0, 1, 0xB2);
         assert_eq!(ranges.total(), 22_080);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
@@ -3462,7 +3432,7 @@ mod tests {
     #[test]
     fn range_shapes_follow_actual_prefix_slots() {
         let mut workload =
-            WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         workload.ranges = vec![
             crate::config::RangeSpec {
                 key_pattern: "/registry/prefix/".into(),
@@ -3679,8 +3649,20 @@ mod tests {
     }
 
     #[test]
+    fn event_retry_delay_is_bounded_by_operation_deadline() {
+        let policy = CasRetryPolicy::event();
+        assert!(
+            cas_retry_delay(policy, b"/registry/events/ns/e", 1, Duration::from_secs(7)).is_none()
+        );
+        let delay =
+            cas_retry_delay(policy, b"/registry/events/ns/e", 1, Duration::from_secs(13)).unwrap();
+        assert!((Duration::from_millis(7_500)..=Duration::from_millis(12_500)).contains(&delay));
+    }
+
+    #[test]
     fn embedded_read_only_resources_are_created_before_ranges() {
-        let workload = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+        let workload =
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         for name in ["services", "endpointslices"] {
             let resource = workload
                 .resources
@@ -4015,7 +3997,7 @@ mod tests {
     }
     fn exact_phase_workload() -> WorkloadSpec {
         let mut workload =
-            WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         workload.topology.node_count = 2;
         workload.topology.pod_count = 4;
         workload

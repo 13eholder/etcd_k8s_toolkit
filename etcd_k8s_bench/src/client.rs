@@ -29,14 +29,6 @@ pub fn watch_request<S>(requests: S) -> Request<S> {
     request
 }
 
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum ContextError {
-    #[error("cancelled")]
-    Cancelled,
-    #[error("deadline exceeded")]
-    DeadlineExceeded,
-}
-
 #[derive(Clone)]
 pub struct ClientBundle {
     kv: KvClient<Channel>,
@@ -51,8 +43,6 @@ pub enum ClientError {
     Transport(#[source] tonic::transport::Error),
     #[error("etcd RPC error: {0}")]
     Rpc(#[from] Status),
-    #[error("etcd request context error: {0:?}")]
-    Context(ContextError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RpcMutability {
@@ -113,7 +103,6 @@ impl ClientError {
             return RetryDecision::NotSent;
         }
         match self {
-            Self::Context(_) => RetryDecision::Stop,
             Self::Transport(_) if !method.is_mutable() => RetryDecision::Retry,
             Self::Transport(_) => RetryDecision::ResultUnknown,
             Self::Rpc(status) if !method.is_mutable() => {
@@ -337,20 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn local_context_errors_stop_without_retry() {
-        let deadline = ClientError::Context(ContextError::DeadlineExceeded);
-        assert_eq!(
-            deadline.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
-            RetryDecision::Stop
-        );
-        let cancelled = ClientError::Context(ContextError::Cancelled);
-        assert_eq!(
-            cancelled.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
-            RetryDecision::Stop
-        );
-    }
-
-    #[test]
     fn method_mutability_is_explicit() {
         assert_eq!(RpcMethod::Range.mutability(), RpcMutability::ReadOnly);
         assert_eq!(RpcMethod::Status.mutability(), RpcMutability::ReadOnly);
@@ -363,8 +338,5 @@ mod tests {
         assert!(error.to_string().starts_with("etcd RPC error: "));
         assert!(error.to_string().contains("temporary"));
         assert!(std::error::Error::source(&error).is_some());
-
-        let context = ClientError::Context(ContextError::Cancelled);
-        assert_eq!(context.to_string(), "etcd request context error: Cancelled");
     }
 }

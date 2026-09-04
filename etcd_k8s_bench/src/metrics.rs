@@ -657,7 +657,7 @@ mod tests {
         reset_watch_reconnects();
         let recorder = PrometheusBuilder::new().build_recorder();
         let resource = ResourceName::new("pods").unwrap();
-        let workload = WorkloadName::new("mock_k8").unwrap();
+        let workload = WorkloadName::new("k8s").unwrap();
         let pool = PoolName::new("events").unwrap();
 
         // Building a Prometheus recorder is the registration step.  Running
@@ -691,7 +691,7 @@ mod tests {
             record_watch_cancel(&workload, "eof");
             record_info("0.1.0", &workload);
             set_pod_size(4096);
-            set_nodes(2003);
+            set_nodes(2000);
         });
         reset_watch_reconnects();
     }

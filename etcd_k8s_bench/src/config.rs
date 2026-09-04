@@ -11,18 +11,16 @@ use crate::metrics::{PoolName, ResourceName, WorkloadName};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Profile {
-    MockK8,
-    RealK8,
+    K8sNoNodeLease,
+    K8s,
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub endpoint: String,
-    pub profile: Option<Profile>,
     pub workload: WorkloadSpec,
     pub pod_size: usize,
     pub nodes: u64,
-    pub rate_scale: f64,
     pub time_scale: f64,
     pub workers: usize,
     pub queue_capacity: usize,
@@ -36,7 +34,9 @@ pub struct RuntimeConfig {
 #[cfg(test)]
 pub const DEFAULT_POD_SIZE_BYTES: usize = 4096;
 #[cfg(test)]
-pub const DEFAULT_NODE_COUNT: u64 = 2003;
+pub const DEFAULT_NODE_COUNT: u64 = 2_000;
+#[cfg(test)]
+pub const DEFAULT_POD_COUNT: u64 = 40_000;
 
 /// Node count used by `gen_profile` rolling-update workloads when `--nodes`
 /// is not given explicitly.
@@ -53,8 +53,6 @@ pub struct WorkloadSpec {
     pub timeline: Vec<TimelineSegment>,
     pub resources: Vec<ResourceSpec>,
     pub ranges: Vec<RangeSpec>,
-    #[serde(default)]
-    pub range_fixtures: Vec<RangeFixtureSpec>,
     #[serde(default)]
     pub etcd_lease_pools: Vec<EtcdLeasePoolSpec>,
     #[serde(default)]
@@ -170,7 +168,6 @@ fn default_node_lease_enabled() -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TimelineSegment {
     pub duration_s: f64,
-    pub application_txn_rps: f64,
     pub range_rps: f64,
 }
 
@@ -203,14 +200,6 @@ pub struct RangeSpec {
 
 fn default_selector_keep_every() -> u64 {
     1
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct RangeFixtureSpec {
-    pub name: String,
-    pub key_pattern: String,
-    pub count: u64,
-    pub value_size_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -289,15 +278,10 @@ impl WorkloadSpec {
                     "timeline[{index}].duration_s must be greater than zero"
                 )));
             }
-            for (field, value) in [
-                ("application_txn_rps", segment.application_txn_rps),
-                ("range_rps", segment.range_rps),
-            ] {
-                if !value.is_finite() || value < 0.0 {
-                    return Err(ConfigError::Invalid(format!(
-                        "timeline[{index}].{field} must be non-negative"
-                    )));
-                }
+            if !segment.range_rps.is_finite() || segment.range_rps < 0.0 {
+                return Err(ConfigError::Invalid(format!(
+                    "timeline[{index}].range_rps must be non-negative"
+                )));
             }
         }
 
@@ -397,9 +381,6 @@ impl WorkloadSpec {
                     "watches[{index}].start_revision must be non-negative"
                 )));
             }
-        }
-        for (index, fixture) in self.range_fixtures.iter().enumerate() {
-            fixture.validate(index, max_message_size)?;
         }
         let mut pool_names = HashSet::with_capacity(self.etcd_lease_pools.len());
         for (index, pool) in self.etcd_lease_pools.iter().enumerate() {
@@ -533,7 +514,6 @@ impl WorkloadSpec {
         };
         spec.timeline = vec![TimelineSegment {
             duration_s: seconds,
-            application_txn_rps: txn_rps,
             range_rps,
         }];
 
@@ -576,8 +556,8 @@ impl WorkloadSpec {
         // segment total; the runtime cursor never schedules fewer ranges
         // than that floor, so range_shape_plan can never fail at scale 1.
         // The margin (one per range shape, two per segment) covers rounding
-        // drift when the run applies --rate-scale/--time-scale other than 1,
-        // which rescales both sides of the check.
+        // drift when run-time duration scaling changes the number of
+        // scheduled Range requests.
         let floor_range_total = (range_rps * seconds).floor() as u64;
         let scaled_count_only = if base_seconds > 0.0 {
             (self.range_count_only_count as f64 * seconds / base_seconds).round() as u64
@@ -958,32 +938,6 @@ impl RangeSpec {
     }
 }
 
-impl RangeFixtureSpec {
-    fn validate(&self, index: usize, max_message_size: usize) -> Result<(), ConfigError> {
-        ResourceName::new(self.name.clone()).map_err(|error| {
-            ConfigError::Invalid(format!(
-                "range_fixtures[{index}].name is not a valid metric label: {error}"
-            ))
-        })?;
-        if self.key_pattern.trim().is_empty() {
-            return Err(ConfigError::Invalid(format!(
-                "range_fixtures[{index}].key_pattern must not be empty"
-            )));
-        }
-        if self.count == 0 {
-            return Err(ConfigError::Invalid(format!(
-                "range_fixtures[{index}].count must be greater than zero"
-            )));
-        }
-        if self.value_size_bytes == 0 || self.value_size_bytes > max_message_size {
-            return Err(ConfigError::Invalid(format!(
-                "range_fixtures[{index}].value_size_bytes must be in 1..={max_message_size}"
-            )));
-        }
-        Ok(())
-    }
-}
-
 impl EtcdLeasePoolSpec {
     fn validate(&self, index: usize) -> Result<(), ConfigError> {
         if self.name.trim().is_empty() {
@@ -1025,7 +979,7 @@ mod tests {
     use super::*;
 
     fn embedded() -> WorkloadSpec {
-        WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap()
+        WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap()
     }
 
     #[test]
@@ -1180,17 +1134,17 @@ mod tests {
     #[test]
     fn embedded_profile_declares_authoritative_topology_and_counts() {
         let spec = embedded();
-        assert_eq!(spec.topology.node_count, 2_003);
-        assert_eq!(spec.topology.pod_count, 42_001);
+        assert_eq!(spec.topology.node_count, 2_000);
+        assert_eq!(spec.topology.pod_count, 40_000);
         let pods = spec.resources.iter().find(|r| r.name == "pods").unwrap();
         let events = spec.resources.iter().find(|r| r.name == "events").unwrap();
-        assert_eq!(spec.resource_count(pods).unwrap(), 42_001);
-        assert_eq!(spec.resource_count(events).unwrap(), 45_432);
+        assert_eq!(spec.resource_count(pods).unwrap(), 40_000);
+        assert_eq!(spec.resource_count(events).unwrap(), 40_000);
     }
     #[test]
     fn removed_keep_alive_field_is_rejected() {
         let mut workload: serde_json::Value =
-            serde_json::from_str(include_str!("../workloads/mock_k8.json")).unwrap();
+            serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         workload["etcd_lease_pools"][0]["keep_alive"] = serde_json::Value::Bool(true);
 
         let error = WorkloadSpec::from_json(&workload.to_string()).unwrap_err();
@@ -1200,8 +1154,8 @@ mod tests {
     #[test]
     fn built_in_profiles_do_not_expose_keep_alive() {
         for json in [
-            include_str!("../workloads/mock_k8.json"),
-            include_str!("../workloads/real_k8.json"),
+            include_str!("../workloads/k8s-no-node-lease.json"),
+            include_str!("../workloads/k8s.json"),
         ] {
             let workload: serde_json::Value = serde_json::from_str(json).unwrap();
             assert!(
@@ -1226,7 +1180,7 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
     }
     #[test]
-    fn embedded_mock_k8_preserves_resource_and_lease_shapes() {
+    fn embedded_k8s_preserves_resource_and_lease_shapes() {
         let spec = embedded();
         assert_eq!(
             spec.timeline
@@ -1238,16 +1192,15 @@ mod tests {
         assert_eq!(spec.master_lease_interval_s, 10.0);
         assert_eq!(spec.cas_conflicts, 0);
         assert_eq!(spec.range_count_only_count, 220);
-        assert!(spec.range_fixtures.is_empty());
         assert_eq!(spec.pod_size_bytes, 4096);
-        assert_eq!(spec.topology.node_count, 2003);
+        assert_eq!(spec.topology.node_count, 2000);
 
         let event = spec
             .resources
             .iter()
             .find(|resource| resource.name == "events")
             .unwrap();
-        assert_eq!(spec.resource_count(event).unwrap(), 45_432);
+        assert_eq!(spec.resource_count(event).unwrap(), 40_000);
         assert_eq!(event.update_amplification, 0);
 
         let pool = spec
@@ -1269,7 +1222,7 @@ mod tests {
     #[test]
     fn lease_pool_requires_integral_encodable_seconds() {
         let mut input: serde_json::Value =
-            serde_json::from_str(include_str!("../workloads/mock_k8.json")).unwrap();
+            serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         input["etcd_lease_pools"][0]["object_ttl_s"] = serde_json::Value::from(0.5);
         assert!(WorkloadSpec::from_json(&input.to_string()).is_err());
 
@@ -1311,16 +1264,17 @@ mod tests {
     }
     #[test]
     fn built_in_profiles_have_explicit_node_lease_modes() {
-        let mock = WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap();
-        let real = WorkloadSpec::from_json(include_str!("../workloads/real_k8.json")).unwrap();
+        let mock =
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
+        let real = WorkloadSpec::from_json(include_str!("../workloads/k8s.json")).unwrap();
         assert!(!mock.nodes.node_lease_enabled);
         assert!(real.nodes.node_lease_enabled);
     }
     #[test]
     fn built_in_watch_uses_resource_root_without_trailing_slash() {
         for spec in [
-            WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap(),
-            WorkloadSpec::from_json(include_str!("../workloads/real_k8.json")).unwrap(),
+            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap(),
+            WorkloadSpec::from_json(include_str!("../workloads/k8s.json")).unwrap(),
         ] {
             assert_eq!(spec.watches.len(), 1);
             assert_eq!(spec.watches[0].resource_prefix, "/registry/pods");
@@ -1329,7 +1283,7 @@ mod tests {
     #[test]
     fn watch_rejects_legacy_or_non_root_prefixes() {
         let mut input: serde_json::Value =
-            serde_json::from_str(include_str!("../workloads/mock_k8.json")).unwrap();
+            serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let prefix = input["watches"][0]
             .as_object_mut()
             .unwrap()
@@ -1395,20 +1349,21 @@ mod tests {
         let mut spec = embedded();
         spec.name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
-        spec.name = "mock_k8".into();
+        spec.name = "k8s".into();
         spec.resources[0].name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
         spec.resources[0].name = "pods".into();
         spec.etcd_lease_pools[0].name = "invalid label".into();
         assert!(spec.validate(64 * 1024 * 1024).is_err());
         spec.etcd_lease_pools[0].name = "events".into();
-        spec.range_fixtures.push(RangeFixtureSpec {
-            name: "invalid label".into(),
-            key_pattern: "/registry/test/{id}".into(),
-            count: 1,
-            value_size_bytes: 1,
-        });
-        assert!(spec.validate(64 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn legacy_range_fixtures_field_is_rejected() {
+        let mut input: serde_json::Value =
+            serde_json::from_str(include_str!("../workloads/k8s.json")).unwrap();
+        input["range_fixtures"] = serde_json::json!([]);
+        assert!(WorkloadSpec::from_json(&input.to_string()).is_err());
     }
 
     #[test]
@@ -1431,7 +1386,7 @@ mod tests {
 
     fn rolling(base: &WorkloadSpec, nodes: u64, batch: u64) -> Result<WorkloadSpec, ConfigError> {
         let range = crate::scheduler::range_request_total(base, 1);
-        let app = crate::scheduler::application_operation_total(base, 1.0, 1.0);
+        let app = crate::scheduler::application_operation_total(base);
         base.rolling_update(nodes, batch, 500.0, "rolling-test", range, app)
     }
 
@@ -1445,12 +1400,11 @@ mod tests {
         // Budget 8N+1+2w = 800+1+20 = 821 at 500 rps -> 1.642s.
         assert_eq!(spec.timeline.len(), 1);
         assert_eq!(spec.timeline[0].duration_s, 1.642);
-        assert_eq!(spec.timeline[0].application_txn_rps, 500.0);
         // Range rate preserves the trace read/write ratio at 500 rps.
         let base_seconds: f64 = base.timeline.iter().map(|s| s.duration_s).sum();
         let base_range_rps = crate::scheduler::range_request_total(&base, 1) as f64 / base_seconds;
         let base_app_rps =
-            crate::scheduler::application_operation_total(&base, 1.0, 1.0) as f64 / base_seconds;
+            crate::scheduler::application_operation_total(&base) as f64 / base_seconds;
         assert_eq!(
             spec.timeline[0].range_rps,
             base_range_rps * 500.0 / base_app_rps
@@ -1469,7 +1423,7 @@ mod tests {
         assert_eq!(daemonsets.update_amplification, 20);
         assert_eq!(spec.resource_count(daemonsets).unwrap(), 1);
         // Total conservation: 8N + 1 + 2w application operations.
-        let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
+        let total = crate::scheduler::application_operation_total(&spec);
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
         // Masterlease resources are preserved unchanged.
         assert!(
@@ -1501,7 +1455,7 @@ mod tests {
         assert!(rolling(&base, 0, 10).is_err());
         assert!(rolling(&base, 100, 0).is_err());
         let range = crate::scheduler::range_request_total(&base, 1);
-        let app = crate::scheduler::application_operation_total(&base, 1.0, 1.0);
+        let app = crate::scheduler::application_operation_total(&base);
         assert!(base.rolling_update(100, 10, 0.0, "x", range, app).is_err());
         assert!(
             base.rolling_update(100, 10, f64::NAN, "x", range, app)
@@ -1526,7 +1480,7 @@ mod tests {
                 .all(|r| r.name != "events" && r.name != "daemonsets")
         );
         // Budget 5N (deploy N + rolling 4N) = 500 at 500 rps -> 1s.
-        let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
+        let total = crate::scheduler::application_operation_total(&spec);
         assert_eq!(total, 5 * 100);
         assert_eq!(spec.timeline[0].duration_s, 1.0);
         spec.validate(64 * 1024 * 1024).unwrap();
@@ -1551,12 +1505,11 @@ mod tests {
         let mut base = embedded();
         base.timeline = vec![TimelineSegment {
             duration_s: 30.0,
-            application_txn_rps: 1.0,
             range_rps: 0.1,
         }];
         base.range_count_only_count = 3;
         let range_total = crate::scheduler::range_request_total(&base, 1);
-        let app_total = crate::scheduler::application_operation_total(&base, 1.0, 1.0);
+        let app_total = crate::scheduler::application_operation_total(&base);
         let spec = base
             .rolling_update(1, 1, 100.0, "tight", range_total, app_total)
             .unwrap();

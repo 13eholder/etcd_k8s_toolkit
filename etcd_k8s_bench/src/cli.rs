@@ -6,14 +6,14 @@ use clap::Parser;
 
 use crate::config::{ConfigError, Profile, ROLLING_UPDATE_NODE_COUNT, RuntimeConfig, WorkloadSpec};
 #[cfg(test)]
-use crate::config::{DEFAULT_NODE_COUNT, DEFAULT_POD_SIZE_BYTES};
+use crate::config::{DEFAULT_NODE_COUNT, DEFAULT_POD_COUNT, DEFAULT_POD_SIZE_BYTES};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:2379";
 
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "etcd_k8s_bench",
-    about = "Replay a Kubernetes workload against etcd"
+    about = "Apply Kubernetes etcd API pressure from an exact workload model"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,9 +24,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the benchmark against a dedicated empty etcd endpoint.
     Run(RunArgs),
-    /// Generate a rolling-update workload profile (DaemonSet pods recreated in
-    /// waves), write it to workloads/<name>.json, and exit without touching
-    /// etcd.
+    /// Generate a deterministic DaemonSet-update pressure profile, write it
+    /// to workloads/<name>.json, and exit without touching etcd.
     #[command(name = "gen_profile")]
     GenProfile(GenProfileArgs),
 }
@@ -38,7 +37,7 @@ pub struct BaseArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Built-in workload profile. Defaults to mock-k8 when omitted.
+    /// Built-in workload profile. Defaults to k8s when omitted.
     #[arg(long, value_parser = parse_profile)]
     pub profile: Option<Profile>,
 
@@ -68,11 +67,11 @@ pub struct RunArgs {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
 
-    /// Scale application transaction rate; heartbeat cadence is unchanged.
-    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f64)]
-    pub rate_scale: f64,
+    /// Exact total number of Pod keys.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub pods: Option<u64>,
 
-    /// Scale workload and periodic task time.
+    /// Scale update-phase duration and periodic task intervals; exact object and update counts are unchanged.
     #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f64)]
     pub time_scale: f64,
 
@@ -122,25 +121,19 @@ pub struct GenProfileArgs {
 }
 
 impl BaseArgs {
-    /// Load the base workload selected by --config/--profile (default MockK8).
-    fn base_workload(&self) -> Result<(Option<Profile>, WorkloadSpec), ConfigError> {
+    /// Load the base workload selected by --config/--profile (default k8s).
+    fn base_workload(&self) -> Result<WorkloadSpec, ConfigError> {
         match (&self.config, self.profile) {
             (Some(_), Some(_)) => Err(ConfigError::Invalid(
                 "--config and --profile are mutually exclusive".into(),
             )),
-            (Some(path), None) => Ok((None, WorkloadSpec::from_path(path)?)),
-            (None, Some(profile @ Profile::MockK8)) => Ok((
-                Some(profile),
-                WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json"))?,
-            )),
-            (None, Some(profile @ Profile::RealK8)) => Ok((
-                Some(profile),
-                WorkloadSpec::from_json(include_str!("../workloads/real_k8.json"))?,
-            )),
-            (None, None) => Ok((
-                Some(Profile::MockK8),
-                WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json"))?,
-            )),
+            (Some(path), None) => WorkloadSpec::from_path(path),
+            (None, Some(Profile::K8sNoNodeLease)) => {
+                WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json"))
+            }
+            (None, Some(Profile::K8s)) | (None, None) => {
+                WorkloadSpec::from_json(include_str!("../workloads/k8s.json"))
+            }
         }
     }
 
@@ -178,9 +171,9 @@ impl GenProfileArgs {
     }
 
     fn generate_to(&self, dir: &Path) -> Result<PathBuf, ConfigError> {
-        let (_, mut workload) = self.base.base_workload()?;
+        let mut workload = self.base.base_workload()?;
         let base_range_total = crate::scheduler::range_request_total(&workload, self.base.seed);
-        let base_app_total = crate::scheduler::application_operation_total(&workload, 1.0, 1.0);
+        let base_app_total = crate::scheduler::application_operation_total(&workload);
         let nodes = self.base.nodes.unwrap_or(ROLLING_UPDATE_NODE_COUNT);
         workload = workload.rolling_update(
             nodes,
@@ -198,8 +191,11 @@ impl GenProfileArgs {
 
 impl RunArgs {
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
-        let (profile, mut workload) = self.base.base_workload()?;
+        let mut workload = self.base.base_workload()?;
         self.base.apply_overrides(&mut workload);
+        if let Some(pods) = self.pods {
+            workload.topology.pod_count = pods;
+        }
         if self.queue_capacity < self.workers {
             return Err(ConfigError::Invalid(format!(
                 "queue_capacity ({}) must be at least workers ({})",
@@ -210,11 +206,6 @@ impl RunArgs {
 
         if self.endpoint.trim().is_empty() {
             return Err(ConfigError::Invalid("endpoint must not be empty".into()));
-        }
-        if !self.rate_scale.is_finite() || self.rate_scale <= 0.0 {
-            return Err(ConfigError::Invalid(
-                "rate_scale must be greater than zero".into(),
-            ));
         }
         if !self.time_scale.is_finite() || self.time_scale <= 0.0 {
             return Err(ConfigError::Invalid(
@@ -230,11 +221,9 @@ impl RunArgs {
 
         Ok(RuntimeConfig {
             endpoint: self.endpoint.clone(),
-            profile,
             pod_size: workload.pod_size_bytes,
             nodes: workload.topology.node_count,
             workload,
-            rate_scale: self.rate_scale,
             time_scale: self.time_scale,
             workers: self.workers,
             queue_capacity: self.queue_capacity,
@@ -369,10 +358,10 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 }
 fn parse_profile(value: &str) -> Result<Profile, String> {
     match value {
-        "mock-k8" => Ok(Profile::MockK8),
-        "real-k8" => Ok(Profile::RealK8),
+        "k8s" => Ok(Profile::K8s),
+        "k8s-no-node-lease" => Ok(Profile::K8sNoNodeLease),
         _ => Err(format!(
-            "unknown profile {value:?}; expected mock-k8 or real-k8"
+            "unknown profile {value:?}; expected k8s or k8s-no-node-lease"
         )),
     }
 }
@@ -471,36 +460,37 @@ mod tests {
     }
 
     #[test]
-    fn defaults_load_mock_k8_without_node_leases() {
+    fn defaults_load_k8s_with_exact_topology_and_node_leases() {
         let config = run_config(&[]).unwrap();
-        assert_eq!(config.profile, Some(Profile::MockK8));
-        assert!(!config.workload.nodes.node_lease_enabled);
+        assert_eq!(config.workload.name, "k8s");
+        assert!(config.workload.nodes.node_lease_enabled);
         assert_eq!(config.pod_size, DEFAULT_POD_SIZE_BYTES);
         assert_eq!(config.nodes, DEFAULT_NODE_COUNT);
-        assert_eq!(config.rate_scale, 1.0);
+        assert_eq!(config.workload.topology.pod_count, DEFAULT_POD_COUNT);
         assert_eq!(config.request_timeout, Duration::from_secs(10));
     }
     #[test]
-    fn real_k8_enables_node_leases() {
-        let config = run_config(&["--profile", "real-k8"]).unwrap();
-        assert_eq!(config.profile, Some(Profile::RealK8));
-        assert!(config.workload.nodes.node_lease_enabled);
+    fn explicit_no_node_lease_profile_disables_node_leases() {
+        let config = run_config(&["--profile", "k8s-no-node-lease"]).unwrap();
+        assert_eq!(config.workload.name, "k8s_no_node_lease");
+        assert!(!config.workload.nodes.node_lease_enabled);
     }
     #[test]
     fn explicit_profile_and_custom_config_are_mutually_exclusive() {
-        let error = run_config(&["--profile", "mock-k8", "--config", "custom.json"])
+        let error = run_config(&["--profile", "k8s", "--config", "custom.json"])
             .unwrap_err()
             .to_string();
         assert!(error.contains("mutually exclusive"));
     }
 
     #[test]
-    fn explicit_pod_and_nodes_override_workload() {
-        let config = run_config(&["--pod-size", "8192", "--nodes", "7"]).unwrap();
+    fn explicit_pod_size_pods_and_nodes_override_workload() {
+        let config = run_config(&["--pod-size", "8192", "--pods", "800", "--nodes", "7"]).unwrap();
         assert_eq!(config.pod_size, 8192);
         assert_eq!(config.nodes, 7);
         assert_eq!(config.workload.pod_size_bytes, 8192);
         assert_eq!(config.workload.topology.node_count, 7);
+        assert_eq!(config.workload.topology.pod_count, 800);
         assert_eq!(
             config
                 .workload
@@ -546,6 +536,27 @@ mod tests {
     }
 
     #[test]
+    fn removed_rate_scale_and_legacy_profiles_are_rejected() {
+        assert!(Cli::try_parse_from(["bench", "run", "--rate-scale", "2"]).is_err());
+        assert!(Cli::try_parse_from(["bench", "run", "--profile", "mock-k8"]).is_err());
+        assert!(Cli::try_parse_from(["bench", "run", "--profile", "real-k8"]).is_err());
+    }
+
+    #[test]
+    fn time_scale_changes_duration_without_changing_exact_targets() {
+        let base = run_config(&[]).unwrap();
+        let scaled = run_config(&["--time-scale", "0.5"]).unwrap();
+        assert_eq!(
+            crate::scheduler::application_operation_total(&base.workload),
+            crate::scheduler::application_operation_total(&scaled.workload)
+        );
+        assert_eq!(
+            crate::scheduler::Scheduler::new(&scaled).duration(),
+            crate::scheduler::Scheduler::new(&base).duration() / 2
+        );
+    }
+
+    #[test]
     fn gen_profile_defaults_match_rolling_update() {
         let args = gen_args(&[]);
         assert_eq!(args.batch_size, 500);
@@ -584,7 +595,6 @@ mod tests {
         assert_eq!(spec.timeline.len(), 1);
         // Budget 821 at 500 rps -> 1.642s.
         assert_eq!(spec.timeline[0].duration_s, 1.642);
-        assert_eq!(spec.timeline[0].application_txn_rps, 500.0);
         let pods = spec
             .resources
             .iter()
@@ -592,7 +602,7 @@ mod tests {
             .unwrap();
         assert_eq!(spec.resource_count(pods).unwrap(), 100);
         assert_eq!(pods.update_amplification, 4);
-        let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
+        let total = crate::scheduler::application_operation_total(&spec);
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -614,6 +624,14 @@ mod tests {
             8192
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gen_profile_rejects_explicit_pod_count() {
+        assert!(
+            Cli::try_parse_from(["bench", "gen_profile", "--pods", "100", "--name", "invalid"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -657,8 +675,7 @@ mod tests {
         assert_eq!(spec.timeline.len(), 1);
         // Budget 80041 at the default 2000 rps -> 40.0205s.
         assert_eq!(spec.timeline[0].duration_s, 40.0205);
-        assert_eq!(spec.timeline[0].application_txn_rps, 2000.0);
-        let app_total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
+        let app_total = crate::scheduler::application_operation_total(&spec);
         assert_eq!(app_total, 8 * 10_000 + 1 + 2 * 20);
         assert!(crate::scheduler::range_request_total(&spec, 1) > 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -673,7 +690,7 @@ mod tests {
         assert_eq!(config.workload.name, "roundtrip");
         assert_eq!(config.nodes, 10);
         assert_eq!(
-            crate::scheduler::application_operation_total(&config.workload, 1.0, 1.0),
+            crate::scheduler::application_operation_total(&config.workload),
             8 * 10 + 1 + 2 * 2
         );
         let _ = std::fs::remove_dir_all(&dir);
