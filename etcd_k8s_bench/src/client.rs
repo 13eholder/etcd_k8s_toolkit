@@ -1,4 +1,3 @@
-use std::pin::Pin;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -18,7 +17,6 @@ use crate::pb::etcdserverpb::{
     WatchResponse,
 };
 
-pub type WatchRequestStream = Pin<Box<dyn Stream<Item = WatchRequest> + Send + 'static>>;
 pub const REQUIRE_LEADER_METADATA: &str = "hasleader";
 /// Construct the tonic Watch request with etcd's canonical require-leader
 /// metadata. Keeping construction separate makes the metadata observable
@@ -178,10 +176,6 @@ impl ClientBundle {
             maintenance,
             watch,
         })
-    }
-
-    pub fn watch_client(&self) -> GeneratedWatchClient<Channel> {
-        self.watch.clone()
     }
 
     /// Open the single bidirectional Watch RPC with Kubernetes' require-leader

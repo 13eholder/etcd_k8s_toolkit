@@ -98,7 +98,7 @@
   "watches": [
     {
       "name": "pods",
-      "key_prefix": "/registry/pods/",
+      "resource_prefix": "/registry/pods",
       "start_revision": 0,
       "prev_kv": true,
       "progress_notify": true

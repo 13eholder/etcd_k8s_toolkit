@@ -10,10 +10,9 @@ use tonic::{Code, Status};
 
 use crate::client::ClientBundle;
 use crate::config::WatchSpec;
-use crate::metrics;
+use crate::metrics::{self, WorkloadName};
 use crate::pb::etcdserverpb::{
-    WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest, WatchResponse,
-    watch_request,
+    WatchCancelRequest, WatchCreateRequest, WatchRequest, WatchResponse, watch_request,
 };
 use crate::pb::mvccpb;
 
@@ -38,8 +37,6 @@ impl WatchConnector for ClientBundle {
     }
 }
 
-pub use crate::client::REQUIRE_LEADER_METADATA;
-
 /// Return the etcd range end for a byte prefix.
 pub fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
     if prefix.is_empty() {
@@ -59,21 +56,13 @@ pub fn create_request(spec: &WatchSpec, start_revision: i64) -> WatchRequest {
     WatchRequest {
         request_union: Some(watch_request::RequestUnion::CreateRequest(
             WatchCreateRequest {
-                key: spec.key_prefix.as_bytes().to_vec(),
-                range_end: prefix_range_end(spec.key_prefix.as_bytes()),
+                key: spec.resource_prefix.as_bytes().to_vec(),
+                range_end: prefix_range_end(spec.resource_prefix.as_bytes()),
                 start_revision,
                 prev_kv: spec.prev_kv,
                 progress_notify: spec.progress_notify,
                 ..Default::default()
             },
-        )),
-    }
-}
-
-pub fn progress_request() -> WatchRequest {
-    WatchRequest {
-        request_union: Some(watch_request::RequestUnion::ProgressRequest(
-            WatchProgressRequest {},
         )),
     }
 }
@@ -186,8 +175,6 @@ pub struct WatchOutcome {
 pub enum WatchError {
     #[error("watch RPC: {0}")]
     Rpc(#[source] Status),
-    #[error("watch terminated: {:?}", .0.terminal)]
-    Terminal(WatchOutcome),
 }
 
 /// Run one long-lived watch. Only transport disconnects are resumed; semantic
@@ -208,6 +195,8 @@ async fn run_with_connector<C>(
 where
     C: WatchConnector,
 {
+    let watch_name =
+        WorkloadName::new(spec.name.clone()).expect("workload watch label was validated");
     let mut state = WatchState::default();
     loop {
         // A peer can close a stream immediately after it is opened.  Keep the
@@ -219,7 +208,7 @@ where
                 _ = sleep(delay) => {}
                 _ = shutdown.changed() => {
                     let outcome = WatchOutcome { terminal: WatchTerminal::ContextCanceled, state };
-                    metrics::record_watch_cancel("context");
+                    metrics::record_watch_cancel(&watch_name, "context");
                     return Ok(outcome);
                 }
             }
@@ -229,14 +218,11 @@ where
         tx.send(create_request(&spec, start))
             .await
             .map_err(|_| WatchError::Rpc(Status::cancelled("watch request channel closed")))?;
-        tx.send(progress_request())
-            .await
-            .map_err(|_| WatchError::Rpc(Status::cancelled("watch request channel closed")))?;
         let mut stream = match client.open_watch(ReceiverStream::new(rx)).await {
             Ok(stream) => stream,
             Err(status) if is_no_leader_status(&status) => return Err(WatchError::Rpc(status)),
             Err(status) if is_recoverable_disconnect(&status) => {
-                record_reconnect(&mut state);
+                record_reconnect(&mut state, &watch_name);
                 continue;
             }
             Err(status) => return Err(WatchError::Rpc(status)),
@@ -248,14 +234,15 @@ where
                         let _ = tx.send(cancel_request(state.watch_id)).await;
                     }
                     let outcome = WatchOutcome { terminal: WatchTerminal::ContextCanceled, state };
-                    metrics::record_watch_cancel("context");
+                    metrics::record_watch_cancel(&watch_name, "context");
                     return Ok(outcome);
                 }
                 response = stream.next() => match response {
                     Some(Ok(response)) => {
-                        metrics::record_watch_response(&response);
+                        metrics::record_watch_response(&watch_name, &response);
                         if let Some(terminal) = state.observe(&response) {
                             metrics::record_watch_cancel(
+                                &watch_name,
                                 if response.compact_revision > 0 { "compacted" } else { "server" }
                             );
                             return Ok(WatchOutcome { terminal, state });
@@ -264,14 +251,14 @@ where
                     None => {
                         // A clean EOF is a transport transition for a
                         // long-lived watch, not a terminal scheduler result.
-                        record_reconnect(&mut state);
+                        record_reconnect(&mut state, &watch_name);
                         break;
                     }
                     Some(Err(status)) if is_no_leader_status(&status) => {
                         return Err(WatchError::Rpc(status));
                     }
                     Some(Err(status)) if is_recoverable_disconnect(&status) => {
-                        record_reconnect(&mut state);
+                        record_reconnect(&mut state, &watch_name);
                         break;
                     }
                     Some(Err(status)) => return Err(WatchError::Rpc(status)),
@@ -292,9 +279,9 @@ fn is_no_leader_status(status: &Status) -> bool {
         && status.message().trim() == ETCD_NO_LEADER_MESSAGE
 }
 
-fn record_reconnect(state: &mut WatchState) {
+fn record_reconnect(state: &mut WatchState, watch: &WorkloadName) {
     state.reconnects = state.reconnects.saturating_add(1);
-    metrics::record_watch_reconnect();
+    metrics::record_watch_reconnect(watch);
 }
 
 #[cfg(test)]
@@ -327,6 +314,12 @@ mod tests {
                 panic!("first request must create watch");
             };
             self.starts.lock().await.push(create.start_revision);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), requests.next())
+                    .await
+                    .is_err(),
+                "watch open must not send an unconditional progress request"
+            );
             let call = {
                 let mut calls = self.calls.lock().await;
                 *calls += 1;
@@ -382,7 +375,7 @@ mod tests {
     fn spec() -> WatchSpec {
         WatchSpec {
             name: "pods".into(),
-            key_prefix: "/registry/pods/".into(),
+            resource_prefix: "/registry/pods".into(),
             start_revision: 7,
             prev_kv: true,
             progress_notify: true,
@@ -509,8 +502,8 @@ mod tests {
 
     #[test]
     fn prefix_end_and_require_leader_contract_are_fixed() {
-        assert_eq!(REQUIRE_LEADER_METADATA, "hasleader");
-        assert_eq!(prefix_range_end(b"/pods/"), b"/pods0".to_vec());
+        assert_eq!(crate::client::REQUIRE_LEADER_METADATA, "hasleader");
+        assert_eq!(prefix_range_end(b"/pods"), b"/podt".to_vec());
         assert_eq!(prefix_range_end(&[0xff]), vec![0]);
     }
 
@@ -522,12 +515,8 @@ mod tests {
             panic!()
         };
         assert_eq!(request.start_revision, 9);
-        assert_eq!(request.range_end, b"/registry/pods0".to_vec());
+        assert_eq!(request.range_end, b"/registry/podt".to_vec());
         assert!(request.prev_kv && request.progress_notify);
-        assert!(matches!(
-            progress_request().request_union,
-            Some(watch_request::RequestUnion::ProgressRequest(_))
-        ));
         assert!(matches!(
             cancel_request(3).request_union,
             Some(watch_request::RequestUnion::CancelRequest(_))
@@ -613,8 +602,9 @@ mod tests {
         metrics::reset_watch_reconnects();
         let mut first = WatchState::default();
         let mut second = WatchState::default();
-        record_reconnect(&mut first);
-        record_reconnect(&mut second);
+        let watch = WorkloadName::new("pods").unwrap();
+        record_reconnect(&mut first, &watch);
+        record_reconnect(&mut second, &watch);
         assert_eq!(metrics::watch_reconnects_total(), 2);
         assert_eq!(first.reconnects, 1);
         assert_eq!(second.reconnects, 1);

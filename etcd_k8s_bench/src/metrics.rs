@@ -25,12 +25,15 @@ pub const CAS_RETRIES_TOTAL: &str = "etcd_k8s_bench_cas_retries_total";
 pub const NODE_HEARTBEATS_TOTAL: &str = "etcd_k8s_bench_node_heartbeats_total";
 pub const LEASE_GET_TOTAL: &str = "etcd_k8s_bench_lease_get_total";
 pub const LEASE_ATTACHED_OBJECTS: &str = "etcd_k8s_bench_lease_attached_objects";
+pub const RESOURCE_OBJECTS: &str = "etcd_k8s_bench_resource_objects";
+pub const RESOURCE_UPDATES: &str = "etcd_k8s_bench_resource_updates";
 pub const DROPPED_TOTAL: &str = "etcd_k8s_bench_dropped_total";
 pub const INFO: &str = "etcd_k8s_bench_info";
 pub const WATCH_EVENTS_TOTAL: &str = "etcd_k8s_bench_watch_events_total";
 pub const WATCH_EVENT_BYTES: &str = "etcd_k8s_bench_watch_event_bytes";
 pub const WATCH_CANCEL_TOTAL: &str = "etcd_k8s_bench_watch_cancel_total";
 pub const WATCH_RECONNECT_TOTAL: &str = "etcd_k8s_bench_watch_reconnect_total";
+pub const RANGE_REQUESTS_TOTAL: &str = "etcd_k8s_bench_range_requests_total";
 pub const RANGE_PAGES: &str = "etcd_k8s_bench_range_pages";
 pub const RANGE_SNAPSHOT_REVISION: &str = "etcd_k8s_bench_range_snapshot_revision";
 pub const RANGE_SERVER_COUNT: &str = "etcd_k8s_bench_range_server_count";
@@ -209,6 +212,24 @@ impl Rpc {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RangeShape {
+    Point,
+    CountOnly,
+    UnboundedPrefix,
+    PagedPrefix,
+}
+
+impl RangeShape {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::CountOnly => "count_only",
+            Self::UnboundedPrefix => "unbounded_prefix",
+            Self::PagedPrefix => "paged_prefix",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TxnShape {
@@ -265,10 +286,6 @@ impl HeartbeatKind {
 pub enum DropReason {
     Backpressure,
     QueueClosed,
-    /// The application producer ran out of schedulable operations while the
-    /// rate cursor still had events (possible when a workload with heavy
-    /// delete churn is run at `--rate-scale`/`--time-scale` other than 1).
-    Exhausted,
 }
 
 impl DropReason {
@@ -276,7 +293,6 @@ impl DropReason {
         match self {
             Self::Backpressure => "backpressure",
             Self::QueueClosed => "queue_closed",
-            Self::Exhausted => "exhausted",
         }
     }
 }
@@ -358,6 +374,15 @@ pub fn record_request_duration(rpc: Rpc, duration: Duration) {
         .record(duration.as_secs_f64());
 }
 
+pub fn record_range_request(shape: RangeShape, outcome: Outcome) {
+    metrics::counter!(
+        RANGE_REQUESTS_TOTAL,
+        "shape" => shape.as_str(),
+        "outcome" => outcome.as_str()
+    )
+    .increment(1);
+}
+
 pub fn record_request_bytes(resource: &ResourceName, bytes: usize) {
     metrics::histogram!(REQUEST_BYTES, "resource" => resource.as_str().to_owned())
         .record(bytes as f64);
@@ -413,11 +438,32 @@ pub fn set_lease_attached_objects(pool: &PoolName, count: u64) {
     .set(count as f64);
 }
 
+pub fn set_resource_objects(resource: &ResourceName, state: &'static str, count: u64) {
+    metrics::gauge!(
+        RESOURCE_OBJECTS,
+        "resource" => resource.as_str().to_owned(),
+        "state" => state
+    )
+    .set(count as f64);
+}
+
+pub fn set_resource_updates(resource: &ResourceName, state: &'static str, count: u64) {
+    metrics::gauge!(
+        RESOURCE_UPDATES,
+        "resource" => resource.as_str().to_owned(),
+        "state" => state
+    )
+    .set(count as f64);
+}
+
 pub fn record_dropped(reason: DropReason) {
     metrics::counter!(DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
-pub fn record_watch_response(response: &crate::pb::etcdserverpb::WatchResponse) {
+pub fn record_watch_response(
+    watch: &WorkloadName,
+    response: &crate::pb::etcdserverpb::WatchResponse,
+) {
     let events = response.events.len() as u64;
     let bytes: u64 = response
         .events
@@ -433,26 +479,23 @@ pub fn record_watch_response(response: &crate::pb::etcdserverpb::WatchResponse) 
                     .map_or(0, |kv| (kv.key.len() + kv.value.len()) as u64)
         })
         .sum();
-    metrics::counter!(WATCH_EVENTS_TOTAL).increment(events);
-    metrics::counter!(WATCH_EVENT_BYTES).increment(bytes);
+    metrics::counter!(WATCH_EVENTS_TOTAL, "watch" => watch.as_str().to_owned()).increment(events);
+    metrics::counter!(WATCH_EVENT_BYTES, "watch" => watch.as_str().to_owned()).increment(bytes);
 }
 
-pub fn record_watch_cancel(reason: &'static str) {
-    metrics::counter!(WATCH_CANCEL_TOTAL, "reason" => reason).increment(1);
+pub fn record_watch_cancel(watch: &WorkloadName, reason: &'static str) {
+    metrics::counter!(WATCH_CANCEL_TOTAL, "watch" => watch.as_str().to_owned(), "reason" => reason)
+        .increment(1);
 }
 
-pub fn record_watch_reconnect() {
+pub fn record_watch_reconnect(watch: &WorkloadName) {
     #[cfg(test)]
     let total = WATCH_RECONNECTS.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(not(test))]
     WATCH_RECONNECTS.fetch_add(1, Ordering::Relaxed);
     #[cfg(test)]
     invoke_watch_reconnect_test_hook(total);
-    metrics::counter!(WATCH_RECONNECT_TOTAL).increment(1);
-    // Increment the gauge directly.  A fetch-then-set publication lets a
-    // slower transition overwrite a newer cumulative value when watches
-    // reconnect concurrently.
-    metrics::gauge!("etcd_k8s_bench_watch_reconnects").increment(1);
+    metrics::counter!(WATCH_RECONNECT_TOTAL, "watch" => watch.as_str().to_owned()).increment(1);
 }
 
 #[cfg(test)]
@@ -570,6 +613,8 @@ mod tests {
             NODE_HEARTBEATS_TOTAL,
             LEASE_GET_TOTAL,
             LEASE_ATTACHED_OBJECTS,
+            RESOURCE_OBJECTS,
+            RESOURCE_UPDATES,
             DROPPED_TOTAL,
             INFO,
             WATCH_EVENTS_TOTAL,
@@ -580,6 +625,7 @@ mod tests {
             RANGE_SNAPSHOT_REVISION,
             RANGE_SERVER_COUNT,
             RANGE_LAST_KEY_BYTES,
+            RANGE_REQUESTS_TOTAL,
             RANGE_SELECTED,
             RANGE_DISCARDED,
             INFLIGHT,
@@ -593,7 +639,7 @@ mod tests {
             COMPACTOR_RECOVERIES_TOTAL,
         ];
         assert!(names.iter().all(|name| name.starts_with("etcd_k8s_bench_")));
-        assert_eq!(names.len(), 31);
+        assert_eq!(names.len(), 34);
     }
     #[test]
     fn outcome_mapping_is_fixed() {
@@ -624,10 +670,13 @@ mod tests {
             record_request_duration(Rpc::Txn, Duration::from_millis(2));
             record_request_bytes(&resource, 4096);
             record_txn(&resource, TxnShape::Create, TxnResult::Committed);
+            record_range_request(RangeShape::PagedPrefix, Outcome::Success);
             record_cas_retry(&resource, Operation::Update);
             record_node_heartbeat(HeartbeatKind::NodeLease, Outcome::Success);
             record_lease_get(&pool, "reuse");
             set_lease_attached_objects(&pool, 7);
+            set_resource_objects(&resource, "planned", 40_000);
+            set_resource_updates(&resource, "target", 400_000);
             record_dropped(DropReason::Backpressure);
             add_inflight(Rpc::Txn);
             remove_inflight(Rpc::Txn);
@@ -638,8 +687,8 @@ mod tests {
             record_compactor_error("failure_kv_missing");
             record_compactor_recovery("missing_key");
             record_range_result(2, 7, 10, b"/registry/pods/z", 8, 2);
-            record_watch_reconnect();
-            record_watch_cancel("eof");
+            record_watch_reconnect(&workload);
+            record_watch_cancel(&workload, "eof");
             record_info("0.1.0", &workload);
             set_pod_size(4096);
             set_nodes(2003);
@@ -667,16 +716,18 @@ mod tests {
                 hook_pause.wait();
             }
         })));
+        let watch = WorkloadName::new("pods").unwrap();
 
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 let start = Arc::clone(&start);
                 let completed_tx = completed_tx.clone();
                 let recorder = &recorder;
+                let watch = watch.clone();
                 scope.spawn(move || {
                     metrics::with_local_recorder(recorder, || {
                         start.wait();
-                        record_watch_reconnect();
+                        record_watch_reconnect(&watch);
                         completed_tx.send(()).expect("reconnect worker receiver");
                     });
                 });
@@ -694,10 +745,6 @@ mod tests {
         set_watch_reconnect_test_hook(None);
         assert_eq!(watch_reconnects_total(), 2);
         let rendered = recorder.handle().render();
-        assert_eq!(
-            rendered_metric_value(&rendered, "etcd_k8s_bench_watch_reconnects"),
-            2
-        );
         assert_eq!(rendered_metric_value(&rendered, WATCH_RECONNECT_TOTAL), 2);
         reset_watch_reconnects();
     }
@@ -707,7 +754,7 @@ mod tests {
             .lines()
             .find_map(|line| {
                 let (metric, value) = line.split_once(' ')?;
-                (metric == name).then_some(value.parse::<f64>().ok()?)
+                (metric.split('{').next()? == name).then_some(value.parse::<f64>().ok()?)
             })
             .map(|value| value as u64)
             .expect("metric must be rendered")

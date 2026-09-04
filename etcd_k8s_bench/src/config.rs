@@ -72,9 +72,10 @@ pub struct WorkloadSpec {
 
 /// One long-lived Kubernetes-style prefix Watch stream.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct WatchSpec {
     pub name: String,
-    pub key_prefix: String,
+    pub resource_prefix: String,
     #[serde(default)]
     pub start_revision: i64,
     #[serde(default)]
@@ -383,9 +384,12 @@ impl WorkloadSpec {
                     "watches[{index}].name is not a valid metric label: {error}"
                 ))
             })?;
-            if watch.key_prefix.is_empty() {
+            if watch.resource_prefix.is_empty()
+                || !watch.resource_prefix.starts_with("/registry/")
+                || watch.resource_prefix.ends_with('/')
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "watches[{index}].key_prefix must not be empty"
+                    "watches[{index}].resource_prefix must be a /registry resource root without a trailing slash"
                 )));
             }
             if watch.start_revision < 0 {
@@ -1311,6 +1315,33 @@ mod tests {
         let real = WorkloadSpec::from_json(include_str!("../workloads/real_k8.json")).unwrap();
         assert!(!mock.nodes.node_lease_enabled);
         assert!(real.nodes.node_lease_enabled);
+    }
+    #[test]
+    fn built_in_watch_uses_resource_root_without_trailing_slash() {
+        for spec in [
+            WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap(),
+            WorkloadSpec::from_json(include_str!("../workloads/real_k8.json")).unwrap(),
+        ] {
+            assert_eq!(spec.watches.len(), 1);
+            assert_eq!(spec.watches[0].resource_prefix, "/registry/pods");
+        }
+    }
+    #[test]
+    fn watch_rejects_legacy_or_non_root_prefixes() {
+        let mut input: serde_json::Value =
+            serde_json::from_str(include_str!("../workloads/mock_k8.json")).unwrap();
+        let prefix = input["watches"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resource_prefix")
+            .unwrap();
+        input["watches"][0]["key_prefix"] = prefix;
+        assert!(WorkloadSpec::from_json(&input.to_string()).is_err());
+
+        let mut spec = embedded();
+        spec.watches[0].resource_prefix = "/registry/pods/".into();
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("without a trailing slash"));
     }
     #[test]
     fn custom_node_spec_can_explicitly_disable_leases() {
