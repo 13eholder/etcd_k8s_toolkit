@@ -43,9 +43,11 @@ pub const DEFAULT_NODE_COUNT: u64 = 2003;
 pub const ROLLING_UPDATE_NODE_COUNT: u64 = 10_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadSpec {
     pub name: String,
     pub pod_size_bytes: usize,
+    pub topology: TopologySpec,
     pub nodes: NodeSpec,
     pub timeline: Vec<TimelineSegment>,
     pub resources: Vec<ResourceSpec>,
@@ -81,8 +83,23 @@ pub struct WatchSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TopologySpec {
+    pub node_count: u64,
+    pub pod_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "basis", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceCountSpec {
+    Fixed { count: u64 },
+    Pods { numerator: u64, denominator: u64 },
+    Nodes { numerator: u64, denominator: u64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSpec {
-    pub count: u64,
     pub status_interval_s: f64,
     pub lease_interval_s: f64,
     pub lease_jitter: f64,
@@ -105,10 +122,12 @@ pub struct TimelineSegment {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceSpec {
     pub name: String,
     pub key_pattern: String,
-    pub unique_keys: u64,
+    pub count: ResourceCountSpec,
+    pub update_amplification: u64,
     pub create_weight: f64,
     pub update_weight: f64,
     pub delete_weight: f64,
@@ -209,6 +228,7 @@ impl WorkloadSpec {
                 self.pod_size_bytes
             )));
         }
+        self.topology.validate()?;
         self.nodes.validate()?;
         if self.timeline.is_empty() {
             return Err(ConfigError::Invalid("timeline must not be empty".into()));
@@ -231,13 +251,20 @@ impl WorkloadSpec {
             }
         }
 
+        let mut resource_names = HashSet::with_capacity(self.resources.len());
         for (index, resource) in self.resources.iter().enumerate() {
             ResourceName::new(resource.name.clone()).map_err(|error| {
                 ConfigError::Invalid(format!(
                     "resources[{index}].name is not a valid metric label: {error}"
                 ))
             })?;
-            resource.validate(index, max_message_size)?;
+            if !resource_names.insert(resource.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "resources[{index}] duplicate resource name {:?}",
+                    resource.name
+                )));
+            }
+            resource.validate(index, &self.topology, max_message_size)?;
             let requires_native_lease = matches!(
                 &resource.retry_policy,
                 RetryPolicy::Event | RetryPolicy::MasterLease
@@ -267,6 +294,18 @@ impl WorkloadSpec {
                 }
                 (None, false) => {}
             }
+        }
+        let pods = self
+            .resources
+            .iter()
+            .find(|resource| resource.name == "pods")
+            .ok_or_else(|| ConfigError::Invalid("workload has no pods resource".into()))?;
+        let pod_resource_count = self.resource_count(pods)?;
+        if pod_resource_count != self.topology.pod_count {
+            return Err(ConfigError::Invalid(format!(
+                "pods resource count ({pod_resource_count}) must equal topology.pod_count ({})",
+                self.topology.pod_count
+            )));
         }
         for (index, range) in self.ranges.iter().enumerate() {
             range.validate(index)?;
@@ -319,6 +358,10 @@ impl WorkloadSpec {
         Ok(())
     }
 
+    pub fn resource_count(&self, resource: &ResourceSpec) -> Result<u64, ConfigError> {
+        resource.count.resolve(&self.topology, &resource.name)
+    }
+
     /// Build a Kubernetes DaemonSet rolling-update workload from this base
     /// spec at a caller-chosen application transaction rate. The total
     /// budget is fixed by the shape — initial deploy (N Pods plus events
@@ -329,8 +372,8 @@ impl WorkloadSpec {
     /// deficit producer interleaves operations freely, so early operation
     /// is create-dominated (updates/deletes need present keys) and later
     /// operation is mixed churn. The Pod pool is 2N, so creates never
-    /// exceed `unique_keys` and no slot recycling is needed. The Range rate
-    /// follows the trace read/write ratio: `base_range_rps` scaled by
+    /// exceed the resolved resource count and no slot recycling is needed.
+    /// The Range rate follows the trace read/write ratio: `base_range_rps` scaled by
     /// `txn_rps / base_app_rps`. Periodic traffic (heartbeats, masterlease,
     /// compact, watches) keeps this base spec's cadence unchanged.
     ///
@@ -411,7 +454,10 @@ impl WorkloadSpec {
 
         let mut spec = self.clone();
         spec.name = name.to_string();
-        spec.nodes.count = nodes;
+        spec.topology.node_count = nodes;
+        spec.topology.pod_count = nodes
+            .checked_mul(2)
+            .ok_or_else(|| ConfigError::Invalid("rolling Pod count overflows u64".into()))?;
         spec.timeline = vec![TimelineSegment {
             duration_s: seconds,
             application_txn_rps: txn_rps,
@@ -419,7 +465,11 @@ impl WorkloadSpec {
         }];
 
         let mut resources = vec![ResourceSpec {
-            unique_keys: 2 * nodes,
+            count: ResourceCountSpec::Pods {
+                numerator: 1,
+                denominator: 1,
+            },
+            update_amplification: 1,
             create_weight: (2 * nodes) as f64,
             update_weight: (2 * nodes) as f64,
             delete_weight: nodes as f64,
@@ -427,7 +477,8 @@ impl WorkloadSpec {
         }];
         if let Some(events) = events {
             resources.push(ResourceSpec {
-                unique_keys: 3 * nodes,
+                count: ResourceCountSpec::Fixed { count: 3 * nodes },
+                update_amplification: 0,
                 create_weight: (3 * nodes) as f64,
                 update_weight: 0.0,
                 delete_weight: 0.0,
@@ -436,7 +487,8 @@ impl WorkloadSpec {
         }
         if let Some(daemonsets) = daemonsets {
             resources.push(ResourceSpec {
-                unique_keys: 1,
+                count: ResourceCountSpec::Fixed { count: 1 },
+                update_amplification: 2 * waves,
                 create_weight: 1.0,
                 update_weight: (2 * waves) as f64,
                 delete_weight: 0.0,
@@ -473,13 +525,94 @@ impl WorkloadSpec {
     }
 }
 
+impl TopologySpec {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (field, count) in [
+            ("node_count", self.node_count),
+            ("pod_count", self.pod_count),
+        ] {
+            if count == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "topology.{field} must be greater than zero"
+                )));
+            }
+            if usize::try_from(count).is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "topology.{field} exceeds platform capacity"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ResourceCountSpec {
+    pub fn resolve(&self, topology: &TopologySpec, resource: &str) -> Result<u64, ConfigError> {
+        match *self {
+            Self::Fixed { count } => {
+                if count == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "resource {resource:?} count must be greater than zero"
+                    )));
+                }
+                Ok(count)
+            }
+            Self::Pods {
+                numerator,
+                denominator,
+            } => {
+                scaled_resource_count(topology.pod_count, numerator, denominator, resource, "pods")
+            }
+            Self::Nodes {
+                numerator,
+                denominator,
+            } => scaled_resource_count(
+                topology.node_count,
+                numerator,
+                denominator,
+                resource,
+                "nodes",
+            ),
+        }
+    }
+}
+
+fn scaled_resource_count(
+    base: u64,
+    numerator: u64,
+    denominator: u64,
+    resource: &str,
+    basis: &str,
+) -> Result<u64, ConfigError> {
+    if numerator == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "resource {resource:?} {basis} numerator must be greater than zero"
+        )));
+    }
+    if denominator == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "resource {resource:?} {basis} denominator must be greater than zero"
+        )));
+    }
+    let scaled = base.checked_mul(numerator).ok_or_else(|| {
+        ConfigError::Invalid(format!("resource {resource:?} {basis} count overflows u64"))
+    })?;
+    if scaled % denominator != 0 {
+        return Err(ConfigError::Invalid(format!(
+            "resource {resource:?} {basis} count must resolve to an integer"
+        )));
+    }
+    let count = scaled / denominator;
+    if count == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "resource {resource:?} count must be greater than zero"
+        )));
+    }
+    Ok(count)
+}
+
 impl NodeSpec {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.count == 0 {
-            return Err(ConfigError::Invalid(
-                "nodes.count must be greater than zero".into(),
-            ));
-        }
         for (field, value) in [
             ("status_interval_s", self.status_interval_s),
             ("lease_interval_s", self.lease_interval_s),
@@ -510,7 +643,12 @@ impl NodeSpec {
 }
 
 impl ResourceSpec {
-    fn validate(&self, index: usize, max_message_size: usize) -> Result<(), ConfigError> {
+    fn validate(
+        &self,
+        index: usize,
+        topology: &TopologySpec,
+        max_message_size: usize,
+    ) -> Result<(), ConfigError> {
         if self.name.trim().is_empty() {
             return Err(ConfigError::Invalid(format!(
                 "resources[{index}].name must not be empty"
@@ -521,11 +659,17 @@ impl ResourceSpec {
                 "resources[{index}].key_pattern must not be empty"
             )));
         }
-        if self.unique_keys == 0 {
+        let count = self.count.resolve(topology, &self.name)?;
+        if usize::try_from(count).is_err() {
             return Err(ConfigError::Invalid(format!(
-                "resources[{index}].unique_keys must be greater than zero"
+                "resources[{index}] count exceeds platform capacity"
             )));
         }
+        count
+            .checked_mul(self.update_amplification)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!("resources[{index}] update target overflows u64"))
+            })?;
         for (field, value) in [
             ("create_weight", self.create_weight),
             ("update_weight", self.update_weight),
@@ -652,6 +796,100 @@ mod tests {
     fn embedded() -> WorkloadSpec {
         WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap()
     }
+
+    #[test]
+    fn resource_counts_resolve_exactly_from_topology() {
+        let topology = TopologySpec {
+            node_count: 2_000,
+            pod_count: 40_000,
+        };
+        assert_eq!(
+            ResourceCountSpec::Pods {
+                numerator: 1,
+                denominator: 1,
+            }
+            .resolve(&topology, "events")
+            .unwrap(),
+            40_000
+        );
+        assert_eq!(
+            ResourceCountSpec::Nodes {
+                numerator: 1,
+                denominator: 1,
+            }
+            .resolve(&topology, "node_leases")
+            .unwrap(),
+            2_000
+        );
+        assert_eq!(
+            ResourceCountSpec::Fixed { count: 20 }
+                .resolve(&topology, "deployments")
+                .unwrap(),
+            20
+        );
+    }
+
+    #[test]
+    fn resource_counts_reject_nonintegral_overflowing_and_zero_values() {
+        let topology = TopologySpec {
+            node_count: 2_000,
+            pod_count: 40_000,
+        };
+        let nonintegral = ResourceCountSpec::Pods {
+            numerator: 1,
+            denominator: 3,
+        }
+        .resolve(&topology, "events")
+        .unwrap_err()
+        .to_string();
+        assert!(nonintegral.contains("must resolve to an integer"));
+
+        let overflow = ResourceCountSpec::Pods {
+            numerator: u64::MAX,
+            denominator: 1,
+        }
+        .resolve(&topology, "events")
+        .unwrap_err()
+        .to_string();
+        assert!(overflow.contains("overflows"));
+
+        for count in [
+            ResourceCountSpec::Fixed { count: 0 },
+            ResourceCountSpec::Nodes {
+                numerator: 0,
+                denominator: 1,
+            },
+            ResourceCountSpec::Nodes {
+                numerator: 1,
+                denominator: 0,
+            },
+        ] {
+            assert!(count.resolve(&topology, "invalid").is_err());
+        }
+    }
+
+    #[test]
+    fn update_amplification_target_must_fit_u64() {
+        let mut spec = embedded();
+        spec.resources
+            .iter_mut()
+            .find(|resource| resource.name == "pods")
+            .unwrap()
+            .update_amplification = u64::MAX;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("update target overflows"));
+    }
+
+    #[test]
+    fn embedded_profile_declares_authoritative_topology_and_counts() {
+        let spec = embedded();
+        assert_eq!(spec.topology.node_count, 2_003);
+        assert_eq!(spec.topology.pod_count, 42_001);
+        let pods = spec.resources.iter().find(|r| r.name == "pods").unwrap();
+        let events = spec.resources.iter().find(|r| r.name == "events").unwrap();
+        assert_eq!(spec.resource_count(pods).unwrap(), 42_001);
+        assert_eq!(spec.resource_count(events).unwrap(), 45_432);
+    }
     #[test]
     fn removed_keep_alive_field_is_rejected() {
         let mut workload: serde_json::Value =
@@ -705,14 +943,14 @@ mod tests {
         assert_eq!(spec.range_count_only_count, 220);
         assert_eq!(spec.range_fixtures.len(), 2);
         assert_eq!(spec.pod_size_bytes, 4096);
-        assert_eq!(spec.nodes.count, 2003);
+        assert_eq!(spec.topology.node_count, 2003);
 
         let event = spec
             .resources
             .iter()
             .find(|resource| resource.name == "events")
             .unwrap();
-        assert_eq!(event.unique_keys, 45_432);
+        assert_eq!(spec.resource_count(event).unwrap(), 45_432);
         assert_eq!(event.create_weight, 45_432.0);
         assert_eq!(event.update_weight, 266.0);
         assert_eq!(event.delete_weight, 1.0);
@@ -787,7 +1025,6 @@ mod tests {
     fn custom_node_spec_can_explicitly_disable_leases() {
         let node: NodeSpec = serde_json::from_str(
             r#"{
-                "count": 1,
                 "status_interval_s": 300,
                 "lease_interval_s": 10,
                 "lease_jitter": 0.04,
@@ -803,9 +1040,9 @@ mod tests {
     #[test]
     fn rejects_zero_nodes() {
         let mut spec = embedded();
-        spec.nodes.count = 0;
+        spec.topology.node_count = 0;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
-        assert!(error.contains("nodes.count"));
+        assert!(error.contains("topology.node_count"));
     }
 
     #[test]
@@ -876,7 +1113,7 @@ mod tests {
         let base = embedded();
         let spec = rolling(&base, 100, 10).unwrap();
         assert_eq!(spec.name, "rolling-test");
-        assert_eq!(spec.nodes.count, 100);
+        assert_eq!(spec.topology.node_count, 100);
         // Single segment at the requested rate; duration = budget / txn_rps.
         // Budget 8N+1+2w = 800+1+20 = 821 at 500 rps -> 1.642s.
         assert_eq!(spec.timeline.len(), 1);
@@ -892,12 +1129,14 @@ mod tests {
             base_range_rps * 500.0 / base_app_rps
         );
         let pods = spec.resources.iter().find(|r| r.name == "pods").unwrap();
-        assert_eq!(pods.unique_keys, 200);
+        assert_eq!(pods.update_amplification, 1);
+        assert_eq!(spec.resource_count(pods).unwrap(), 200);
         assert_eq!(pods.create_weight, 200.0);
         assert_eq!(pods.update_weight, 200.0);
         assert_eq!(pods.delete_weight, 100.0);
         let events = spec.resources.iter().find(|r| r.name == "events").unwrap();
-        assert_eq!(events.unique_keys, 300);
+        assert_eq!(events.update_amplification, 0);
+        assert_eq!(spec.resource_count(events).unwrap(), 300);
         assert_eq!(events.create_weight, 300.0);
         assert_eq!(events.delete_weight, 0.0);
         let daemonsets = spec
@@ -905,7 +1144,8 @@ mod tests {
             .iter()
             .find(|r| r.name == "daemonsets")
             .unwrap();
-        assert_eq!(daemonsets.unique_keys, 1);
+        assert_eq!(daemonsets.update_amplification, 20);
+        assert_eq!(spec.resource_count(daemonsets).unwrap(), 1);
         assert_eq!(daemonsets.update_weight, 20.0);
         // Total conservation: 8N + 1 + 2w application operations.
         let total: u64 = spec

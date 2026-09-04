@@ -157,7 +157,7 @@ impl BaseArgs {
             }
         }
         if let Some(nodes) = self.nodes {
-            workload.nodes.count = nodes;
+            workload.topology.node_count = nodes;
         }
     }
 }
@@ -174,8 +174,7 @@ impl GenProfileArgs {
     fn generate_to(&self, dir: &Path) -> Result<PathBuf, ConfigError> {
         let (_, mut workload) = self.base.base_workload()?;
         let base_range_total = crate::scheduler::range_request_total(&workload, self.base.seed);
-        let base_app_total =
-            crate::scheduler::application_operation_total(&workload, 1.0, 1.0);
+        let base_app_total = crate::scheduler::application_operation_total(&workload, 1.0, 1.0);
         let nodes = self.base.nodes.unwrap_or(ROLLING_UPDATE_NODE_COUNT);
         workload = workload.rolling_update(
             nodes,
@@ -227,7 +226,7 @@ impl RunArgs {
             endpoint: self.endpoint.clone(),
             profile,
             pod_size: workload.pod_size_bytes,
-            nodes: workload.nodes.count,
+            nodes: workload.topology.node_count,
             workload,
             rate_scale: self.rate_scale,
             time_scale: self.time_scale,
@@ -495,7 +494,7 @@ mod tests {
         assert_eq!(config.pod_size, 8192);
         assert_eq!(config.nodes, 7);
         assert_eq!(config.workload.pod_size_bytes, 8192);
-        assert_eq!(config.workload.nodes.count, 7);
+        assert_eq!(config.workload.topology.node_count, 7);
         assert_eq!(
             config
                 .workload
@@ -575,7 +574,7 @@ mod tests {
         assert_eq!(path, dir.join("load-test.json"));
         let spec = WorkloadSpec::from_path(&path).unwrap();
         assert_eq!(spec.name, "load-test");
-        assert_eq!(spec.nodes.count, 100);
+        assert_eq!(spec.topology.node_count, 100);
         assert_eq!(spec.timeline.len(), 1);
         // Budget 821 at 500 rps -> 1.642s.
         assert_eq!(spec.timeline[0].duration_s, 1.642);
@@ -585,7 +584,7 @@ mod tests {
             .iter()
             .find(|resource| resource.name == "pods")
             .unwrap();
-        assert_eq!(pods.unique_keys, 200);
+        assert_eq!(spec.resource_count(pods).unwrap(), 200);
         assert_eq!(pods.create_weight, 200.0);
         assert_eq!(pods.delete_weight, 100.0);
         let total = crate::scheduler::application_operation_total(&spec, 1.0, 1.0);
@@ -596,14 +595,10 @@ mod tests {
     #[test]
     fn generate_profile_bakes_explicit_overrides() {
         let dir = temp_dir("overrides");
-        let args = gen_args(&[
-            "--nodes", "7",
-            "--pod-size", "8192",
-            "--name", "small",
-        ]);
+        let args = gen_args(&["--nodes", "7", "--pod-size", "8192", "--name", "small"]);
         let path = args.generate_to(&dir).unwrap();
         let spec = WorkloadSpec::from_path(&path).unwrap();
-        assert_eq!(spec.nodes.count, 7);
+        assert_eq!(spec.topology.node_count, 7);
         assert_eq!(spec.pod_size_bytes, 8192);
         assert_eq!(
             spec.resources
@@ -653,7 +648,7 @@ mod tests {
         let path = args.generate_to(&dir).unwrap();
         let spec = WorkloadSpec::from_path(&path).unwrap();
         assert_eq!(spec.name, "rolling-update");
-        assert_eq!(spec.nodes.count, ROLLING_UPDATE_NODE_COUNT);
+        assert_eq!(spec.topology.node_count, ROLLING_UPDATE_NODE_COUNT);
         assert_eq!(spec.timeline.len(), 1);
         // Budget 80041 at the default 2000 rps -> 40.0205s.
         assert_eq!(spec.timeline[0].duration_s, 40.0205);

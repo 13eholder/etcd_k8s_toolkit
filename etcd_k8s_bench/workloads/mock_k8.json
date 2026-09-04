@@ -1,8 +1,8 @@
 {
   "name": "mock_k8",
   "pod_size_bytes": 4096,
+  "topology": {"node_count":2003,"pod_count":42001},
   "nodes": {
-    "count": 2003,
     "status_interval_s": 300,
     "lease_interval_s": 10,
     "lease_jitter": 0.04,
@@ -52,13 +52,13 @@
     {"duration_s":30,"application_txn_rps":117.14562,"range_rps":10}
   ],
   "resources": [
-    {"name":"pods","key_pattern":"/registry/pods/bench-{ns}/{id}","unique_keys":42001,"create_weight":42001,"update_weight":413972,"delete_weight":2,"value_size_bytes":4096,"retry_policy":"guaranteed_update"},
-    {"name":"events","key_pattern":"/registry/events/bench-{ns}/{id}","unique_keys":45432,"create_weight":45432,"update_weight":266,"delete_weight":1,"value_size_bytes":677,"retry_policy":"event","lease_pool":"events"},
-    {"name":"replicasets","key_pattern":"/registry/replicasets/bench-{ns}/{id}","unique_keys":20,"create_weight":20,"update_weight":3359,"delete_weight":0,"value_size_bytes":22660,"retry_policy":"guaranteed_update"},
-    {"name":"deployments","key_pattern":"/registry/deployments/bench-{ns}/{id}","unique_keys":20,"create_weight":20,"update_weight":3398,"delete_weight":0,"value_size_bytes":22863,"retry_policy":"guaranteed_update"},
-    {"name":"leases","key_pattern":"/registry/leases/bench-{ns}/{id}","unique_keys":6,"create_weight":6,"update_weight":3200,"delete_weight":0,"value_size_bytes":466,"retry_policy":"guaranteed_update"},
-    {"name":"daemonsets","key_pattern":"/registry/daemonsets/bench-{ns}/{id}","unique_keys":1,"create_weight":1,"update_weight":2407,"delete_weight":0,"value_size_bytes":2858,"retry_policy":"guaranteed_update"},
-    {"name":"masterleases","key_pattern":"/registry/masterleases/{id}","unique_keys":1,"create_weight":1,"update_weight":230,"delete_weight":0,"value_size_bytes":66,"retry_policy":"master_lease","lease_pool":"masterleases"}
+    {"name":"pods","key_pattern":"/registry/pods/bench-{ns}/{id}","count":{"basis":"pods","numerator":1,"denominator":1},"update_amplification":10,"create_weight":42001,"update_weight":413972,"delete_weight":2,"value_size_bytes":4096,"retry_policy":"guaranteed_update"},
+    {"name":"events","key_pattern":"/registry/events/bench-{ns}/{id}","count":{"basis":"pods","numerator":45432,"denominator":42001},"update_amplification":0,"create_weight":45432,"update_weight":266,"delete_weight":1,"value_size_bytes":677,"retry_policy":"event","lease_pool":"events"},
+    {"name":"replicasets","key_pattern":"/registry/replicasets/bench-{ns}/{id}","count":{"basis":"fixed","count":20},"update_amplification":168,"create_weight":20,"update_weight":3359,"delete_weight":0,"value_size_bytes":22660,"retry_policy":"guaranteed_update"},
+    {"name":"deployments","key_pattern":"/registry/deployments/bench-{ns}/{id}","count":{"basis":"fixed","count":20},"update_amplification":170,"create_weight":20,"update_weight":3398,"delete_weight":0,"value_size_bytes":22863,"retry_policy":"guaranteed_update"},
+    {"name":"leases","key_pattern":"/registry/leases/bench-{ns}/{id}","count":{"basis":"fixed","count":6},"update_amplification":534,"create_weight":6,"update_weight":3200,"delete_weight":0,"value_size_bytes":466,"retry_policy":"guaranteed_update"},
+    {"name":"daemonsets","key_pattern":"/registry/daemonsets/bench-{ns}/{id}","count":{"basis":"fixed","count":1},"update_amplification":2407,"create_weight":1,"update_weight":2407,"delete_weight":0,"value_size_bytes":2858,"retry_policy":"guaranteed_update"},
+    {"name":"masterleases","key_pattern":"/registry/masterleases/{id}","count":{"basis":"fixed","count":1},"update_amplification":0,"create_weight":1,"update_weight":230,"delete_weight":0,"value_size_bytes":66,"retry_policy":"master_lease","lease_pool":"masterleases"}
   ],
   "ranges": [
     {"key_pattern":"/registry/pods/bench-{ns}/","kind":"prefix","limit":500,"count_only":false,"weight":5440},

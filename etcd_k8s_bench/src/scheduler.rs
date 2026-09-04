@@ -12,8 +12,11 @@ use tokio::task::JoinSet;
 use tokio::time::{self, Instant as TokioInstant};
 
 use crate::client::{ClientBundle, RequestDisposition, RetryDecision, RpcMethod};
+#[cfg(test)]
+use crate::config::TopologySpec;
 use crate::config::{
-    EtcdLeasePoolSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy, RuntimeConfig, WorkloadSpec,
+    EtcdLeasePoolSpec, ResourceCountSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy,
+    RuntimeConfig, WorkloadSpec,
 };
 use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner};
 use crate::lease::{LeaseEvent, LeasePool, LeasePoolConfig};
@@ -508,7 +511,10 @@ impl LifecycleProducer {
                     op_left -= 1;
                 }
             }
-            let create_overflow = remaining[0].saturating_sub(spec.unique_keys);
+            let object_count = workload
+                .resource_count(spec)
+                .expect("workload resource counts were validated");
+            let create_overflow = remaining[0].saturating_sub(object_count);
             remaining[0] -= create_overflow;
             if op_weights[1] > 0.0 {
                 remaining[1] += create_overflow;
@@ -521,7 +527,7 @@ impl LifecycleProducer {
                 deficits: [0.0; 3],
                 total_weight: weight,
                 next_id: 0,
-                present: vec![false; spec.unique_keys as usize],
+                present: vec![false; object_count as usize],
                 present_cursor: splitmix(seed ^ index as u64) as usize,
             });
         }
@@ -2575,7 +2581,8 @@ async fn execute_heartbeat(
     let spec = ResourceSpec {
         name: resource.into(),
         key_pattern: item.key.clone(),
-        unique_keys: 1,
+        count: ResourceCountSpec::Fixed { count: 1 },
+        update_amplification: 1,
         create_weight: 1.0,
         update_weight: 1.0,
         delete_weight: 0.0,
@@ -2891,8 +2898,11 @@ mod tests {
         let workload = WorkloadSpec {
             name: "mock_k8".into(),
             pod_size_bytes: 4096,
+            topology: TopologySpec {
+                node_count: 1,
+                pod_count: 10_000,
+            },
             nodes: crate::config::NodeSpec {
-                count: 1,
                 status_interval_s: 300.0,
                 lease_interval_s: 10.0,
                 lease_jitter: 0.0,
@@ -2908,7 +2918,11 @@ mod tests {
             resources: vec![ResourceSpec {
                 name: "pods".into(),
                 key_pattern: "/p/{id}".into(),
-                unique_keys: 10000,
+                count: ResourceCountSpec::Pods {
+                    numerator: 1,
+                    denominator: 1,
+                },
+                update_amplification: 1,
                 create_weight: 1.0,
                 update_weight: 1.0,
                 delete_weight: 0.0,
@@ -2995,7 +3009,10 @@ mod tests {
             total
         );
         assert!(producer.resources.iter().all(|quota| {
-            quota.remaining[0] <= workload.resources[quota.spec_index].unique_keys
+            quota.remaining[0]
+                <= workload
+                    .resource_count(&workload.resources[quota.spec_index])
+                    .unwrap()
         }));
     }
 
