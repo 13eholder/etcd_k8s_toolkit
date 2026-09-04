@@ -1,9 +1,10 @@
+use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
-use std::{fmt, fs};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::metrics::{PoolName, ResourceName, WorkloadName};
 
@@ -143,13 +144,12 @@ pub struct RangeFixtureSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EtcdLeasePoolSpec {
     pub name: String,
     pub object_ttl_s: f64,
     pub reuse_s: f64,
     pub max_objects: u64,
-    #[serde(default)]
-    pub keep_alive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -162,34 +162,18 @@ pub enum RetryPolicy {
     MasterLease,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("cannot read config {path}: {source}")]
     Io {
         path: String,
+        #[source]
         source: std::io::Error,
     },
-    Json(serde_json::Error),
+    #[error("invalid workload JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
     Invalid(String),
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { path, source } => write!(f, "cannot read config {path}: {source}"),
-            Self::Json(source) => write!(f, "invalid workload JSON: {source}"),
-            Self::Invalid(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Json(source) => Some(source),
-            Self::Invalid(_) => None,
-        }
-    }
 }
 
 impl WorkloadSpec {
@@ -335,7 +319,9 @@ impl WorkloadSpec {
         base_app_total: u64,
     ) -> Result<Self, ConfigError> {
         if nodes == 0 {
-            return Err(ConfigError::Invalid("nodes must be greater than zero".into()));
+            return Err(ConfigError::Invalid(
+                "nodes must be greater than zero".into(),
+            ));
         }
         if batch_size == 0 {
             return Err(ConfigError::Invalid(
@@ -346,7 +332,9 @@ impl WorkloadSpec {
             return Err(ConfigError::Invalid("nodes is unreasonably large".into()));
         }
         if !txn_rps.is_finite() || txn_rps <= 0.0 {
-            return Err(ConfigError::Invalid("txn_rps must be greater than zero".into()));
+            return Err(ConfigError::Invalid(
+                "txn_rps must be greater than zero".into(),
+            ));
         }
 
         let find = |name: &str| self.resources.iter().find(|r| r.name == name);
@@ -371,8 +359,7 @@ impl WorkloadSpec {
         // (+ 2N events) (+ 2 daemonset updates per wave).
         let has_events = u64::from(events.is_some());
         let has_daemonsets = u64::from(daemonsets.is_some());
-        let budget =
-            5 * nodes + 3 * nodes * has_events + (1 + 2 * waves) * has_daemonsets;
+        let budget = 5 * nodes + 3 * nodes * has_events + (1 + 2 * waves) * has_daemonsets;
         let seconds = budget as f64 / txn_rps;
         if !seconds.is_finite() || seconds <= 0.0 {
             return Err(ConfigError::Invalid(
@@ -629,6 +616,44 @@ mod tests {
         WorkloadSpec::from_json(include_str!("../workloads/mock_k8.json")).unwrap()
     }
     #[test]
+    fn removed_keep_alive_field_is_rejected() {
+        let mut workload: serde_json::Value =
+            serde_json::from_str(include_str!("../workloads/mock_k8.json")).unwrap();
+        workload["etcd_lease_pools"][0]["keep_alive"] = serde_json::Value::Bool(true);
+
+        let error = WorkloadSpec::from_json(&workload.to_string()).unwrap_err();
+        assert!(error.to_string().contains("keep_alive"));
+    }
+
+    #[test]
+    fn built_in_profiles_do_not_expose_keep_alive() {
+        for json in [
+            include_str!("../workloads/mock_k8.json"),
+            include_str!("../workloads/real_k8.json"),
+        ] {
+            let workload: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert!(
+                workload["etcd_lease_pools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|pool| pool.get("keep_alive").is_none())
+            );
+        }
+    }
+    #[test]
+    fn config_io_error_preserves_path_and_source() {
+        let error = ConfigError::Io {
+            path: "workload.json".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "cannot read config workload.json: missing"
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+    #[test]
     fn embedded_mock_k8_preserves_resource_and_lease_shapes() {
         let spec = embedded();
         assert_eq!(
@@ -772,28 +797,19 @@ mod tests {
         assert_eq!(spec.timeline[0].application_txn_rps, 500.0);
         // Range rate preserves the trace read/write ratio at 500 rps.
         let base_seconds: f64 = base.timeline.iter().map(|s| s.duration_s).sum();
-        let base_range_rps =
-            crate::scheduler::range_request_total(&base, 1) as f64 / base_seconds;
+        let base_range_rps = crate::scheduler::range_request_total(&base, 1) as f64 / base_seconds;
         let base_app_rps =
             crate::scheduler::application_operation_total(&base, 1.0, 1.0) as f64 / base_seconds;
         assert_eq!(
             spec.timeline[0].range_rps,
             base_range_rps * 500.0 / base_app_rps
         );
-        let pods = spec
-            .resources
-            .iter()
-            .find(|r| r.name == "pods")
-            .unwrap();
+        let pods = spec.resources.iter().find(|r| r.name == "pods").unwrap();
         assert_eq!(pods.unique_keys, 200);
         assert_eq!(pods.create_weight, 200.0);
         assert_eq!(pods.update_weight, 200.0);
         assert_eq!(pods.delete_weight, 100.0);
-        let events = spec
-            .resources
-            .iter()
-            .find(|r| r.name == "events")
-            .unwrap();
+        let events = spec.resources.iter().find(|r| r.name == "events").unwrap();
         assert_eq!(events.unique_keys, 300);
         assert_eq!(events.create_weight, 300.0);
         assert_eq!(events.delete_weight, 0.0);
@@ -813,10 +829,11 @@ mod tests {
             .sum();
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
         // Masterlease resources are preserved unchanged.
-        assert!(spec
-            .resources
-            .iter()
-            .any(|r| r.retry_policy == RetryPolicy::MasterLease));
+        assert!(
+            spec.resources
+                .iter()
+                .any(|r| r.retry_policy == RetryPolicy::MasterLease)
+        );
         spec.validate(64 * 1024 * 1024).unwrap();
     }
 
@@ -842,15 +859,15 @@ mod tests {
         assert!(rolling(&base, 100, 0).is_err());
         let range = crate::scheduler::range_request_total(&base, 1);
         let app = crate::scheduler::application_operation_total(&base, 1.0, 1.0);
-        assert!(base
-            .rolling_update(100, 10, 0.0, "x", range, app)
-            .is_err());
-        assert!(base
-            .rolling_update(100, 10, f64::NAN, "x", range, app)
-            .is_err());
-        assert!(base
-            .rolling_update(100, 10, 1e-310, "x", range, app)
-            .is_err());
+        assert!(base.rolling_update(100, 10, 0.0, "x", range, app).is_err());
+        assert!(
+            base.rolling_update(100, 10, f64::NAN, "x", range, app)
+                .is_err()
+        );
+        assert!(
+            base.rolling_update(100, 10, 1e-310, "x", range, app)
+                .is_err()
+        );
     }
 
     #[test]
@@ -860,10 +877,11 @@ mod tests {
         base.resources
             .retain(|r| r.name == "pods" || r.retry_policy == RetryPolicy::MasterLease);
         let spec = rolling(&base, 100, 10).unwrap();
-        assert!(spec
-            .resources
-            .iter()
-            .all(|r| r.name != "events" && r.name != "daemonsets"));
+        assert!(
+            spec.resources
+                .iter()
+                .all(|r| r.name != "events" && r.name != "daemonsets")
+        );
         // Budget 5N (deploy N + rolling 4N) = 500 at 500 rps -> 1s.
         let total: u64 = spec
             .resources

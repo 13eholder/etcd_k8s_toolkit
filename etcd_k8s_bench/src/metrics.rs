@@ -5,7 +5,6 @@
 //! configuration; request keys, IDs, endpoints, and error text never become
 //! labels.
 
-use std::fmt;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder};
+use thiserror::Error;
 
 pub const SCHEDULED_TOTAL: &str = "etcd_k8s_bench_scheduled_total";
 pub const OPERATIONS_TOTAL: &str = "etcd_k8s_bench_operations_total";
@@ -22,7 +22,6 @@ pub const REQUEST_DURATION_SECONDS: &str = "etcd_k8s_bench_request_duration_seco
 pub const REQUEST_BYTES: &str = "etcd_k8s_bench_request_bytes";
 pub const TXN_TOTAL: &str = "etcd_k8s_bench_txn_total";
 pub const CAS_RETRIES_TOTAL: &str = "etcd_k8s_bench_cas_retries_total";
-pub const LEASE_KEEPALIVE_TOTAL: &str = "etcd_k8s_bench_lease_keepalive_total";
 pub const NODE_HEARTBEATS_TOTAL: &str = "etcd_k8s_bench_node_heartbeats_total";
 pub const DROPPED_TOTAL: &str = "etcd_k8s_bench_dropped_total";
 pub const INFO: &str = "etcd_k8s_bench_info";
@@ -67,25 +66,15 @@ pub struct PoolName(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkloadName(String);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum LabelError {
+    #[error("label name must not be empty")]
     Empty,
+    #[error("label name is too long")]
     TooLong,
+    #[error("label name contains an invalid character")]
     InvalidCharacter,
 }
-
-impl fmt::Display for LabelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            Self::Empty => "label name must not be empty",
-            Self::TooLong => "label name is too long",
-            Self::InvalidCharacter => "label name contains an invalid character",
-        };
-        f.write_str(message)
-    }
-}
-
-impl std::error::Error for LabelError {}
 
 impl ResourceName {
     pub fn new(name: impl Into<String>) -> Result<Self, LabelError> {
@@ -100,10 +89,6 @@ impl ResourceName {
 impl PoolName {
     pub fn new(name: impl Into<String>) -> Result<Self, LabelError> {
         validate_name(name.into()).map(Self)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -203,7 +188,6 @@ pub enum Rpc {
     Txn,
     Range,
     LeaseGrant,
-    LeaseKeepAlive,
     Status,
     Compact,
 }
@@ -214,7 +198,6 @@ impl Rpc {
             Self::Txn => "txn",
             Self::Range => "range",
             Self::LeaseGrant => "lease_grant",
-            Self::LeaseKeepAlive => "lease_keepalive",
             Self::Status => "status",
             Self::Compact => "compact",
         }
@@ -251,20 +234,6 @@ impl TxnResult {
         match self {
             Self::Committed => "committed",
             Self::Conflict => "conflict",
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeepAliveMessage {
-    Request,
-    Response,
-}
-
-impl KeepAliveMessage {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Request => "request",
-            Self::Response => "response",
         }
     }
 }
@@ -405,16 +374,6 @@ pub fn record_cas_retry(resource: &ResourceName, operation: Operation) {
         CAS_RETRIES_TOTAL,
         "resource" => resource.as_str().to_owned(),
         "operation" => operation.as_str()
-    )
-    .increment(1);
-}
-
-pub fn record_lease_keepalive(pool: &PoolName, message: KeepAliveMessage, outcome: Outcome) {
-    metrics::counter!(
-        LEASE_KEEPALIVE_TOTAL,
-        "pool" => pool.as_str().to_owned(),
-        "message" => message.as_str(),
-        "outcome" => outcome.as_str()
     )
     .increment(1);
 }
@@ -582,7 +541,6 @@ mod tests {
             REQUEST_BYTES,
             TXN_TOTAL,
             CAS_RETRIES_TOTAL,
-            LEASE_KEEPALIVE_TOTAL,
             NODE_HEARTBEATS_TOTAL,
             DROPPED_TOTAL,
             INFO,
@@ -607,7 +565,7 @@ mod tests {
             COMPACTOR_RECOVERIES_TOTAL,
         ];
         assert!(names.iter().all(|name| name.starts_with("etcd_k8s_bench_")));
-        assert_eq!(names.len(), 30);
+        assert_eq!(names.len(), 29);
     }
     #[test]
     fn outcome_mapping_is_fixed() {
@@ -625,7 +583,6 @@ mod tests {
         reset_watch_reconnects();
         let recorder = PrometheusBuilder::new().build_recorder();
         let resource = ResourceName::new("pods").unwrap();
-        let pool = PoolName::new("events").unwrap();
         let workload = WorkloadName::new("mock_k8").unwrap();
 
         // Building a Prometheus recorder is the registration step.  Running
@@ -639,7 +596,6 @@ mod tests {
             record_request_bytes(&resource, 4096);
             record_txn(&resource, TxnShape::Create, TxnResult::Committed);
             record_cas_retry(&resource, Operation::Update);
-            record_lease_keepalive(&pool, KeepAliveMessage::Request, Outcome::Success);
             record_node_heartbeat(HeartbeatKind::NodeLease, Outcome::Success);
             record_dropped(DropReason::Backpressure);
             add_inflight(Rpc::Txn);

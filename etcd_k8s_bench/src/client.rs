@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use thiserror::Error;
 use tokio_stream::Stream;
 use tonic::codec::Streaming;
 use tonic::metadata::MetadataValue;
@@ -30,9 +31,11 @@ pub fn watch_request<S>(requests: S) -> Request<S> {
     request
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ContextError {
+    #[error("cancelled")]
     Cancelled,
+    #[error("deadline exceeded")]
     DeadlineExceeded,
 }
 
@@ -44,10 +47,13 @@ pub struct ClientBundle {
     watch: GeneratedWatchClient<Channel>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ClientError {
-    Transport(tonic::transport::Error),
-    Rpc(Status),
+    #[error("etcd transport error: {0}")]
+    Transport(#[source] tonic::transport::Error),
+    #[error("etcd RPC error: {0}")]
+    Rpc(#[from] Status),
+    #[error("etcd request context error: {0:?}")]
     Context(ContextError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,21 +99,6 @@ pub enum RetryDecision {
     Stop,
 }
 
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transport(error) => write!(f, "etcd transport error: {error}"),
-            Self::Rpc(error) => write!(f, "etcd RPC error: {error}"),
-            Self::Context(error) => write!(f, "etcd request context error: {error:?}"),
-        }
-    }
-}
-impl std::error::Error for ClientError {}
-impl From<Status> for ClientError {
-    fn from(value: Status) -> Self {
-        Self::Rpc(value)
-    }
-}
 impl ClientError {
     /// Classify one error in the context of the concrete RPC method.
     ///
@@ -187,10 +178,6 @@ impl ClientBundle {
             maintenance,
             watch,
         })
-    }
-
-    pub fn lease_client(&self) -> LeaseClient<Channel> {
-        self.lease.clone()
     }
 
     pub fn watch_client(&self) -> GeneratedWatchClient<Channel> {
@@ -375,5 +362,15 @@ mod tests {
         assert_eq!(RpcMethod::Status.mutability(), RpcMutability::ReadOnly);
         assert_eq!(RpcMethod::Txn.mutability(), RpcMutability::Mutable);
         assert_eq!(RpcMethod::LeaseGrant.mutability(), RpcMutability::Mutable);
+    }
+    #[test]
+    fn thiserror_preserves_client_display_and_source() {
+        let error = ClientError::from(Status::unavailable("temporary"));
+        assert!(error.to_string().starts_with("etcd RPC error: "));
+        assert!(error.to_string().contains("temporary"));
+        assert!(std::error::Error::source(&error).is_some());
+
+        let context = ClientError::Context(ContextError::Cancelled);
+        assert_eq!(context.to_string(), "etcd request context error: Cancelled");
     }
 }

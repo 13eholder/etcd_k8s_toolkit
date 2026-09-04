@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
+use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch as shutdown_watch};
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant as TokioInstant};
@@ -15,10 +16,9 @@ use crate::config::{
     EtcdLeasePoolSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy, RuntimeConfig, WorkloadSpec,
 };
 use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner};
-use crate::lease::{KeepAliveHandle, LeaseEvent, LeasePool, LeasePoolConfig};
+use crate::lease::{LeaseEvent, LeasePool, LeasePoolConfig};
 use crate::metrics::{
-    self, DropReason, HeartbeatKind, Operation, Outcome, PoolName, ResourceName, Rpc, TxnResult,
-    TxnShape,
+    self, DropReason, HeartbeatKind, Operation, Outcome, ResourceName, Rpc, TxnResult, TxnShape,
 };
 use crate::pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse};
 use crate::workload::{
@@ -92,12 +92,17 @@ impl CompactorRecovery {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 enum CompactorObservationError {
+    #[error("compact journal failure response is missing a key-value")]
     FailureKvMissing,
+    #[error("compact journal failure value is not valid UTF-8")]
     FailureValueNotUtf8,
+    #[error("compact journal failure value is not a decimal revision")]
     FailureValueNotDecimal,
+    #[error("compact journal failure response is missing key version")]
     FailureVersionMissing,
+    #[error("compact journal failure key version is invalid")]
     FailureVersionInvalid,
 }
 
@@ -717,7 +722,8 @@ struct RangeExecutionResult {
     selected: u64,
     discarded: u64,
 }
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{message}")]
 struct RangeExecutionError {
     outcome: Outcome,
     message: String,
@@ -981,7 +987,8 @@ fn masterlease_tick_at(
     Some(Duration::from_secs_f64(secs))
 }
 
-fn range_shape_plan(    workload: &WorkloadSpec,
+fn range_shape_plan(
+    workload: &WorkloadSpec,
     prefix_total: u64,
     time_scale: f64,
 ) -> Result<RangeShapePlan, String> {
@@ -1091,7 +1098,6 @@ fn heartbeat_interval(
 }
 struct SharedPool {
     pool: Mutex<LeasePool>,
-    keep_alive: Option<Arc<KeepAliveHandle>>,
 }
 
 type WatchTaskOutput = (
@@ -1214,16 +1220,10 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             .iter()
             .map(|spec| {
                 let pool = lease_pool(spec);
-                let pool_name =
-                    PoolName::new(spec.name.clone()).expect("validated lease pool label");
-                let handle = pool
-                    .start_keep_alive(client.lease_client(), pool_name)
-                    .map(Arc::new);
                 (
                     spec.name.clone(),
                     Arc::new(SharedPool {
                         pool: Mutex::new(pool),
-                        keep_alive: handle,
                     }),
                 )
             })
@@ -1792,7 +1792,7 @@ async fn drain_workers(
             }
         }
     }
-    close_pools(pools).await;
+    close_pools(pools);
 }
 
 async fn abort_workers(
@@ -1807,21 +1807,11 @@ async fn abort_workers(
     for worker in workers {
         let _ = worker.await;
     }
-    close_pools(pools).await;
+    close_pools(pools);
 }
 
-async fn close_pools(pools: Arc<HashMap<String, Arc<SharedPool>>>) {
-    if let Ok(pools) = Arc::try_unwrap(pools) {
-        for (_, pool) in pools {
-            if let Ok(mut pool) = Arc::try_unwrap(pool) {
-                if let Some(handle) = pool.keep_alive.take() {
-                    if let Ok(handle) = Arc::try_unwrap(handle) {
-                        handle.close().await;
-                    }
-                }
-            }
-        }
-    }
+fn close_pools(pools: Arc<HashMap<String, Arc<SharedPool>>>) {
+    drop(pools);
 }
 
 fn lease_pool(spec: &EtcdLeasePoolSpec) -> LeasePool {
@@ -1829,7 +1819,6 @@ fn lease_pool(spec: &EtcdLeasePoolSpec) -> LeasePool {
         object_ttl: Duration::from_secs_f64(spec.object_ttl_s),
         reuse_window: Duration::from_secs_f64(spec.reuse_s),
         max_objects: spec.max_objects.min(u32::MAX as u64) as u32,
-        keep_alive: spec.keep_alive,
     })
 }
 async fn worker_loop(
@@ -2224,17 +2213,9 @@ async fn acquire_lease(
     let mut failure = None;
     for event in pool.acquire_at(now) {
         match event {
-            LeaseEvent::Expire { lease_id } => {
-                if let Some(handle) = &shared.keep_alive {
-                    handle.unregister(lease_id).await;
-                }
-            }
+            LeaseEvent::Expire { .. } => {}
             LeaseEvent::Reuse { lease_id } => {
-                let active = match &shared.keep_alive {
-                    Some(handle) => handle.is_active(lease_id).await,
-                    None => true,
-                };
-                if lease_id == 0 || !active {
+                if lease_id == 0 {
                     pool.invalidate(lease_id);
                     failure = Some(Outcome::Timeout);
                 } else {
@@ -2268,9 +2249,6 @@ async fn acquire_lease(
                         metrics::record_request(Rpc::LeaseGrant, Outcome::Success);
                         if let Some(header) = response.header {
                             update_revision(&latest_revision, header.revision);
-                        }
-                        if let Some(handle) = &shared.keep_alive {
-                            handle.register(response.id, ttl).await;
                         }
                     }
                     Ok(Ok(_)) => {
@@ -2779,7 +2757,10 @@ mod tests {
         let interval = Duration::from_secs(10);
         let duration = Duration::from_secs(15);
         // Derived short run: only the ordinal-0 tick at t=10s fits.
-        assert_eq!(masterlease_tick_at(interval, 231, 0, duration), Some(interval));
+        assert_eq!(
+            masterlease_tick_at(interval, 231, 0, duration),
+            Some(interval)
+        );
         assert_eq!(masterlease_tick_at(interval, 231, 1, duration), None);
         // An interval longer than the run suppresses even the initial tick.
         assert_eq!(
@@ -2794,7 +2775,10 @@ mod tests {
             })
             .count();
         assert_eq!(ticks, 231);
-        assert_eq!(masterlease_tick_at(interval, 231, 231, trace_duration), None);
+        assert_eq!(
+            masterlease_tick_at(interval, 231, 231, trace_duration),
+            None
+        );
         // Huge intervals cannot overflow even while ordinals remain.
         assert_eq!(
             masterlease_tick_at(Duration::from_secs_f64(1e19), 2, 1, trace_duration),
@@ -3159,7 +3143,6 @@ mod tests {
 
         let pool = Arc::new(SharedPool {
             pool: Mutex::new(LeasePool::new(LeasePoolConfig::default())),
-            keep_alive: None,
         });
         let pool_weak = Arc::downgrade(&pool);
         let mut pool_map = HashMap::new();

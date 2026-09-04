@@ -1,6 +1,7 @@
 //! Watch stream construction, lifecycle state, and resumable event consumption.
 use std::pin::Pin;
 
+use thiserror::Error;
 use tokio::sync::watch as shutdown_channel;
 use tokio::time::{Duration, sleep};
 use tokio_stream::wrappers::ReceiverStream;
@@ -181,21 +182,13 @@ pub struct WatchOutcome {
     pub state: WatchState,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum WatchError {
-    Rpc(Status),
+    #[error("watch RPC: {0}")]
+    Rpc(#[source] Status),
+    #[error("watch terminated: {:?}", .0.terminal)]
     Terminal(WatchOutcome),
 }
-
-impl std::fmt::Display for WatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rpc(status) => write!(f, "watch RPC: {status}"),
-            Self::Terminal(outcome) => write!(f, "watch terminated: {:?}", outcome.terminal),
-        }
-    }
-}
-impl std::error::Error for WatchError {}
 
 /// Run one long-lived watch. Only transport disconnects are resumed; semantic
 /// cancellation and compaction are returned to the scheduler as terminal outcomes.
@@ -626,5 +619,11 @@ mod tests {
         assert_eq!(first.reconnects, 1);
         assert_eq!(second.reconnects, 1);
         metrics::reset_watch_reconnects();
+    }
+    #[test]
+    fn thiserror_preserves_watch_error_source() {
+        let error = WatchError::Rpc(Status::unavailable("temporary"));
+        assert!(error.to_string().starts_with("watch RPC: "));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
