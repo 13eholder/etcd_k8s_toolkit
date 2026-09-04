@@ -18,7 +18,8 @@ use crate::config::{
 use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner};
 use crate::lease::{LeaseEvent, LeasePool, LeasePoolConfig};
 use crate::metrics::{
-    self, DropReason, HeartbeatKind, Operation, Outcome, ResourceName, Rpc, TxnResult, TxnShape,
+    self, DropReason, HeartbeatKind, Operation, Outcome, PoolName, ResourceName, Rpc, TxnResult,
+    TxnShape,
 };
 use crate::pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse};
 use crate::workload::{
@@ -1097,6 +1098,7 @@ fn heartbeat_interval(
     Duration::from_nanos((nanos as i128 + offset).max(1) as u64)
 }
 struct SharedPool {
+    name: PoolName,
     pool: Mutex<LeasePool>,
 }
 
@@ -1220,9 +1222,11 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             .iter()
             .map(|spec| {
                 let pool = lease_pool(spec);
+                let name = PoolName::new(spec.name.clone()).expect("validated lease pool label");
                 (
                     spec.name.clone(),
                     Arc::new(SharedPool {
+                        name,
                         pool: Mutex::new(pool),
                     }),
                 )
@@ -1816,9 +1820,10 @@ fn close_pools(pools: Arc<HashMap<String, Arc<SharedPool>>>) {
 
 fn lease_pool(spec: &EtcdLeasePoolSpec) -> LeasePool {
     LeasePool::new(LeasePoolConfig {
-        object_ttl: Duration::from_secs_f64(spec.object_ttl_s),
-        reuse_window: Duration::from_secs_f64(spec.reuse_s),
-        max_objects: spec.max_objects.min(u32::MAX as u64) as u32,
+        // WorkloadSpec::validate rejects non-integral/overflowing values.
+        object_ttl: Duration::from_secs(spec.object_ttl_s),
+        reuse_window: Duration::from_secs(spec.reuse_s),
+        max_objects: spec.max_objects,
     })
 }
 async fn worker_loop(
@@ -1845,27 +1850,12 @@ async fn worker_loop(
                 if let Some(spec) = workload.resources.get(resource) {
                     if let Ok(label) = ResourceName::try_from(spec.name.as_str()) {
                         let operation_started = Instant::now();
-                        let lease_id = match pool.as_deref().and_then(|name| pools.get(name)) {
-                            Some(shared) => match acquire_lease(
-                                shared,
-                                &client,
-                                lease_epoch,
-                                timeout,
-                                latest_revision.clone(),
-                            )
-                            .await
-                            {
-                                Ok(id) => id,
-                                Err(outcome) => {
-                                    metrics::record_operation(
-                                        operation_metric(operation),
-                                        &label,
-                                        outcome,
-                                    );
-                                    continue;
-                                }
-                            },
-                            None => 0,
+                        let lease_pool = if operation.uses_native_lease() {
+                            pool.as_deref()
+                                .and_then(|name| pools.get(name))
+                                .map(|pool| pool.as_ref())
+                        } else {
+                            None
                         };
                         let remaining_timeout = timeout.saturating_sub(operation_started.elapsed());
                         let inject_conflict = operation == ResourceOperation::GuaranteedUpdate
@@ -1888,7 +1878,8 @@ async fn worker_loop(
                             CasRetryPolicy::generic_controller(),
                             spec.retry_policy == ConfigRetryPolicy::MasterLease,
                             remaining_timeout,
-                            lease_id,
+                            lease_pool,
+                            lease_epoch,
                             latest_revision.clone(),
                         )
                         .await;
@@ -1967,7 +1958,8 @@ async fn worker_loop(
                             policy,
                             false,
                             timeout,
-                            0,
+                            None,
+                            TokioInstant::now(),
                             latest_revision.clone(),
                         )
                         .await
@@ -2208,75 +2200,93 @@ async fn acquire_lease(
 ) -> Result<i64, Outcome> {
     let now = started.elapsed();
     let deadline = Instant::now() + timeout;
+    // The upstream lease manager serializes cache decisions and Grant while
+    // holding its mutex; retain that single-flight lifecycle per pool.
     let mut pool = shared.pool.lock().await;
-    let mut id = None;
-    let mut failure = None;
-    for event in pool.acquire_at(now) {
-        match event {
-            LeaseEvent::Expire { .. } => {}
-            LeaseEvent::Reuse { lease_id } => {
-                if lease_id == 0 {
-                    pool.invalidate(lease_id);
-                    failure = Some(Outcome::Timeout);
-                } else {
-                    id = Some(lease_id);
-                }
+    match pool.acquire_at(now) {
+        LeaseEvent::Reuse { lease_id } if lease_id != 0 => {
+            metrics::record_lease_get(&shared.name, "reuse");
+            metrics::set_lease_attached_objects(&shared.name, pool.attached_objects());
+            Ok(lease_id)
+        }
+        LeaseEvent::Reuse { .. } => {
+            metrics::record_lease_get(&shared.name, "error");
+            Err(Outcome::GrpcError)
+        }
+        LeaseEvent::Grant { ttl } => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                metrics::record_lease_get(&shared.name, "timeout");
+                metrics::record_request(Rpc::LeaseGrant, Outcome::Timeout);
+                return Err(Outcome::Timeout);
             }
-            LeaseEvent::Grant { ttl } => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    metrics::record_request(Rpc::LeaseGrant, Outcome::Timeout);
-                    failure = Some(Outcome::Timeout);
-                    continue;
+            let ttl_seconds = match i64::try_from(ttl.as_secs()) {
+                Ok(ttl_seconds) => ttl_seconds,
+                Err(_) => {
+                    metrics::record_lease_get(&shared.name, "error");
+                    metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
+                    return Err(Outcome::GrpcError);
                 }
-                let start = Instant::now();
-                metrics::add_inflight(Rpc::LeaseGrant);
-                let response = time::timeout(
-                    remaining,
-                    client.lease_grant(LeaseGrantRequest {
-                        ttl: ttl.as_secs() as i64,
-                        id: 0,
-                    }),
-                )
-                .await;
-                metrics::remove_inflight(Rpc::LeaseGrant);
-                metrics::record_request_duration(Rpc::LeaseGrant, start.elapsed());
-                metrics::record_request_bytes(&ResourceName::new("lease").unwrap(), 16);
-                match response {
-                    Ok(Ok(response)) if response.id != 0 => {
-                        id = Some(response.id);
-                        pool.record_grant(response.id, now);
-                        metrics::record_request(Rpc::LeaseGrant, Outcome::Success);
-                        if let Some(header) = response.header {
-                            update_revision(&latest_revision, header.revision);
+            };
+            let start = Instant::now();
+            metrics::add_inflight(Rpc::LeaseGrant);
+            let response = time::timeout(
+                remaining,
+                client.lease_grant(LeaseGrantRequest {
+                    ttl: ttl_seconds,
+                    id: 0,
+                }),
+            )
+            .await;
+            metrics::remove_inflight(Rpc::LeaseGrant);
+            metrics::record_request_duration(Rpc::LeaseGrant, start.elapsed());
+            metrics::record_request_bytes(&ResourceName::new("lease").unwrap(), 16);
+            match response {
+                Ok(Ok(response)) if response.id != 0 => {
+                    pool.record_grant(response.id, now);
+                    metrics::record_lease_get(&shared.name, "grant");
+                    metrics::set_lease_attached_objects(&shared.name, 1);
+                    metrics::record_request(Rpc::LeaseGrant, Outcome::Success);
+                    if let Some(header) = response.header {
+                        update_revision(&latest_revision, header.revision);
+                    }
+                    Ok(response.id)
+                }
+                Ok(Ok(_)) => {
+                    metrics::record_lease_get(&shared.name, "error");
+                    metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
+                    Err(Outcome::GrpcError)
+                }
+                Ok(Err(error)) => {
+                    let decision =
+                        error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::Unknown);
+                    let outcome = match decision {
+                        RetryDecision::ResultUnknown => Outcome::ResultUnknown,
+                        RetryDecision::NotSent | RetryDecision::Retry | RetryDecision::Stop => {
+                            Outcome::GrpcError
                         }
-                    }
-                    Ok(Ok(_)) => {
-                        metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
-                        failure = Some(Outcome::GrpcError);
-                    }
-                    Ok(Err(error)) => {
-                        let decision = error
-                            .retry_decision(RpcMethod::LeaseGrant, RequestDisposition::Unknown);
-                        let outcome = match decision {
-                            RetryDecision::ResultUnknown => Outcome::ResultUnknown,
-                            RetryDecision::NotSent | RetryDecision::Retry => Outcome::GrpcError,
-                            RetryDecision::Stop => Outcome::GrpcError,
-                        };
-                        metrics::record_request(Rpc::LeaseGrant, outcome);
-                        failure = Some(outcome);
-                    }
-                    // A local deadline can race with a server-side grant.  The
-                    // lease id is therefore unknown; never submit another grant.
-                    Err(_) => {
-                        metrics::record_request(Rpc::LeaseGrant, Outcome::ResultUnknown);
-                        failure = Some(Outcome::ResultUnknown);
-                    }
+                    };
+                    metrics::record_lease_get(
+                        &shared.name,
+                        if outcome == Outcome::ResultUnknown {
+                            "unknown"
+                        } else {
+                            "error"
+                        },
+                    );
+                    metrics::record_request(Rpc::LeaseGrant, outcome);
+                    Err(outcome)
+                }
+                // A local deadline can race with a server-side grant. The
+                // lease id is therefore unknown; never submit another grant.
+                Err(_) => {
+                    metrics::record_lease_get(&shared.name, "unknown");
+                    metrics::record_request(Rpc::LeaseGrant, Outcome::ResultUnknown);
+                    Err(Outcome::ResultUnknown)
                 }
             }
         }
     }
-    id.ok_or_else(|| failure.unwrap_or(Outcome::GrpcError))
 }
 fn retry_policy(spec: &ResourceSpec) -> CasRetryPolicy {
     match spec.retry_policy {
@@ -2338,9 +2348,11 @@ async fn execute_txn(
     cas_policy: CasRetryPolicy,
     recreate_missing: bool,
     timeout: Duration,
-    lease_id: i64,
+    lease_pool: Option<&SharedPool>,
+    lease_epoch: TokioInstant,
     latest_revision: Arc<AtomicI64>,
 ) -> Outcome {
+    let lease_pool = lease_pool.filter(|_| operation.uses_native_lease());
     let deadline = Instant::now() + timeout;
     let mut current_value = value;
     let mut state = states.get(&key).cloned().unwrap_or_default();
@@ -2380,6 +2392,37 @@ async fn execute_txn(
                 metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
                 return Outcome::Timeout;
             }
+            // Kubernetes etcd3 gets a lease inside each Put attempt; a CAS
+            // retry may therefore reuse or obtain a different lease.
+            let lease_id = match lease_pool {
+                Some(shared) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        metrics::record_operation(
+                            operation_metric(operation),
+                            label,
+                            Outcome::Timeout,
+                        );
+                        return Outcome::Timeout;
+                    }
+                    match acquire_lease(
+                        shared,
+                        client,
+                        lease_epoch,
+                        remaining,
+                        latest_revision.clone(),
+                    )
+                    .await
+                    {
+                        Ok(lease_id) => lease_id,
+                        Err(outcome) => {
+                            metrics::record_operation(operation_metric(operation), label, outcome);
+                            return outcome;
+                        }
+                    }
+                }
+                None => 0,
+            };
             let request = attempt.request_with_lease(lease_id);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -2569,7 +2612,8 @@ async fn execute_heartbeat(
         policy,
         false,
         timeout,
-        0,
+        None,
+        TokioInstant::now(),
         latest_revision,
     )
     .await;
@@ -2579,12 +2623,269 @@ async fn execute_heartbeat(
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pb::etcdserverpb::ResponseOp;
     use crate::pb::mvccpb;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    #[derive(Clone)]
+    struct LeaseTxnProbe {
+        grant_ttls: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
+        txn_leases: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
+        txn_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl LeaseTxnProbe {
+        fn new() -> Self {
+            Self {
+                grant_ttls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                txn_leases: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                txn_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl crate::pb::etcdserverpb::kv_server::Kv for LeaseTxnProbe {
+        async fn range(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::RangeRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::RangeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "range is not part of this probe",
+            ))
+        }
+
+        async fn put(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::PutRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::PutResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "put is not part of this probe",
+            ))
+        }
+
+        async fn delete_range(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::DeleteRangeRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::DeleteRangeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "delete_range is not part of this probe",
+            ))
+        }
+
+        async fn txn(
+            &self,
+            request: tonic::Request<crate::pb::etcdserverpb::TxnRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::TxnResponse>, tonic::Status> {
+            let call = self
+                .txn_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let request = request.into_inner();
+            let lease = request
+                .success
+                .first()
+                .and_then(|operation| match operation.request.as_ref() {
+                    Some(crate::pb::etcdserverpb::request_op::Request::RequestPut(put)) => {
+                        Some(put.lease)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(-1);
+            self.txn_leases.lock().unwrap().push(lease);
+
+            match call {
+                0 => Ok(tonic::Response::new(crate::pb::etcdserverpb::TxnResponse {
+                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                        revision: 2,
+                        ..Default::default()
+                    }),
+                    succeeded: false,
+                    responses: vec![ResponseOp {
+                        response: Some(
+                            crate::pb::etcdserverpb::response_op::Response::ResponseRange(
+                                crate::pb::etcdserverpb::RangeResponse {
+                                    kvs: vec![mvccpb::KeyValue {
+                                        key: b"k".to_vec(),
+                                        value: b"remote".to_vec(),
+                                        mod_revision: 1,
+                                        version: 2,
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
+                    }],
+                    ..Default::default()
+                })),
+                1 => Ok(tonic::Response::new(crate::pb::etcdserverpb::TxnResponse {
+                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                        revision: 3,
+                        ..Default::default()
+                    }),
+                    succeeded: true,
+                    ..Default::default()
+                })),
+                _ => Err(tonic::Status::internal("unexpected Txn call")),
+            }
+        }
+
+        async fn compact(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::CompactionRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::CompactionResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "compact is not part of this probe",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl crate::pb::etcdserverpb::lease_server::Lease for LeaseTxnProbe {
+        type LeaseKeepAliveStream = tokio_stream::Empty<
+            Result<crate::pb::etcdserverpb::LeaseKeepAliveResponse, tonic::Status>,
+        >;
+
+        async fn lease_grant(
+            &self,
+            request: tonic::Request<crate::pb::etcdserverpb::LeaseGrantRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseGrantResponse>, tonic::Status>
+        {
+            let ttl = request.into_inner().ttl;
+            let mut grants = self.grant_ttls.lock().unwrap();
+            let id = 100 + grants.len() as i64;
+            grants.push(ttl);
+            Ok(tonic::Response::new(
+                crate::pb::etcdserverpb::LeaseGrantResponse {
+                    id,
+                    ttl,
+                    ..Default::default()
+                },
+            ))
+        }
+
+        async fn lease_revoke(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::LeaseRevokeRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseRevokeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "lease_revoke is not part of this probe",
+            ))
+        }
+
+        async fn lease_keep_alive(
+            &self,
+            _request: tonic::Request<
+                tonic::Streaming<crate::pb::etcdserverpb::LeaseKeepAliveRequest>,
+            >,
+        ) -> Result<tonic::Response<Self::LeaseKeepAliveStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "lease_keep_alive is not part of this probe",
+            ))
+        }
+
+        async fn lease_time_to_live(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::LeaseTimeToLiveRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseTimeToLiveResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "lease_time_to_live is not part of this probe",
+            ))
+        }
+
+        async fn lease_leases(
+            &self,
+            _request: tonic::Request<crate::pb::etcdserverpb::LeaseLeasesRequest>,
+        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseLeasesResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "lease_leases is not part of this probe",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn guaranteed_update_reacquires_native_lease_for_each_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let probe = LeaseTxnProbe::new();
+        let server_probe = probe.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            Server::builder()
+                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(
+                    server_probe.clone(),
+                ))
+                .add_service(crate::pb::etcdserverpb::lease_server::LeaseServer::new(
+                    server_probe,
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        ready_rx.await.unwrap();
+
+        let client = ClientBundle::connect(
+            &format!("http://{address}"),
+            Duration::from_secs(2),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let key = b"k".to_vec();
+        let mut states = HashMap::new();
+        states.insert(
+            key.clone(),
+            KeyState::Present {
+                mod_revision: 1,
+                version: 1,
+            },
+        );
+        let shared = SharedPool {
+            name: PoolName::new("masterleases").unwrap(),
+            pool: Mutex::new(LeasePool::new(LeasePoolConfig {
+                object_ttl: Duration::from_secs(15),
+                reuse_window: Duration::from_secs(60),
+                max_objects: 1,
+            })),
+        };
+        let result = execute_txn(
+            &client,
+            &ResourceName::new("events").unwrap(),
+            &mut states,
+            key,
+            b"value".to_vec(),
+            ResourceOperation::GuaranteedUpdate,
+            false,
+            CasRetryPolicy::node_status(),
+            CasRetryPolicy::node_status(),
+            false,
+            Duration::from_secs(2),
+            Some(&shared),
+            TokioInstant::now(),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await;
+
+        assert_eq!(result, Outcome::Success);
+        assert_eq!(*probe.grant_ttls.lock().unwrap(), vec![15, 15]);
+        assert_eq!(*probe.txn_leases.lock().unwrap(), vec![100, 101]);
+
+        server.abort();
+        let _ = server.await;
+    }
     #[test]
     fn lazy_cursor_has_bounded_state() {
         let workload = WorkloadSpec {
@@ -3142,6 +3443,7 @@ mod tests {
         sender.send(WorkItem::Status).await.unwrap();
 
         let pool = Arc::new(SharedPool {
+            name: PoolName::new("test").unwrap(),
             pool: Mutex::new(LeasePool::new(LeasePoolConfig::default())),
         });
         let pool_weak = Arc::downgrade(&pool);

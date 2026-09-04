@@ -23,6 +23,8 @@ pub const REQUEST_BYTES: &str = "etcd_k8s_bench_request_bytes";
 pub const TXN_TOTAL: &str = "etcd_k8s_bench_txn_total";
 pub const CAS_RETRIES_TOTAL: &str = "etcd_k8s_bench_cas_retries_total";
 pub const NODE_HEARTBEATS_TOTAL: &str = "etcd_k8s_bench_node_heartbeats_total";
+pub const LEASE_GET_TOTAL: &str = "etcd_k8s_bench_lease_get_total";
+pub const LEASE_ATTACHED_OBJECTS: &str = "etcd_k8s_bench_lease_attached_objects";
 pub const DROPPED_TOTAL: &str = "etcd_k8s_bench_dropped_total";
 pub const INFO: &str = "etcd_k8s_bench_info";
 pub const WATCH_EVENTS_TOTAL: &str = "etcd_k8s_bench_watch_events_total";
@@ -89,6 +91,10 @@ impl ResourceName {
 impl PoolName {
     pub fn new(name: impl Into<String>) -> Result<Self, LabelError> {
         validate_name(name.into()).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -387,6 +393,26 @@ pub fn record_node_heartbeat(kind: HeartbeatKind, outcome: Outcome) {
     .increment(1);
 }
 
+/// Records one Kubernetes `GetLease` decision. `result` is a fixed low-cardinality
+/// outcome: `reuse`, `grant`, `error`, `timeout`, or `unknown`.
+pub fn record_lease_get(pool: &PoolName, result: &'static str) {
+    metrics::counter!(
+        LEASE_GET_TOTAL,
+        "pool" => pool.as_str().to_owned(),
+        "result" => result
+    )
+    .increment(1);
+}
+
+/// Publishes the local lease-manager attachment count for one pool.
+pub fn set_lease_attached_objects(pool: &PoolName, count: u64) {
+    metrics::gauge!(
+        LEASE_ATTACHED_OBJECTS,
+        "pool" => pool.as_str().to_owned()
+    )
+    .set(count as f64);
+}
+
 pub fn record_dropped(reason: DropReason) {
     metrics::counter!(DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
@@ -542,6 +568,8 @@ mod tests {
             TXN_TOTAL,
             CAS_RETRIES_TOTAL,
             NODE_HEARTBEATS_TOTAL,
+            LEASE_GET_TOTAL,
+            LEASE_ATTACHED_OBJECTS,
             DROPPED_TOTAL,
             INFO,
             WATCH_EVENTS_TOTAL,
@@ -565,7 +593,7 @@ mod tests {
             COMPACTOR_RECOVERIES_TOTAL,
         ];
         assert!(names.iter().all(|name| name.starts_with("etcd_k8s_bench_")));
-        assert_eq!(names.len(), 29);
+        assert_eq!(names.len(), 31);
     }
     #[test]
     fn outcome_mapping_is_fixed() {
@@ -584,6 +612,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let resource = ResourceName::new("pods").unwrap();
         let workload = WorkloadName::new("mock_k8").unwrap();
+        let pool = PoolName::new("events").unwrap();
 
         // Building a Prometheus recorder is the registration step.  Running
         // every recording path against it verifies all keys and labels are
@@ -597,6 +626,8 @@ mod tests {
             record_txn(&resource, TxnShape::Create, TxnResult::Committed);
             record_cas_retry(&resource, Operation::Update);
             record_node_heartbeat(HeartbeatKind::NodeLease, Outcome::Success);
+            record_lease_get(&pool, "reuse");
+            set_lease_attached_objects(&pool, 7);
             record_dropped(DropReason::Backpressure);
             add_inflight(Rpc::Txn);
             remove_inflight(Rpc::Txn);

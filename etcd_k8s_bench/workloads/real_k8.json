@@ -85,7 +85,7 @@
   ],
   "etcd_lease_pools": [
     {"name":"events","object_ttl_s":3600,"reuse_s":60,"max_objects":1000},
-    {"name":"masterleases","object_ttl_s":15,"reuse_s":0,"max_objects":1}
+    {"name":"masterleases","object_ttl_s":15,"reuse_s":60,"max_objects":1}
   ],
   "status_count": 61,
   "compact_interval_s": 300,

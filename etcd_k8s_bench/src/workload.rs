@@ -24,6 +24,13 @@ pub enum ResourceOperation {
     ConditionalDelete,
 }
 
+impl ResourceOperation {
+    /// Native etcd leases are attached to successful Put operations only.
+    pub const fn uses_native_lease(self) -> bool {
+        matches!(self, Self::Create | Self::GuaranteedUpdate)
+    }
+}
+
 /// The locally known revision state for one key.
 ///
 /// Values returned by a failed CAS remain local to that attempt. Keeping them
@@ -670,6 +677,29 @@ mod tests {
             let delay = policy.delay_for(attempt as u64, attempt);
             assert!(delay >= Duration::from_millis(7_500));
             assert!(delay <= Duration::from_millis(12_500));
+        }
+    }
+    #[test]
+    fn native_lease_attachment_is_limited_to_put_transactions() {
+        assert!(ResourceOperation::Create.uses_native_lease());
+        assert!(ResourceOperation::GuaranteedUpdate.uses_native_lease());
+        assert!(!ResourceOperation::ConditionalDelete.uses_native_lease());
+    }
+    #[test]
+    fn request_with_lease_attaches_id_only_to_put_success_ops() {
+        let create = TxnAttempt::create(b"k", b"v").request_with_lease(42);
+        match create.success[0].request.as_ref() {
+            Some(request_op::Request::RequestPut(put)) => assert_eq!(put.lease, 42),
+            other => panic!("expected Put, got {other:?}"),
+        }
+
+        let delete = TxnAttempt::delete(b"k", 7).request_with_lease(42);
+        match delete.success[0].request.as_ref() {
+            Some(request_op::Request::RequestDeleteRange(delete)) => {
+                assert!(delete.range_end.is_empty());
+                assert!(!delete.prev_kv);
+            }
+            other => panic!("expected DeleteRange, got {other:?}"),
         }
     }
 }

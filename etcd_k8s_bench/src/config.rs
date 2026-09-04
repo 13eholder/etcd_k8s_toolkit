@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -147,8 +148,8 @@ pub struct RangeFixtureSpec {
 #[serde(deny_unknown_fields)]
 pub struct EtcdLeasePoolSpec {
     pub name: String,
-    pub object_ttl_s: f64,
-    pub reuse_s: f64,
+    pub object_ttl_s: u64,
+    pub reuse_s: u64,
     pub max_objects: u64,
 }
 
@@ -175,6 +176,7 @@ pub enum ConfigError {
     #[error("{0}")]
     Invalid(String),
 }
+const MAX_ETCD_LEASE_SECONDS: u64 = i64::MAX as u64;
 
 impl WorkloadSpec {
     pub fn from_json(input: &str) -> Result<Self, ConfigError> {
@@ -236,16 +238,34 @@ impl WorkloadSpec {
                 ))
             })?;
             resource.validate(index, max_message_size)?;
-            if let Some(pool) = &resource.lease_pool {
-                if !self
-                    .etcd_lease_pools
-                    .iter()
-                    .any(|candidate| candidate.name == *pool)
-                {
+            let requires_native_lease = matches!(
+                &resource.retry_policy,
+                RetryPolicy::Event | RetryPolicy::MasterLease
+            );
+            match (&resource.lease_pool, requires_native_lease) {
+                (None, true) => {
                     return Err(ConfigError::Invalid(format!(
-                        "resources[{index}].lease_pool references unknown pool {pool:?}"
+                        "resources[{index}].retry_policy {:?} requires lease_pool",
+                        resource.retry_policy
                     )));
                 }
+                (Some(_), false) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "resources[{index}].lease_pool is only valid for Event or MasterLease"
+                    )));
+                }
+                (Some(pool), true) => {
+                    if !self
+                        .etcd_lease_pools
+                        .iter()
+                        .any(|candidate| candidate.name == *pool)
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "resources[{index}].lease_pool references unknown pool {pool:?}"
+                        )));
+                    }
+                }
+                (None, false) => {}
             }
         }
         for (index, range) in self.ranges.iter().enumerate() {
@@ -271,12 +291,19 @@ impl WorkloadSpec {
         for (index, fixture) in self.range_fixtures.iter().enumerate() {
             fixture.validate(index, max_message_size)?;
         }
+        let mut pool_names = HashSet::with_capacity(self.etcd_lease_pools.len());
         for (index, pool) in self.etcd_lease_pools.iter().enumerate() {
             PoolName::new(pool.name.clone()).map_err(|error| {
                 ConfigError::Invalid(format!(
                     "etcd_lease_pools[{index}].name is not a valid metric label: {error}"
                 ))
             })?;
+            if !pool_names.insert(pool.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "etcd_lease_pools[{index}] duplicate lease pool name {:?}",
+                    pool.name
+                )));
+            }
             pool.validate(index)?;
         }
         if self.compact_interval_s <= 0.0 || !self.compact_interval_s.is_finite() {
@@ -589,14 +616,24 @@ impl EtcdLeasePoolSpec {
                 "etcd_lease_pools[{index}].name must not be empty"
             )));
         }
-        if !self.object_ttl_s.is_finite() || self.object_ttl_s <= 0.0 {
+        if self.object_ttl_s == 0 || self.object_ttl_s > MAX_ETCD_LEASE_SECONDS {
             return Err(ConfigError::Invalid(format!(
-                "etcd_lease_pools[{index}].object_ttl_s must be greater than zero"
+                "etcd_lease_pools[{index}].object_ttl_s must be representable as an etcd TTL"
             )));
         }
-        if !self.reuse_s.is_finite() || self.reuse_s < 0.0 {
+        if self.reuse_s > MAX_ETCD_LEASE_SECONDS {
             return Err(ConfigError::Invalid(format!(
-                "etcd_lease_pools[{index}].reuse_s must be non-negative"
+                "etcd_lease_pools[{index}].reuse_s must be representable as an etcd TTL"
+            )));
+        }
+        let effective_reuse = self.reuse_s.min(self.object_ttl_s / 20);
+        let grant_ttl = self
+            .object_ttl_s
+            .checked_add(effective_reuse)
+            .filter(|ttl| *ttl <= MAX_ETCD_LEASE_SECONDS);
+        if grant_ttl.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "etcd_lease_pools[{index}] grant TTL must be representable as an etcd TTL"
             )));
         }
         if self.max_objects == 0 {
@@ -685,9 +722,59 @@ mod tests {
             .iter()
             .find(|pool| pool.name == "events")
             .unwrap();
-        assert_eq!(pool.object_ttl_s + pool.reuse_s, 3_660.0);
-        assert_eq!(pool.object_ttl_s, 3_600.0);
-        assert_eq!(pool.reuse_s, 60.0);
+        assert_eq!(pool.object_ttl_s + pool.reuse_s, 3_660);
+        assert_eq!(pool.object_ttl_s, 3_600);
+        assert_eq!(pool.reuse_s, 60);
+        let master = spec
+            .etcd_lease_pools
+            .iter()
+            .find(|pool| pool.name == "masterleases")
+            .unwrap();
+        assert_eq!(master.object_ttl_s, 15);
+        assert_eq!(master.reuse_s, 60);
+    }
+    #[test]
+    fn lease_pool_requires_integral_encodable_seconds() {
+        let mut input: serde_json::Value =
+            serde_json::from_str(include_str!("../workloads/mock_k8.json")).unwrap();
+        input["etcd_lease_pools"][0]["object_ttl_s"] = serde_json::Value::from(0.5);
+        assert!(WorkloadSpec::from_json(&input.to_string()).is_err());
+
+        input["etcd_lease_pools"][0]["object_ttl_s"] = serde_json::Value::from(15.5);
+        assert!(WorkloadSpec::from_json(&input.to_string()).is_err());
+    }
+
+    #[test]
+    fn lease_pool_rejects_unrepresentable_grant_ttl() {
+        let mut spec = embedded();
+        spec.etcd_lease_pools[0].object_ttl_s = u64::MAX;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("representable"));
+    }
+
+    #[test]
+    fn native_ttl_policies_require_a_lease_pool() {
+        let mut spec = embedded();
+        spec.resources
+            .iter_mut()
+            .find(|resource| resource.name == "events")
+            .unwrap()
+            .lease_pool = None;
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("requires lease_pool"));
+
+        let mut spec = embedded();
+        spec.resources[0].lease_pool = Some("events".into());
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("lease_pool is only valid"));
+    }
+    #[test]
+    fn duplicate_lease_pool_names_are_rejected() {
+        let mut spec = embedded();
+        let duplicate = spec.etcd_lease_pools[0].clone();
+        spec.etcd_lease_pools.push(duplicate);
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("duplicate lease pool name"));
     }
     #[test]
     fn built_in_profiles_have_explicit_node_lease_modes() {
