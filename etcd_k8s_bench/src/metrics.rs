@@ -19,6 +19,7 @@ pub const SCHEDULED_TOTAL: &str = "etcd_k8s_bench_scheduled_total";
 pub const OPERATIONS_TOTAL: &str = "etcd_k8s_bench_operations_total";
 pub const REQUESTS_TOTAL: &str = "etcd_k8s_bench_requests_total";
 pub const REQUEST_DURATION_SECONDS: &str = "etcd_k8s_bench_request_duration_seconds";
+pub const QUEUE_WAIT_SECONDS: &str = "etcd_k8s_bench_queue_wait_seconds";
 pub const REQUEST_BYTES: &str = "etcd_k8s_bench_request_bytes";
 pub const TXN_TOTAL: &str = "etcd_k8s_bench_txn_total";
 pub const CAS_RETRIES_TOTAL: &str = "etcd_k8s_bench_cas_retries_total";
@@ -154,6 +155,8 @@ fn validate_name(name: String) -> Result<String, LabelError> {
 pub enum Outcome {
     Success,
     GrpcError,
+    Conflict,
+    NotFound,
     Timeout,
     /// The mutable request may have been processed, so the caller must
     /// reconcile instead of blindly replaying it.
@@ -165,6 +168,8 @@ impl Outcome {
         match self {
             Self::Success => "success",
             Self::GrpcError => "grpc_error",
+            Self::Conflict => "conflict",
+            Self::NotFound => "not_found",
             Self::Timeout => "timeout",
             Self::ResultUnknown => "result_unknown",
         }
@@ -372,6 +377,17 @@ pub fn record_request(rpc: Rpc, outcome: Outcome) {
 pub fn record_request_duration(rpc: Rpc, duration: Duration) {
     metrics::histogram!(REQUEST_DURATION_SECONDS, "rpc" => rpc.as_str())
         .record(duration.as_secs_f64());
+}
+
+/// Records time spent waiting in a scheduler queue. This histogram is
+/// deliberately separate from RPC duration so transport latency is not
+/// presented as end-to-end work-item latency.
+pub fn record_queue_wait(work_class: &'static str, duration: Duration) {
+    metrics::histogram!(
+        QUEUE_WAIT_SECONDS,
+        "work_class" => work_class
+    )
+    .record(duration.as_secs_f64());
 }
 
 pub fn record_range_request(shape: RangeShape, outcome: Outcome) {
@@ -607,6 +623,7 @@ mod tests {
             OPERATIONS_TOTAL,
             REQUESTS_TOTAL,
             REQUEST_DURATION_SECONDS,
+            QUEUE_WAIT_SECONDS,
             REQUEST_BYTES,
             TXN_TOTAL,
             CAS_RETRIES_TOTAL,
@@ -639,7 +656,7 @@ mod tests {
             COMPACTOR_RECOVERIES_TOTAL,
         ];
         assert!(names.iter().all(|name| name.starts_with("etcd_k8s_bench_")));
-        assert_eq!(names.len(), 34);
+        assert_eq!(names.len(), 35);
     }
     #[test]
     fn outcome_mapping_is_fixed() {
@@ -668,6 +685,7 @@ mod tests {
             record_operation(Operation::Create, &resource, Outcome::Success);
             record_request(Rpc::Txn, Outcome::Success);
             record_request_duration(Rpc::Txn, Duration::from_millis(2));
+            record_queue_wait("create", Duration::from_millis(1));
             record_request_bytes(&resource, 4096);
             record_txn(&resource, TxnShape::Create, TxnResult::Committed);
             record_range_request(RangeShape::PagedPrefix, Outcome::Success);

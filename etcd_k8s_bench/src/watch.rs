@@ -2,7 +2,7 @@
 use std::pin::Pin;
 
 use thiserror::Error;
-use tokio::sync::watch as shutdown_channel;
+use tokio::sync::{oneshot, watch as shutdown_channel};
 use tokio::time::{Duration, sleep};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -82,20 +82,30 @@ pub struct WatchState {
     pub event_count: u64,
     pub event_bytes: u64,
     pub reconnects: u64,
+    /// Whether `watch_id` belongs to the currently established substream.
+    watch_id_valid: bool,
+    /// Recovery baseline from an initial current (start_revision=0) Created.
+    ///
+    /// This is deliberately separate from `last_revision`: a Created header
+    /// acknowledges the current store revision but does not deliver an event.
+    recovery_revision: i64,
 }
 
 impl WatchState {
     pub fn next_start_revision(&self, configured: i64) -> i64 {
         if self.last_revision > 0 {
             self.last_revision.saturating_add(1)
+        } else if self.recovery_revision > 0 {
+            self.recovery_revision
         } else {
             configured
         }
     }
 
     pub fn observe(&mut self, response: &WatchResponse) -> Option<WatchTerminal> {
-        if response.watch_id != 0 && response.watch_id != -1 {
+        if response.watch_id != -1 {
             self.watch_id = response.watch_id;
+            self.watch_id_valid = true;
         }
         if let Some(header) = response.header.as_ref() {
             metrics::set_revision(header.revision);
@@ -145,6 +155,22 @@ impl WatchState {
         }
         None
     }
+
+    fn observe_recovery_baseline(&mut self, response: &WatchResponse, configured: i64) {
+        if configured != 0
+            || !response.created
+            || !response.events.is_empty()
+            || self.last_revision > 0
+            || self.recovery_revision > 0
+        {
+            return;
+        }
+        if let Some(header) = response.header.as_ref() {
+            if header.revision > 0 {
+                self.recovery_revision = header.revision;
+            }
+        }
+    }
 }
 
 fn event_bytes(event: &mvccpb::Event) -> u64 {
@@ -179,18 +205,21 @@ pub enum WatchError {
 
 /// Run one long-lived watch. Only transport disconnects are resumed; semantic
 /// cancellation and compaction are returned to the scheduler as terminal outcomes.
+/// `ready` is notified once by the first nonterminal Created response.
 pub async fn run(
     client: ClientBundle,
     spec: WatchSpec,
     shutdown: shutdown_channel::Receiver<bool>,
+    ready: oneshot::Sender<()>,
 ) -> Result<WatchOutcome, WatchError> {
-    run_with_connector(client, spec, shutdown).await
+    run_with_connector(client, spec, shutdown, ready).await
 }
 
 async fn run_with_connector<C>(
     client: C,
     spec: WatchSpec,
     mut shutdown: shutdown_channel::Receiver<bool>,
+    ready: oneshot::Sender<()>,
 ) -> Result<WatchOutcome, WatchError>
 where
     C: WatchConnector,
@@ -198,7 +227,11 @@ where
     let watch_name =
         WorkloadName::new(spec.name.clone()).expect("workload watch label was validated");
     let mut state = WatchState::default();
+    let mut ready = Some(ready);
     loop {
+        if *shutdown.borrow() {
+            return Ok(context_canceled_outcome(state, &watch_name));
+        }
         // A peer can close a stream immediately after it is opened.  Keep the
         // reconnect state machine, but yield between attempts so a persistent
         // close cannot become a busy loop.
@@ -207,18 +240,26 @@ where
             tokio::select! {
                 _ = sleep(delay) => {}
                 _ = shutdown.changed() => {
-                    let outcome = WatchOutcome { terminal: WatchTerminal::ContextCanceled, state };
-                    metrics::record_watch_cancel(&watch_name, "context");
-                    return Ok(outcome);
+                    return Ok(context_canceled_outcome(state, &watch_name));
                 }
             }
         }
+        if *shutdown.borrow() {
+            return Ok(context_canceled_outcome(state, &watch_name));
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(4);
+        state.watch_id_valid = false;
         let start = state.next_start_revision(spec.start_revision);
         tx.send(create_request(&spec, start))
             .await
             .map_err(|_| WatchError::Rpc(Status::cancelled("watch request channel closed")))?;
-        let mut stream = match client.open_watch(ReceiverStream::new(rx)).await {
+        let open_result = tokio::select! {
+            result = client.open_watch(ReceiverStream::new(rx)) => result,
+            _ = shutdown.changed() => {
+                return Ok(context_canceled_outcome(state, &watch_name));
+            }
+        };
+        let mut stream = match open_result {
             Ok(stream) => stream,
             Err(status) if is_no_leader_status(&status) => return Err(WatchError::Rpc(status)),
             Err(status) if is_recoverable_disconnect(&status) => {
@@ -230,12 +271,10 @@ where
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
-                    if state.watch_id != 0 {
+                    if state.watch_id_valid {
                         let _ = tx.send(cancel_request(state.watch_id)).await;
                     }
-                    let outcome = WatchOutcome { terminal: WatchTerminal::ContextCanceled, state };
-                    metrics::record_watch_cancel(&watch_name, "context");
-                    return Ok(outcome);
+                    return Ok(context_canceled_outcome(state, &watch_name));
                 }
                 response = stream.next() => match response {
                     Some(Ok(response)) => {
@@ -246,6 +285,17 @@ where
                                 if response.compact_revision > 0 { "compacted" } else { "server" }
                             );
                             return Ok(WatchOutcome { terminal, state });
+                        }
+                        if response.created && response.watch_id == -1 {
+                            return Err(WatchError::Rpc(Status::internal(
+                                "watch created with invalid watch id",
+                            )));
+                        }
+                        state.observe_recovery_baseline(&response, spec.start_revision);
+                        if response.created {
+                            if let Some(sender) = ready.take() {
+                                let _ = sender.send(());
+                            }
                         }
                     }
                     None => {
@@ -283,12 +333,19 @@ fn record_reconnect(state: &mut WatchState, watch: &WorkloadName) {
     state.reconnects = state.reconnects.saturating_add(1);
     metrics::record_watch_reconnect(watch);
 }
+fn context_canceled_outcome(state: WatchState, watch: &WorkloadName) -> WatchOutcome {
+    metrics::record_watch_cancel(watch, "context");
+    WatchOutcome {
+        terminal: WatchTerminal::ContextCanceled,
+        state,
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::{Mutex, oneshot};
+    use tokio::sync::{Mutex, mpsc, oneshot};
 
     use super::*;
     use crate::pb::etcdserverpb::ResponseHeader;
@@ -381,6 +438,153 @@ mod tests {
             progress_notify: true,
         }
     }
+
+    #[derive(Clone)]
+    struct DelayedCreatedClient {
+        responses: Arc<Mutex<Option<mpsc::Receiver<Result<WatchResponse, Status>>>>>,
+        opened: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl WatchConnector for DelayedCreatedClient {
+        async fn open_watch<S>(&self, requests: S) -> Result<WatchResponseStream, Status>
+        where
+            S: Stream<Item = WatchRequest> + Send + 'static,
+        {
+            tokio::pin!(requests);
+            let _ = requests.next().await.expect("create request");
+            if let Some(notify) = self.opened.lock().await.take() {
+                let _ = notify.send(());
+            }
+            let response_rx = self
+                .responses
+                .lock()
+                .await
+                .take()
+                .expect("response stream requested once");
+            Ok(Box::pin(ReceiverStream::new(response_rx)))
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingOpenClient {
+        opened: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl WatchConnector for BlockingOpenClient {
+        async fn open_watch<S>(&self, requests: S) -> Result<WatchResponseStream, Status>
+        where
+            S: Stream<Item = WatchRequest> + Send + 'static,
+        {
+            tokio::pin!(requests);
+            let _ = requests.next().await.expect("create request");
+            if let Some(notify) = self.opened.lock().await.take() {
+                let _ = notify.send(());
+            }
+            std::future::pending::<Result<WatchResponseStream, Status>>().await
+        }
+    }
+
+    #[derive(Clone)]
+    struct TerminalClient {
+        response: Arc<Mutex<Option<WatchResponse>>>,
+    }
+
+    #[tonic::async_trait]
+    impl WatchConnector for TerminalClient {
+        async fn open_watch<S>(&self, requests: S) -> Result<WatchResponseStream, Status>
+        where
+            S: Stream<Item = WatchRequest> + Send + 'static,
+        {
+            tokio::pin!(requests);
+            let _ = requests.next().await.expect("create request");
+
+            let response = self
+                .response
+                .lock()
+                .await
+                .take()
+                .expect("terminal response requested once");
+            Ok(Box::pin(tokio_stream::once(Ok(response))))
+        }
+    }
+    struct NotifyAfterCreatedStream {
+        response: Option<Result<WatchResponse, Status>>,
+        processed: Option<oneshot::Sender<()>>,
+    }
+
+    impl Stream for NotifyAfterCreatedStream {
+        type Item = Result<WatchResponse, Status>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if let Some(response) = this.response.take() {
+                std::task::Poll::Ready(Some(response))
+            } else {
+                if let Some(processed) = this.processed.take() {
+                    let _ = processed.send(());
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReconnectIdClient {
+        calls: Arc<Mutex<usize>>,
+        second_created: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        cancel_id: Arc<Mutex<Option<oneshot::Sender<i64>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl WatchConnector for ReconnectIdClient {
+        async fn open_watch<S>(&self, requests: S) -> Result<WatchResponseStream, Status>
+        where
+            S: Stream<Item = WatchRequest> + Send + 'static,
+        {
+            let mut requests = Box::pin(requests);
+            let _ = requests.next().await.expect("create request");
+            let call = {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                *calls
+            };
+            if call == 1 {
+                return Ok(Box::pin(tokio_stream::once(Ok(WatchResponse {
+                    watch_id: 7,
+                    created: true,
+                    ..Default::default()
+                }))));
+            }
+
+            let cancel_id = self.cancel_id.lock().await.take();
+            tokio::spawn(async move {
+                while let Some(request) = requests.next().await {
+                    if let Some(watch_request::RequestUnion::CancelRequest(cancel)) =
+                        request.request_union
+                    {
+                        if let Some(sender) = cancel_id {
+                            let _ = sender.send(cancel.watch_id);
+                        }
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(NotifyAfterCreatedStream {
+                response: Some(Ok(WatchResponse {
+                    watch_id: 0,
+                    created: true,
+                    ..Default::default()
+                })),
+                processed: self.second_created.lock().await.take(),
+            }))
+        }
+    }
+
     #[derive(Clone)]
     struct NoLeaderOpenClient {
         calls: Arc<Mutex<usize>>,
@@ -423,7 +627,8 @@ mod tests {
             calls: Arc::clone(&calls),
         };
         let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let result = run_with_connector(client, spec(), shutdown_rx).await;
+        let (ready_tx, _ready_rx) = oneshot::channel();
+        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx).await;
         let Err(WatchError::Rpc(status)) = result else {
             panic!("expected no-leader RPC");
         };
@@ -439,13 +644,78 @@ mod tests {
             calls: Arc::clone(&calls),
         };
         let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let result = run_with_connector(client, spec(), shutdown_rx).await;
+        let (ready_tx, _ready_rx) = oneshot::channel();
+        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx).await;
         let Err(WatchError::Rpc(status)) = result else {
             panic!("expected no-leader RPC");
         };
         assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(status.message(), ETCD_NO_LEADER_MESSAGE);
         assert_eq!(*calls.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn compacted_response_is_terminal_and_drops_ready() {
+        let client = TerminalClient {
+            response: Arc::new(Mutex::new(Some(WatchResponse {
+                compact_revision: 11,
+                watch_id: 1,
+                created: true,
+                ..Default::default()
+            }))),
+        };
+        let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx)
+            .await
+            .expect("watch outcome");
+        assert_eq!(result.terminal, WatchTerminal::Compacted { revision: 11 });
+        assert!(ready_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn canceled_response_is_terminal_and_drops_ready() {
+        let client = TerminalClient {
+            response: Arc::new(Mutex::new(Some(WatchResponse {
+                canceled: true,
+                cancel_reason: "server canceled".into(),
+                watch_id: 1,
+                created: true,
+                ..Default::default()
+            }))),
+        };
+        let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx)
+            .await
+            .expect("watch outcome");
+        assert_eq!(
+            result.terminal,
+            WatchTerminal::Canceled {
+                reason: "server canceled".into()
+            }
+        );
+        assert!(ready_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_created_watch_id_is_forwarded_and_drops_ready() {
+        let client = TerminalClient {
+            response: Arc::new(Mutex::new(Some(WatchResponse {
+                created: true,
+                watch_id: -1,
+                ..Default::default()
+            }))),
+        };
+        let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx).await;
+        let Err(WatchError::Rpc(status)) = result else {
+            panic!("expected invalid watch ID error");
+        };
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(status.message(), "watch created with invalid watch id");
+        assert!(ready_rx.await.is_err());
     }
 
     #[tokio::test]
@@ -463,7 +733,8 @@ mod tests {
             first_events: false,
         };
         let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx));
+        let (ready_tx, _ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
 
         second_open_rx.await.expect("second watch stream opened");
         assert_eq!(&*starts.lock().await, &[7, 7]);
@@ -472,6 +743,125 @@ mod tests {
         assert_eq!(outcome.state.reconnects, 1);
         assert_eq!(outcome.state.last_revision, 13);
         metrics::reset_watch_reconnects();
+    }
+
+    #[tokio::test]
+    async fn run_path_reconnects_after_current_created_using_header_baseline() {
+        let _serial = metrics::lock_watch_reconnect_tests();
+        metrics::reset_watch_reconnects();
+
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(0usize));
+        let (second_open_tx, second_open_rx) = oneshot::channel();
+        let client = FakeWatchClient {
+            starts: Arc::clone(&starts),
+            calls,
+            second_open: Arc::new(Mutex::new(Some(second_open_tx))),
+            first_events: false,
+        };
+        let mut current_spec = spec();
+        current_spec.start_revision = 0;
+        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_with_connector(
+            client,
+            current_spec,
+            shutdown_rx,
+            ready_tx,
+        ));
+
+        ready_rx.await.expect("current watch created");
+        second_open_rx.await.expect("second watch stream opened");
+        assert_eq!(&*starts.lock().await, &[0, 12]);
+        shutdown.send(true).expect("watch shutdown receiver exists");
+        let outcome = task.await.expect("watch task join").expect("watch outcome");
+        assert_eq!(outcome.state.reconnects, 1);
+        assert_eq!(outcome.state.last_revision, 13);
+        metrics::reset_watch_reconnects();
+    }
+
+    #[tokio::test]
+    async fn reconnect_created_zero_id_cancels_zero_not_stale_id() {
+        let _serial = metrics::lock_watch_reconnect_tests();
+        metrics::reset_watch_reconnects();
+
+        let (second_created_tx, second_created_rx) = oneshot::channel();
+        let (cancel_id_tx, cancel_id_rx) = oneshot::channel();
+        let client = ReconnectIdClient {
+            calls: Arc::new(Mutex::new(0)),
+            second_created: Arc::new(Mutex::new(Some(second_created_tx))),
+            cancel_id: Arc::new(Mutex::new(Some(cancel_id_tx))),
+        };
+        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
+
+        ready_rx.await.expect("first watch created");
+        second_created_rx
+            .await
+            .expect("reconnected zero-ID watch created");
+        shutdown.send(true).expect("watch shutdown receiver exists");
+        let cancel_id = tokio::time::timeout(Duration::from_secs(1), cancel_id_rx)
+            .await
+            .expect("zero-ID cancel sent")
+            .expect("cancel request observer exists");
+        assert_eq!(cancel_id, 0);
+        let outcome = task.await.expect("watch task join").expect("watch outcome");
+        assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
+        metrics::reset_watch_reconnects();
+    }
+    #[tokio::test]
+    async fn ready_waits_for_delayed_created_response() {
+        let (response_tx, response_rx) = mpsc::channel(1);
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let client = DelayedCreatedClient {
+            responses: Arc::new(Mutex::new(Some(response_rx))),
+            opened: Arc::new(Mutex::new(Some(opened_tx))),
+        };
+        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
+
+        opened_rx.await.expect("watch RPC established");
+        assert!(ready_rx.try_recv().is_err());
+        response_tx
+            .send(Ok(WatchResponse {
+                header: Some(ResponseHeader {
+                    revision: 12,
+                    ..Default::default()
+                }),
+                watch_id: 1,
+                created: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("created response receiver exists");
+        ready_rx.await.expect("created response releases readiness");
+
+        shutdown.send(true).expect("watch shutdown receiver exists");
+        let outcome = task.await.expect("watch task join").expect("watch outcome");
+        assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_open_watch_is_terminal_and_drops_ready() {
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let client = BlockingOpenClient {
+            opened: Arc::new(Mutex::new(Some(opened_tx))),
+        };
+        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
+
+        opened_rx.await.expect("watch open started");
+        shutdown.send(true).expect("watch shutdown receiver exists");
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("open cancellation completes")
+            .expect("watch task join");
+        let outcome = result.expect("watch outcome");
+        assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
+        assert!(ready_rx.await.is_err());
     }
 
     #[tokio::test]
@@ -489,7 +879,8 @@ mod tests {
             first_events: true,
         };
         let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx));
+        let (ready_tx, _ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
 
         second_open_rx.await.expect("second watch stream opened");
         assert_eq!(&*starts.lock().await, &[7, 9]);
@@ -525,8 +916,7 @@ mod tests {
 
     #[test]
     fn state_distinguishes_created_events_progress_and_canceled() {
-        let mut state = WatchState::default();
-        state.observe(&WatchResponse {
+        let created = WatchResponse {
             header: Some(ResponseHeader {
                 revision: 12,
                 ..Default::default()
@@ -534,9 +924,20 @@ mod tests {
             watch_id: 3,
             created: true,
             ..Default::default()
-        });
+        };
+        let mut state = WatchState::default();
+        state.observe(&created);
         assert_eq!(state.last_revision, 0);
         assert_eq!(state.next_start_revision(7), 7);
+        state.observe_recovery_baseline(&created, 0);
+        assert_eq!(state.last_revision, 0);
+        assert_eq!(state.next_start_revision(0), 12);
+
+        let mut historical_state = WatchState::default();
+        historical_state.observe(&created);
+        historical_state.observe_recovery_baseline(&created, 7);
+        assert_eq!(historical_state.last_revision, 0);
+        assert_eq!(historical_state.next_start_revision(7), 7);
 
         state.observe(&WatchResponse {
             header: Some(ResponseHeader {

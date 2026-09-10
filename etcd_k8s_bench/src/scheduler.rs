@@ -15,8 +15,8 @@ use crate::client::{ClientBundle, RequestDisposition, RetryDecision, RpcMethod};
 #[cfg(test)]
 use crate::config::TopologySpec;
 use crate::config::{
-    EtcdLeasePoolSpec, ResourceCountSpec, ResourceSpec, RetryPolicy as ConfigRetryPolicy,
-    RuntimeConfig, WorkloadSpec,
+    EtcdLeasePoolSpec, ResourceBehavior, ResourceCountSpec, ResourceSpec, RuntimeConfig,
+    WorkloadSpec,
 };
 use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner};
 use crate::lease::{LeaseEvent, LeasePool, LeasePoolConfig};
@@ -25,12 +25,373 @@ use crate::metrics::{
     TxnResult, TxnShape,
 };
 use crate::pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse};
+use crate::report::{
+    AccountingInvariants, ApplicationTargets, RunReport, RunTargets, WorkItemReport,
+};
 use crate::watch::prefix_range_end;
 use crate::workload::{
-    CasDecision, CasLoop, ExhaustedReason, KeyState, ResourceOperation,
-    RetryPolicy as CasRetryPolicy, TxnAttempt, build_compact_revision_txn, failure_value,
-    failure_version,
+    CasDecision, CasLoop, CasRetryPolicy, ExhaustedReason, KeyState, ResourceOperation, TxnAttempt,
+    build_compact_revision_txn, failure_value, failure_version,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkClass {
+    Bootstrap,
+    Create,
+    Update,
+    Range,
+    MasterLease,
+    Heartbeat,
+    Status,
+    Compact,
+}
+
+impl WorkClass {
+    const ALL: [Self; 8] = [
+        Self::Bootstrap,
+        Self::Create,
+        Self::Update,
+        Self::Range,
+        Self::MasterLease,
+        Self::Heartbeat,
+        Self::Status,
+        Self::Compact,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Range => "range",
+            Self::MasterLease => "master_lease",
+            Self::Heartbeat => "heartbeat",
+            Self::Status => "status",
+            Self::Compact => "compact",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Bootstrap => 0,
+            Self::Create => 1,
+            Self::Update => 2,
+            Self::Range => 3,
+            Self::MasterLease => 4,
+            Self::Heartbeat => 5,
+            Self::Status => 6,
+            Self::Compact => 7,
+        }
+    }
+}
+
+const MAX_ERROR_CONTEXT: usize = 256;
+
+#[derive(Debug)]
+struct ClassAccounting {
+    offered: AtomicU64,
+    accepted: AtomicU64,
+    succeeded: AtomicU64,
+    failed: AtomicU64,
+    result_unknown: AtomicU64,
+    dropped_full: AtomicU64,
+    dropped_closed: AtomicU64,
+    unfinished: AtomicU64,
+    unissued: AtomicU64,
+    first_error: std::sync::Mutex<Option<String>>,
+}
+
+impl ClassAccounting {
+    fn new() -> Self {
+        Self {
+            offered: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            succeeded: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            result_unknown: AtomicU64::new(0),
+            dropped_full: AtomicU64::new(0),
+            dropped_closed: AtomicU64::new(0),
+            unfinished: AtomicU64::new(0),
+            unissued: AtomicU64::new(0),
+            first_error: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunAccounting {
+    classes: [ClassAccounting; 8],
+}
+
+impl RunAccounting {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            classes: std::array::from_fn(|_| ClassAccounting::new()),
+        })
+    }
+
+    fn offer(self: &Arc<Self>, class: WorkClass) -> AccountingToken {
+        self.class(class)
+            .offered
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        AccountingToken {
+            accounting: Arc::clone(self),
+            class,
+            state: TokenState::Offered,
+            accepted_at: None,
+            phase: None,
+        }
+    }
+
+    fn class(&self, class: WorkClass) -> &ClassAccounting {
+        &self.classes[class.index()]
+    }
+
+    fn note_error(&self, class: WorkClass, message: impl Into<String>) {
+        let mut slot = self
+            .class(class)
+            .first_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let message = message.into();
+        *slot = Some(message.chars().take(MAX_ERROR_CONTEXT).collect());
+    }
+
+    fn report(
+        &self,
+        targets: RunTargets,
+        interrupted: bool,
+        schedule_complete: bool,
+        termination_error: Option<String>,
+    ) -> RunReport {
+        let mut work_items = Vec::with_capacity(WorkClass::ALL.len());
+        let mut invariants = AccountingInvariants {
+            offered_equals_accepted_plus_dropped_plus_unissued: true,
+            accepted_equals_completed_plus_unfinished: true,
+            accepted_equals_succeeded_plus_failed_plus_unfinished: true,
+            result_unknown_subset_failed: true,
+        };
+        for class in WorkClass::ALL {
+            let counters = self.class(class);
+            let offered = counters.offered.load(AtomicOrdering::Acquire);
+            let accepted = counters.accepted.load(AtomicOrdering::Acquire);
+            let succeeded = counters.succeeded.load(AtomicOrdering::Acquire);
+            let failed = counters.failed.load(AtomicOrdering::Acquire);
+            let completed = succeeded.saturating_add(failed);
+            let result_unknown = counters.result_unknown.load(AtomicOrdering::Acquire);
+            let dropped_full = counters.dropped_full.load(AtomicOrdering::Acquire);
+            let dropped_closed = counters.dropped_closed.load(AtomicOrdering::Acquire);
+            let dropped = dropped_full.saturating_add(dropped_closed);
+            let unfinished = counters.unfinished.load(AtomicOrdering::Acquire);
+            let unissued = counters.unissued.load(AtomicOrdering::Acquire);
+            let offered_valid =
+                offered == accepted.saturating_add(dropped).saturating_add(unissued);
+            let accepted_valid = accepted == completed.saturating_add(unfinished);
+            let accepted_expanded_valid =
+                accepted == succeeded.saturating_add(failed).saturating_add(unfinished);
+            let unknown_valid = result_unknown <= failed;
+            invariants.offered_equals_accepted_plus_dropped_plus_unissued &= offered_valid;
+            invariants.accepted_equals_completed_plus_unfinished &= accepted_valid;
+            invariants.accepted_equals_succeeded_plus_failed_plus_unfinished &=
+                accepted_expanded_valid;
+            invariants.result_unknown_subset_failed &= unknown_valid;
+            let target = match class {
+                WorkClass::Bootstrap => Some(targets.bootstrap),
+                WorkClass::Create => Some(targets.application.creates),
+                WorkClass::Update => Some(targets.application.updates),
+                WorkClass::Range => Some(targets.range_requests),
+                WorkClass::MasterLease
+                | WorkClass::Heartbeat
+                | WorkClass::Status
+                | WorkClass::Compact => None,
+            };
+            let target_deficit = target.map(|target| target.saturating_sub(succeeded));
+            let first_error = counters
+                .first_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            work_items.push(WorkItemReport {
+                work_class: class.as_str().to_string(),
+                target,
+                offered,
+                accepted,
+                completed,
+                succeeded,
+                failed,
+                result_unknown,
+                dropped,
+                dropped_full,
+                dropped_closed,
+                unfinished,
+                unissued,
+                target_deficit,
+                first_error,
+            });
+        }
+        let invariants_valid = invariants.offered_equals_accepted_plus_dropped_plus_unissued
+            && invariants.accepted_equals_completed_plus_unfinished
+            && invariants.accepted_equals_succeeded_plus_failed_plus_unfinished
+            && invariants.result_unknown_subset_failed;
+        let targets_met = work_items.iter().all(|item| {
+            item.target
+                .is_none_or(|target| item.succeeded >= target && item.target_deficit == Some(0))
+        });
+        let no_bad_results = work_items.iter().all(|item| {
+            item.failed == 0 && item.dropped == 0 && item.unfinished == 0 && item.unissued == 0
+        });
+        RunReport {
+            achieved: schedule_complete
+                && !interrupted
+                && termination_error.is_none()
+                && invariants_valid
+                && targets_met
+                && no_bad_results,
+            interrupted,
+            schedule_complete,
+            scope: "scheduler",
+            termination_error: termination_error
+                .map(|error| error.chars().take(MAX_ERROR_CONTEXT).collect::<String>()),
+            targets,
+            work_items,
+            accounting_invariants: invariants,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TokenState {
+    Offered,
+    Accepted,
+    Terminal,
+}
+
+#[derive(Debug)]
+struct AccountingToken {
+    accounting: Arc<RunAccounting>,
+    class: WorkClass,
+    state: TokenState,
+    accepted_at: Option<Instant>,
+    phase: Option<(Arc<PhaseTracker>, usize)>,
+}
+
+impl AccountingToken {
+    fn mark_accepted(&mut self) {
+        if !matches!(self.state, TokenState::Offered) {
+            return;
+        }
+        self.state = TokenState::Accepted;
+        self.accepted_at = Some(Instant::now());
+        self.accounting
+            .class(self.class)
+            .accepted
+            .fetch_add(1, AtomicOrdering::Release);
+    }
+
+    fn record_dequeue(&mut self) {
+        if !matches!(self.state, TokenState::Accepted) {
+            return;
+        }
+        if let Some(accepted_at) = self.accepted_at.take() {
+            metrics::record_queue_wait(self.class.as_str(), accepted_at.elapsed());
+        }
+    }
+
+    fn mark_complete(&mut self, outcome: Outcome) {
+        if !matches!(self.state, TokenState::Accepted) {
+            return;
+        }
+        let counters = self.accounting.class(self.class);
+        if outcome == Outcome::Success {
+            counters.succeeded.fetch_add(1, AtomicOrdering::Release);
+        } else {
+            counters.failed.fetch_add(1, AtomicOrdering::Release);
+            if outcome == Outcome::ResultUnknown {
+                counters
+                    .result_unknown
+                    .fetch_add(1, AtomicOrdering::Release);
+            }
+        }
+        if let Some((tracker, resource)) = &self.phase {
+            tracker.record(*resource, outcome);
+        }
+        self.state = TokenState::Terminal;
+    }
+
+    fn mark_dropped(&mut self, reason: DropReason) {
+        if !matches!(self.state, TokenState::Offered) {
+            return;
+        }
+        match reason {
+            DropReason::Backpressure => {
+                self.accounting
+                    .class(self.class)
+                    .dropped_full
+                    .fetch_add(1, AtomicOrdering::Release);
+            }
+            DropReason::QueueClosed => {
+                self.accounting
+                    .class(self.class)
+                    .dropped_closed
+                    .fetch_add(1, AtomicOrdering::Release);
+            }
+        }
+        self.state = TokenState::Terminal;
+    }
+
+    fn mark_unissued(&mut self) {
+        if !matches!(self.state, TokenState::Offered) {
+            return;
+        }
+        self.accounting
+            .class(self.class)
+            .unissued
+            .fetch_add(1, AtomicOrdering::Release);
+        self.state = TokenState::Terminal;
+    }
+
+    fn mark_unfinished(&mut self) {
+        if !matches!(self.state, TokenState::Accepted) {
+            return;
+        }
+        self.accounting
+            .class(self.class)
+            .unfinished
+            .fetch_add(1, AtomicOrdering::Release);
+        if let Some((tracker, resource)) = &self.phase {
+            tracker.record_unfinished(*resource);
+        }
+        self.state = TokenState::Terminal;
+    }
+}
+
+impl Drop for AccountingToken {
+    fn drop(&mut self) {
+        match self.state {
+            TokenState::Offered => self.mark_unissued(),
+            TokenState::Accepted => self.mark_unfinished(),
+            TokenState::Terminal => {}
+        }
+    }
+}
+
+fn tracked(accounting: &Arc<RunAccounting>, class: WorkClass) -> AccountingToken {
+    accounting.offer(class)
+}
+
+fn tracked_phase(
+    accounting: &Arc<RunAccounting>,
+    class: WorkClass,
+    completion: Arc<PhaseTracker>,
+    resource: usize,
+) -> AccountingToken {
+    let mut token = accounting.offer(class);
+    token.phase = Some((completion, resource));
+    token
+}
 
 #[derive(Debug)]
 enum WorkItem {
@@ -40,20 +401,75 @@ enum WorkItem {
         operation: ResourceOperation,
         value: Vec<u8>,
         pool: Option<String>,
-        completion: Option<Arc<PhaseTracker>>,
+        accounting: AccountingToken,
     },
     Range {
         request: RangeRequest,
         selector_keep_every: u64,
         target: u64,
+        accounting: AccountingToken,
     },
-    Heartbeat(HeartbeatItem),
+    Heartbeat {
+        item: HeartbeatItem,
+        accounting: AccountingToken,
+    },
     Bootstrap {
         item: HeartbeatItem,
         done: oneshot::Sender<Result<(), String>>,
+        accounting: AccountingToken,
     },
-    Status,
-    CompactTick,
+    Status {
+        accounting: AccountingToken,
+    },
+    CompactTick {
+        accounting: AccountingToken,
+    },
+}
+
+impl WorkItem {
+    fn mark_accepted(&mut self) {
+        match self {
+            Self::Txn { accounting, .. }
+            | Self::Range { accounting, .. }
+            | Self::Heartbeat { accounting, .. }
+            | Self::Bootstrap { accounting, .. }
+            | Self::Status { accounting }
+            | Self::CompactTick { accounting } => accounting.mark_accepted(),
+        }
+    }
+
+    fn record_dequeue(&mut self) {
+        match self {
+            Self::Txn { accounting, .. }
+            | Self::Range { accounting, .. }
+            | Self::Heartbeat { accounting, .. }
+            | Self::Bootstrap { accounting, .. }
+            | Self::Status { accounting }
+            | Self::CompactTick { accounting } => accounting.record_dequeue(),
+        }
+    }
+
+    fn mark_dropped(&mut self, reason: DropReason) {
+        match self {
+            Self::Txn { accounting, .. }
+            | Self::Range { accounting, .. }
+            | Self::Heartbeat { accounting, .. }
+            | Self::Bootstrap { accounting, .. }
+            | Self::Status { accounting }
+            | Self::CompactTick { accounting } => accounting.mark_dropped(reason),
+        }
+    }
+
+    fn mark_unissued(&mut self) {
+        match self {
+            Self::Txn { accounting, .. }
+            | Self::Range { accounting, .. }
+            | Self::Heartbeat { accounting, .. }
+            | Self::Bootstrap { accounting, .. }
+            | Self::Status { accounting }
+            | Self::CompactTick { accounting } => accounting.mark_unissued(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,7 +658,6 @@ pub struct ScheduleStats {
 pub struct Scheduler {
     workload: WorkloadSpec,
     nodes: usize,
-    time_scale: f64,
     seed: u64,
 }
 impl Scheduler {
@@ -250,7 +665,6 @@ impl Scheduler {
         Self {
             workload: config.workload.clone(),
             nodes: config.nodes as usize,
-            time_scale: config.time_scale,
             seed: config.seed,
         }
     }
@@ -261,8 +675,7 @@ impl Scheduler {
                 .timeline
                 .iter()
                 .map(|s| s.duration_s)
-                .sum::<f64>()
-                * self.time_scale,
+                .sum::<f64>(),
         )
     }
 }
@@ -318,11 +731,11 @@ struct RateCursor {
     ordinal: u64,
 }
 impl RateCursor {
-    fn new(workload: &WorkloadSpec, time_scale: f64, seed: u64, tag: u64) -> Self {
+    fn new(workload: &WorkloadSpec, seed: u64, tag: u64) -> Self {
         let mut offset = Duration::ZERO;
         let mut segments = Vec::with_capacity(workload.timeline.len());
         for (index, segment) in workload.timeline.iter().enumerate() {
-            let duration = Duration::from_secs_f64(segment.duration_s * time_scale);
+            let duration = Duration::from_secs_f64(segment.duration_s);
             let rate = segment.range_rps;
             let expected = rate.max(0.0) * duration.as_secs_f64();
             let base = expected.floor() as u64;
@@ -369,7 +782,7 @@ pub(crate) fn application_operation_total(workload: &WorkloadSpec) -> u64 {
     workload
         .resources
         .iter()
-        .filter(|resource| resource.retry_policy != ConfigRetryPolicy::MasterLease)
+        .filter(|resource| resource.behavior != ResourceBehavior::MasterLease)
         .try_fold(0u64, |total, resource| {
             let count = workload
                 .resource_count(resource)
@@ -385,10 +798,10 @@ pub(crate) fn application_operation_total(workload: &WorkloadSpec) -> u64 {
 }
 
 /// Total number of independent Range requests the scheduler will emit for
-/// this workload at base scale, using the same per-segment deterministic
+/// this workload's actual timeline, using the same per-segment deterministic
 /// rounding as the runtime cursor.
 pub(crate) fn range_request_total(workload: &WorkloadSpec, seed: u64) -> u64 {
-    RateCursor::new(workload, 1.0, seed, 0xB2).total()
+    RateCursor::new(workload, seed, 0xB2).total()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -595,7 +1008,11 @@ struct PhaseTracker {
     targets: Vec<u64>,
     completed: AtomicU64,
     succeeded: AtomicU64,
+    failed: AtomicU64,
+    result_unknown: AtomicU64,
+    unfinished: AtomicU64,
     succeeded_by_resource: Vec<AtomicU64>,
+    failed_by_resource: Vec<AtomicU64>,
     notify: Notify,
 }
 
@@ -606,12 +1023,17 @@ impl PhaseTracker {
             .try_fold(0u64, |total, target| total.checked_add(*target))
             .expect("phase targets were validated");
         let succeeded_by_resource = targets.iter().map(|_| AtomicU64::new(0)).collect();
+        let failed_by_resource = targets.iter().map(|_| AtomicU64::new(0)).collect();
         Self {
             target,
             targets,
             completed: AtomicU64::new(0),
             succeeded: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            result_unknown: AtomicU64::new(0),
+            unfinished: AtomicU64::new(0),
             succeeded_by_resource,
+            failed_by_resource,
             notify: Notify::new(),
         }
     }
@@ -622,7 +1044,27 @@ impl PhaseTracker {
             if let Some(succeeded) = self.succeeded_by_resource.get(resource) {
                 succeeded.fetch_add(1, AtomicOrdering::Relaxed);
             }
+        } else {
+            self.failed.fetch_add(1, AtomicOrdering::Relaxed);
+            if outcome == Outcome::ResultUnknown {
+                self.result_unknown.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            if let Some(failed) = self.failed_by_resource.get(resource) {
+                failed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
         }
+        self.record_terminal();
+    }
+
+    fn record_unfinished(&self, resource: usize) {
+        self.unfinished.fetch_add(1, AtomicOrdering::Relaxed);
+        self.record_terminal();
+        if let Some(failed) = self.failed_by_resource.get(resource) {
+            failed.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn record_terminal(&self) {
         let completed = self.completed.fetch_add(1, AtomicOrdering::Release) + 1;
         if completed >= self.target {
             self.notify.notify_waiters();
@@ -665,16 +1107,19 @@ impl PhaseTracker {
             let label = ResourceName::try_from(spec.name.as_str())
                 .expect("workload resource labels were validated");
             let succeeded = self.succeeded_by_resource[resource].load(AtomicOrdering::Acquire);
+            let failed = self.failed_by_resource[resource].load(AtomicOrdering::Acquire);
             let deficit = target.saturating_sub(succeeded);
             match kind {
                 PhaseKind::Create => {
                     metrics::set_resource_objects(&label, "planned", target);
                     metrics::set_resource_objects(&label, "succeeded", succeeded);
+                    metrics::set_resource_objects(&label, "failed", failed);
                     metrics::set_resource_objects(&label, "deficit", deficit);
                 }
                 PhaseKind::Update => {
                     metrics::set_resource_updates(&label, "target", target);
                     metrics::set_resource_updates(&label, "succeeded", succeeded);
+                    metrics::set_resource_updates(&label, "failed", failed);
                     metrics::set_resource_updates(&label, "deficit", deficit);
                 }
             }
@@ -894,14 +1339,19 @@ impl RangePager {
         selected_in_page: usize,
     ) -> Result<RangePageOutcome, String> {
         let response_revision = response.header.as_ref().map_or(0, |header| header.revision);
-        match self.revision {
-            None => self.revision = Some(response_revision),
-            Some(revision) if revision != response_revision => {
-                return Err(format!(
-                    "Range page revision changed from {revision} to {response_revision}"
-                ));
+        if self.revision.is_none() {
+            // Historical Range responses report the server's current revision,
+            // not necessarily the snapshot selected by the request.
+            // https://github.com/etcd-io/etcd/blob/v3.6.5/server/storage/mvcc/kvstore_txn.go
+            let snapshot = if self.request.revision > 0 {
+                self.request.revision
+            } else {
+                response_revision
+            };
+            if self.paged && snapshot <= 0 {
+                return Err("Range page has no valid snapshot revision".to_string());
             }
-            Some(_) => {}
+            self.revision = Some(snapshot);
         }
         self.pages = self.pages.saturating_add(1);
         self.server_count = response.count;
@@ -1080,15 +1530,11 @@ fn masterlease_tick_at(interval: Duration, ordinal: u64, duration: Duration) -> 
     Some(Duration::from_secs_f64(secs))
 }
 
-fn range_shape_plan(
-    workload: &WorkloadSpec,
-    prefix_total: u64,
-    time_scale: f64,
-) -> Result<RangeShapePlan, String> {
-    let count_only = (workload.range_count_only_count as f64 * time_scale).round() as u64;
+fn range_shape_plan(workload: &WorkloadSpec, prefix_total: u64) -> Result<RangeShapePlan, String> {
+    let count_only = workload.range_count_only_count;
     if count_only > prefix_total {
         return Err(format!(
-            "scaled Range shape count ({count_only}) exceeds scheduled prefix Range capacity ({prefix_total})",
+            "Range shape count ({count_only}) exceeds scheduled prefix Range capacity ({prefix_total})",
         ));
     }
     Ok(RangeShapePlan::new(prefix_total, count_only))
@@ -1192,19 +1638,26 @@ type WatchTaskOutput = (
 fn spawn_watches(
     client: &ClientBundle,
     specs: &[crate::config::WatchSpec],
-) -> (shutdown_watch::Sender<bool>, JoinSet<WatchTaskOutput>) {
+) -> (
+    shutdown_watch::Sender<bool>,
+    JoinSet<WatchTaskOutput>,
+    Vec<oneshot::Receiver<()>>,
+) {
     let (shutdown, receiver) = shutdown_watch::channel(false);
     let mut tasks = JoinSet::new();
+    let mut ready_receivers = Vec::with_capacity(specs.len());
     for spec in specs.iter().cloned() {
         let name = spec.name.clone();
         let watch_receiver = receiver.clone();
         let watch_client = client.clone();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        ready_receivers.push(ready_receiver);
         tasks.spawn(async move {
-            let result = crate::watch::run(watch_client, spec, watch_receiver).await;
+            let result = crate::watch::run(watch_client, spec, watch_receiver, ready_sender).await;
             (name, result)
         });
     }
-    (shutdown, tasks)
+    (shutdown, tasks, ready_receivers)
 }
 
 fn watch_failure(
@@ -1218,66 +1671,134 @@ fn watch_failure(
     }
 }
 
-async fn stop_watches(
-    shutdown: shutdown_watch::Sender<bool>,
-    mut tasks: JoinSet<WatchTaskOutput>,
+async fn wait_for_watch_ready(
+    tasks: &mut JoinSet<WatchTaskOutput>,
+    ready_receivers: Vec<oneshot::Receiver<()>>,
     timeout: Duration,
-) {
-    let _ = shutdown.send(true);
-    let remaining = timeout;
-    match time::timeout(remaining, async {
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok((name, result)) => {
-                    if let Some(error) = watch_failure(&name, result) {
-                        eprintln!("watch shutdown error: {error}");
+    ctrl_c: &mut CtrlCFuture,
+) -> Result<(), String> {
+    if ready_receivers.is_empty() {
+        return Ok(());
+    }
+    let deadline = TokioInstant::now() + timeout;
+    for mut ready in ready_receivers {
+        let mut readiness_closed = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = ctrl_c.as_mut() => {
+                    return Err("interrupted while waiting for watch readiness".into());
+                }
+                watch_result = tasks.join_next(), if !tasks.is_empty() => {
+                    match watch_result {
+                        Some(Ok((name, result))) => {
+                            if let Some(error) = watch_failure(&name, result) {
+                                return Err(error);
+                            }
+                            return Err(format!("watch {name} terminated before Created readiness"));
+                        }
+                        Some(Err(error)) => return Err(format!("watch task failed: {error}")),
+                        None => return Err("all watch tasks terminated before readiness".into()),
                     }
                 }
-                Err(error) => eprintln!("watch task failed during shutdown: {error}"),
+                ready_result = &mut ready, if !readiness_closed => {
+                    match ready_result {
+                        Ok(()) => break,
+                        Err(_) if tasks.is_empty() => {
+                            return Err("watch terminated before Created readiness".into());
+                        }
+                        Err(_) => readiness_closed = true,
+                    }
+                }
+                _ = time::sleep_until(deadline) => {
+                    return Err("watch readiness timed out".into());
+                }
             }
         }
-    })
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-            eprintln!("watch shutdown timed out");
-        }
+    }
+    Ok(())
+}
+
+fn push_bounded_error(errors: &mut Vec<String>, error: String) {
+    if errors.len() < 8 {
+        errors.push(error.chars().take(MAX_ERROR_CONTEXT).collect());
     }
 }
 
 type CtrlCFuture = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
 
-enum ScheduleControl {
+enum SupervisedScheduleControl {
     Deadline,
     Interrupted,
-    WatchCompleted,
+    UpdateFinished(Result<u64, String>),
 }
 
-async fn wait_for_schedule_event(
-    tasks: &mut JoinSet<WatchTaskOutput>,
+async fn wait_for_supervised_schedule_event(
+    watch_tasks: &mut JoinSet<WatchTaskOutput>,
+    worker_tasks: &mut JoinSet<Result<(), String>>,
+    update_task: &mut Option<tokio::task::JoinHandle<Result<u64, String>>>,
     deadline: TokioInstant,
     ctrl_c: &mut CtrlCFuture,
-) -> Result<ScheduleControl, String> {
+) -> Result<SupervisedScheduleControl, String> {
     tokio::select! {
         biased;
-        watch_result = tasks.join_next(), if !tasks.is_empty() => {
+        _ = ctrl_c.as_mut() => Ok(SupervisedScheduleControl::Interrupted),
+        watch_result = watch_tasks.join_next(), if !watch_tasks.is_empty() => {
             match watch_result {
                 Some(Ok((name, result))) => {
-                    if let Some(error) = watch_failure(&name, result) {
-                        Err(error)
-                    } else {
-                        Ok(ScheduleControl::WatchCompleted)
+                    match watch_failure(&name, result) {
+                        Some(error) => Err(error),
+                        None => Err(format!("watch {name} terminated unexpectedly")),
                     }
                 }
                 Some(Err(error)) => Err(format!("watch task failed: {error}")),
-                None => Ok(ScheduleControl::WatchCompleted),
+                None => Err("all watch tasks terminated unexpectedly".to_string()),
             }
         }
-        _ = time::sleep_until(deadline) => Ok(ScheduleControl::Deadline),
-        _ = ctrl_c.as_mut() => Ok(ScheduleControl::Interrupted),
+        worker_result = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
+            match worker_result {
+                Some(Ok(Ok(()))) => Err("worker exited unexpectedly".to_string()),
+                Some(Ok(Err(error))) => Err(format!("worker failed: {error}")),
+                Some(Err(error)) => Err(format!("worker task failed: {error}")),
+                None => Err("all worker tasks terminated unexpectedly".to_string()),
+            }
+        }
+        update_result = async { update_task.as_mut().expect("guarded update task").await }, if update_task.is_some() => {
+            let result = match update_result {
+                Ok(result) => result,
+                Err(error) => Err(format!("update phase task failed: {error}")),
+            };
+            Ok(SupervisedScheduleControl::UpdateFinished(result))
+        }
+        _ = time::sleep_until(deadline) => Ok(SupervisedScheduleControl::Deadline),
+    }
+}
+enum EnqueueResult {
+    Accepted,
+    Closed,
+    Unissued,
+}
+
+async fn enqueue_until(
+    sender: &mpsc::Sender<WorkItem>,
+    mut item: WorkItem,
+    deadline: TokioInstant,
+) -> EnqueueResult {
+    match time::timeout_at(deadline, sender.reserve()).await {
+        Ok(Ok(permit)) => {
+            item.mark_accepted();
+            permit.send(item);
+            EnqueueResult::Accepted
+        }
+        Ok(Err(_)) => {
+            item.mark_dropped(DropReason::QueueClosed);
+            metrics::record_dropped(DropReason::QueueClosed);
+            EnqueueResult::Closed
+        }
+        Err(_) => {
+            item.mark_unissued();
+            EnqueueResult::Unissued
+        }
     }
 }
 
@@ -1287,6 +1808,7 @@ async fn run_create_phase(
     senders: &[mpsc::Sender<WorkItem>],
     workers: usize,
     timeout: Duration,
+    accounting: &Arc<RunAccounting>,
 ) -> Result<u64, String> {
     let tracker = Arc::new(PhaseTracker::new(
         plan.create_targets(workload.resources.len()),
@@ -1305,16 +1827,22 @@ async fn run_create_phase(
                 operation: ResourceOperation::Create,
                 value: resource_value(spec, operation.id, 0),
                 pool: spec.lease_pool.clone(),
-                completion: Some(Arc::clone(&tracker)),
+                accounting: tracked_phase(
+                    accounting,
+                    if spec.behavior == ResourceBehavior::MasterLease {
+                        WorkClass::MasterLease
+                    } else {
+                        WorkClass::Create
+                    },
+                    Arc::clone(&tracker),
+                    operation.resource,
+                ),
             };
-            match time::timeout_at(deadline, senders[stable_shard(&key, workers)].send(item)).await
-            {
-                Ok(Ok(())) => {
-                    metrics::record_scheduled(Operation::Create, &label);
-                    scheduled += 1;
-                }
-                Ok(Err(_)) => return Err("create phase worker queue closed".to_string()),
-                Err(_) => return Err(tracker.deadline_error("create")),
+            metrics::record_scheduled(Operation::Create, &label);
+            match enqueue_until(&senders[stable_shard(&key, workers)], item, deadline).await {
+                EnqueueResult::Accepted => scheduled += 1,
+                EnqueueResult::Closed => return Err("create phase worker queue closed".to_string()),
+                EnqueueResult::Unissued => return Err(tracker.deadline_error("create")),
             }
         }
         tracker.wait_until("create", deadline).await?;
@@ -1341,6 +1869,7 @@ async fn run_update_phase(
     seed: u64,
     started: TokioInstant,
     duration: Duration,
+    accounting: Arc<RunAccounting>,
 ) -> Result<u64, String> {
     let total = plan.total_updates();
     let tracker = Arc::new(PhaseTracker::new(
@@ -1361,16 +1890,22 @@ async fn run_update_phase(
                 operation: ResourceOperation::GuaranteedUpdate,
                 value: resource_value(spec, operation.id, ordinal as u64 + 1),
                 pool: spec.lease_pool.clone(),
-                completion: Some(Arc::clone(&tracker)),
+                accounting: tracked_phase(
+                    &accounting,
+                    if spec.behavior == ResourceBehavior::MasterLease {
+                        WorkClass::MasterLease
+                    } else {
+                        WorkClass::Update
+                    },
+                    Arc::clone(&tracker),
+                    operation.resource,
+                ),
             };
-            match time::timeout_at(deadline, senders[stable_shard(&key, workers)].send(item)).await
-            {
-                Ok(Ok(())) => {
-                    metrics::record_scheduled(Operation::Update, &label);
-                    scheduled += 1;
-                }
-                Ok(Err(_)) => return Err("update phase worker queue closed".to_string()),
-                Err(_) => return Err(tracker.deadline_error("update")),
+            metrics::record_scheduled(Operation::Update, &label);
+            match enqueue_until(&senders[stable_shard(&key, workers)], item, deadline).await {
+                EnqueueResult::Accepted => scheduled += 1,
+                EnqueueResult::Closed => return Err("update phase worker queue closed".to_string()),
+                EnqueueResult::Unissued => return Err(tracker.deadline_error("update")),
             }
         }
         tracker.wait_until("update", deadline).await?;
@@ -1381,15 +1916,25 @@ async fn run_update_phase(
     result
 }
 
-fn try_enqueue(sender: &mpsc::Sender<WorkItem>, item: WorkItem, stats: &mut ScheduleStats) -> bool {
-    match sender.try_send(item) {
-        Ok(()) => true,
+fn try_enqueue(
+    sender: &mpsc::Sender<WorkItem>,
+    mut item: WorkItem,
+    stats: &mut ScheduleStats,
+) -> bool {
+    match sender.try_reserve() {
+        Ok(permit) => {
+            item.mark_accepted();
+            permit.send(item);
+            true
+        }
         Err(mpsc::error::TrySendError::Full(_)) => {
+            item.mark_dropped(DropReason::Backpressure);
             stats.dropped += 1;
             metrics::record_dropped(DropReason::Backpressure);
             false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
+            item.mark_dropped(DropReason::QueueClosed);
             stats.dropped += 1;
             metrics::record_dropped(DropReason::QueueClosed);
             false
@@ -1397,18 +1942,67 @@ fn try_enqueue(sender: &mpsc::Sender<WorkItem>, item: WorkItem, stats: &mut Sche
     }
 }
 
-pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<ScheduleStats, String> {
+fn application_targets(workload: &WorkloadSpec, plan: &WorkloadPlan) -> ApplicationTargets {
+    let mut targets = ApplicationTargets::default();
+    for resource in &plan.resources {
+        if workload.resources[resource.resource].behavior == ResourceBehavior::MasterLease {
+            continue;
+        }
+        targets.creates = targets.creates.saturating_add(resource.count);
+        targets.updates = targets
+            .updates
+            .saturating_add(resource.count.saturating_mul(resource.update_amplification));
+    }
+    targets
+}
+
+fn combine_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (first, None) | (None, first) => first,
+    }
+}
+
+pub async fn run(config: RuntimeConfig, client: ClientBundle) -> RunReport {
+    run_with_ctrl_c(config, client, Box::pin(tokio::signal::ctrl_c())).await
+}
+
+async fn run_with_ctrl_c(
+    config: RuntimeConfig,
+    client: ClientBundle,
+    mut ctrl_c: CtrlCFuture,
+) -> RunReport {
+    let accounting = RunAccounting::new();
     if config.queue_capacity < config.workers {
-        return Err(format!(
-            "queue_capacity ({}) must be at least workers ({})",
-            config.queue_capacity, config.workers
-        ));
+        return accounting.report(
+            RunTargets::default(),
+            false,
+            false,
+            Some(format!(
+                "queue_capacity ({}) must be at least workers ({})",
+                config.queue_capacity, config.workers
+            )),
+        );
     }
     let scheduler = Scheduler::new(&config);
+    let plan = match WorkloadPlan::build(&scheduler.workload) {
+        Ok(plan) => plan,
+        Err(error) => return accounting.report(RunTargets::default(), false, false, Some(error)),
+    };
+    let targets = RunTargets {
+        bootstrap: scheduler.nodes as u64
+            * if scheduler.workload.nodes.node_lease_enabled {
+                3
+            } else {
+                2
+            },
+        application: application_targets(&scheduler.workload, &plan),
+        range_requests: range_request_total(&scheduler.workload, scheduler.seed),
+    };
     let queue_capacity = config.queue_capacity.max(1);
     let workers_count = config.workers.max(1);
     let mut senders = Vec::with_capacity(workers_count);
-    let mut workers = Vec::with_capacity(workers_count);
+    let mut worker_tasks = JoinSet::new();
     let latest_revision = Arc::new(AtomicI64::new(0));
     let cas_conflicts = Arc::new(AtomicU64::new(config.workload.cas_conflicts));
     let lease_epoch = TokioInstant::now();
@@ -1437,7 +2031,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         let capacity = base_capacity + if worker_index < extra_capacity { 1 } else { 0 };
         let (tx, rx) = mpsc::channel(capacity.max(1));
         senders.push(tx);
-        workers.push(tokio::spawn(worker_loop(
+        worker_tasks.spawn(worker_loop(
             rx,
             client.clone(),
             config.workload.clone(),
@@ -1446,53 +2040,76 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             latest_revision.clone(),
             lease_epoch,
             cas_conflicts.clone(),
-        )));
+        ));
     }
+
     let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
         nodes: scheduler.nodes,
-        lease_interval: Duration::from_secs_f64(
-            scheduler.workload.nodes.lease_interval_s * scheduler.time_scale,
-        ),
+        lease_interval: Duration::from_secs_f64(scheduler.workload.nodes.lease_interval_s),
         lease_jitter: scheduler.workload.nodes.lease_jitter,
-        status_interval: Duration::from_secs_f64(
-            scheduler.workload.nodes.status_interval_s * scheduler.time_scale,
-        ),
+        status_interval: Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s),
         seed: scheduler.seed,
         node_lease_enabled: scheduler.workload.nodes.node_lease_enabled,
     });
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let mut bootstrap_interrupted = false;
     let mut bootstrap_acks = Vec::with_capacity(scheduler.nodes.saturating_mul(3));
-    'bootstrap_send: for item in planner.bootstrap() {
-        let shard = stable_shard(item.key.as_bytes(), workers_count);
+    'bootstrap_send: for heartbeat in planner.bootstrap() {
+        let shard = stable_shard(heartbeat.key.as_bytes(), workers_count);
         let (done_tx, done_rx) = oneshot::channel();
-        let resource = if matches!(item.kind, HeartbeatItemKind::NodeLeaseCreate) {
+        let resource = if matches!(heartbeat.kind, HeartbeatItemKind::NodeLeaseCreate) {
             ResourceName::new("node_leases")
         } else {
             ResourceName::new("nodes")
-        };
+        }
+        .expect("validated heartbeat metric label");
         let operation = if matches!(
-            item.kind,
+            heartbeat.kind,
             HeartbeatItemKind::NodeCreate | HeartbeatItemKind::NodeLeaseCreate
         ) {
             Operation::Create
         } else {
             Operation::Update
         };
-        let send_result = tokio::select! {
-            _ = &mut ctrl_c => {
-                bootstrap_interrupted = true;
-                break 'bootstrap_send;
+        let mut item = WorkItem::Bootstrap {
+            item: heartbeat,
+            done: done_tx,
+            accounting: tracked(&accounting, WorkClass::Bootstrap),
+        };
+        metrics::record_scheduled(operation, &resource);
+        stats.scheduled = stats.scheduled.saturating_add(1);
+        let send_result = {
+            let result = tokio::select! {
+                _ = &mut ctrl_c => {
+                    item.mark_unissued();
+                    bootstrap_interrupted = true;
+                    None
+                }
+                result = senders[shard].reserve() => Some(result),
+            };
+            match result {
+                Some(Ok(permit)) => {
+                    item.mark_accepted();
+                    permit.send(item);
+                    bootstrap_acks.push(done_rx);
+                    Ok(())
+                }
+                Some(Err(_)) => {
+                    item.mark_dropped(DropReason::QueueClosed);
+                    metrics::record_dropped(DropReason::QueueClosed);
+                    Err(())
+                }
+                None => break 'bootstrap_send,
             }
-            result = senders[shard].send(WorkItem::Bootstrap { item, done: done_tx }) => result,
         };
         if send_result.is_err() {
-            abort_workers(senders, workers, pools).await;
-            return Err("bootstrap worker closed".to_string());
+            abort_worker_tasks(senders, worker_tasks, pools).await;
+            return accounting.report(
+                targets,
+                false,
+                false,
+                Some("bootstrap worker queue closed".to_string()),
+            );
         }
-        metrics::record_scheduled(operation, &resource.unwrap());
-        stats.scheduled += 1;
-        bootstrap_acks.push(done_rx);
     }
     if !bootstrap_interrupted {
         'bootstrap_ack: for done_rx in bootstrap_acks {
@@ -1504,23 +2121,33 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 result = done_rx => result,
             };
             match result {
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    abort_workers(senders, workers, pools).await;
-                    return Err(format!("bootstrap: {error}"));
+                    abort_worker_tasks(senders, worker_tasks, pools).await;
+                    return accounting.report(
+                        targets,
+                        false,
+                        false,
+                        Some(format!("bootstrap: {error}")),
+                    );
                 }
                 Err(_) => {
-                    abort_workers(senders, workers, pools).await;
-                    return Err("bootstrap worker closed".to_string());
+                    abort_worker_tasks(senders, worker_tasks, pools).await;
+                    return accounting.report(
+                        targets,
+                        false,
+                        false,
+                        Some("bootstrap worker closed".to_string()),
+                    );
                 }
-                Ok(Ok(())) => {}
             }
         }
     }
     if !bootstrap_allows_main_load(bootstrap_interrupted) {
-        drain_workers(senders, workers, pools, config.operation_timeout).await?;
-        return Ok(stats);
+        abort_worker_tasks(senders, worker_tasks, pools).await;
+        return accounting.report(targets, true, false, None);
     }
-    let plan = WorkloadPlan::build(&scheduler.workload)?;
+
     let create_result = tokio::select! {
         _ = &mut ctrl_c => None,
         result = run_create_phase(
@@ -1529,21 +2156,49 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             &senders,
             workers_count,
             config.operation_timeout,
+            &accounting,
         ) => Some(result),
     };
     match create_result {
-        Some(Ok(scheduled)) => stats.scheduled += scheduled,
+        Some(Ok(scheduled)) => stats.scheduled = stats.scheduled.saturating_add(scheduled),
         Some(Err(error)) => {
-            abort_workers(senders, workers, pools).await;
-            return Err(error);
+            abort_worker_tasks(senders, worker_tasks, pools).await;
+            return accounting.report(targets, false, false, Some(error));
         }
         None => {
-            abort_workers(senders, workers, pools).await;
-            return Ok(stats);
+            abort_worker_tasks(senders, worker_tasks, pools).await;
+            return accounting.report(targets, true, false, None);
         }
     }
 
-    let (watch_shutdown, mut watch_tasks) = spawn_watches(&client, &scheduler.workload.watches);
+    let (watch_shutdown, mut watch_tasks, ready_receivers) =
+        spawn_watches(&client, &scheduler.workload.watches);
+    if let Err(error) = wait_for_watch_ready(
+        &mut watch_tasks,
+        ready_receivers,
+        config.operation_timeout,
+        &mut ctrl_c,
+    )
+    .await
+    {
+        let interrupted = error.starts_with("interrupted while waiting");
+        abort_worker_tasks(senders, worker_tasks, pools).await;
+        let (stop_result, interrupted) = stop_watches_with_ctrl(
+            watch_shutdown,
+            watch_tasks,
+            config.operation_timeout,
+            &mut ctrl_c,
+            interrupted,
+        )
+        .await;
+        return accounting.report(
+            targets,
+            interrupted,
+            false,
+            combine_errors(Some(error), stop_result.err()),
+        );
+    }
+
     let duration = scheduler.duration();
     let started = TokioInstant::now();
     let update_task = tokio::spawn(run_update_phase(
@@ -1554,13 +2209,9 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         scheduler.seed,
         started,
         duration,
+        Arc::clone(&accounting),
     ));
-    let mut ranges = RateCursor::new(
-        &scheduler.workload,
-        scheduler.time_scale,
-        scheduler.seed,
-        0xB2,
-    );
+    let mut ranges = RateCursor::new(&scheduler.workload, scheduler.seed, 0xB2);
     let mut range_producer = RangeProducer::new(scheduler.workload.ranges.iter().map(|r| r.weight));
     let weights: Vec<f64> = scheduler.workload.ranges.iter().map(|r| r.weight).collect();
     let prefix_total = exact_prefix_total(
@@ -1569,17 +2220,29 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         &scheduler.workload.ranges,
         ranges.total(),
     );
-    let mut range_shapes =
-        match range_shape_plan(&scheduler.workload, prefix_total, scheduler.time_scale) {
-            Ok(plan) => plan,
-            Err(error) => {
-                update_task.abort();
-                let _ = update_task.await;
-                stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
-                abort_workers(senders, workers, pools).await;
-                return Err(error);
-            }
-        };
+    let mut range_shapes = match range_shape_plan(&scheduler.workload, prefix_total) {
+        Ok(plan) => plan,
+        Err(error) => {
+            update_task.abort();
+            let _ = update_task.await;
+            abort_worker_tasks(senders, worker_tasks, pools).await;
+            let (stop_result, interrupted) = stop_watches_with_ctrl(
+                watch_shutdown,
+                watch_tasks,
+                config.operation_timeout,
+                &mut ctrl_c,
+                false,
+            )
+            .await;
+            return accounting.report(
+                targets,
+                interrupted,
+                false,
+                combine_errors(Some(error), stop_result.err()),
+            );
+        }
+    };
+    let mut update_task = Some(update_task);
     let mut heap = BinaryHeap::new();
     let mut sequence = 0u64;
     let push = |at: Duration,
@@ -1598,17 +2261,14 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
     if let Some((at, _)) = ranges.next() {
         push(at, 2, Source::Range, &mut heap, &mut sequence);
     }
-    let status_interval =
-        Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s * scheduler.time_scale);
+    let status_interval = Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s);
     if scheduler.workload.nodes.node_lease_enabled {
         for node in 0..scheduler.nodes {
             let lease_at = heartbeat_interval(
                 scheduler.seed,
                 node,
                 0,
-                Duration::from_secs_f64(
-                    scheduler.workload.nodes.lease_interval_s * scheduler.time_scale,
-                ),
+                Duration::from_secs_f64(scheduler.workload.nodes.lease_interval_s),
                 scheduler.workload.nodes.lease_jitter,
             );
             if lease_at <= duration {
@@ -1636,10 +2296,9 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             }
         }
     }
-    let master_lease_interval =
-        Duration::from_secs_f64(scheduler.workload.master_lease_interval_s * scheduler.time_scale);
+    let master_lease_interval = Duration::from_secs_f64(scheduler.workload.master_lease_interval_s);
     for (resource, spec) in scheduler.workload.resources.iter().enumerate() {
-        if spec.retry_policy == ConfigRetryPolicy::MasterLease {
+        if spec.behavior == ResourceBehavior::MasterLease {
             let count = scheduler
                 .workload
                 .resource_count(spec)
@@ -1671,8 +2330,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             &mut sequence,
         );
     }
-    let compact_interval =
-        Duration::from_secs_f64(scheduler.workload.compact_interval_s * scheduler.time_scale);
+    let compact_interval = Duration::from_secs_f64(scheduler.workload.compact_interval_s);
     if compact_interval <= duration {
         push(
             compact_interval,
@@ -1683,34 +2341,43 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
         );
     }
     push(duration, 5, Source::PhaseEnd, &mut heap, &mut sequence);
+
     let mut interrupted = false;
-    let mut ctrl_c: CtrlCFuture = Box::pin(tokio::signal::ctrl_c());
-    while let Some(event) = heap.pop() {
+    let mut schedule_error = None;
+    while let Some(event) = heap.peek().copied() {
         let deadline = started + event.at;
-        let control = match wait_for_schedule_event(&mut watch_tasks, deadline, &mut ctrl_c).await {
+        let control = match wait_for_supervised_schedule_event(
+            &mut watch_tasks,
+            &mut worker_tasks,
+            &mut update_task,
+            deadline,
+            &mut ctrl_c,
+        )
+        .await
+        {
             Ok(control) => control,
             Err(error) => {
-                update_task.abort();
-                let _ = update_task.await;
-                cleanup_watch_failure(
-                    watch_shutdown,
-                    watch_tasks,
-                    senders,
-                    workers,
-                    pools,
-                    config.operation_timeout,
-                )
-                .await;
-                return Err(error);
+                schedule_error = Some(error);
+                break;
             }
         };
         match control {
-            ScheduleControl::Deadline => {}
-            ScheduleControl::Interrupted => {
+            SupervisedScheduleControl::Deadline => {
+                heap.pop();
+            }
+            SupervisedScheduleControl::Interrupted => {
                 interrupted = true;
                 break;
             }
-            ScheduleControl::WatchCompleted => continue,
+            SupervisedScheduleControl::UpdateFinished(result) => {
+                update_task.take();
+                if let Err(error) = result {
+                    schedule_error = Some(error);
+                    break;
+                }
+                // A completed producer must not consume the pending timed event.
+                continue;
+            }
         }
         match event.source {
             Source::PhaseEnd => {}
@@ -1724,11 +2391,9 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     if scheduler.workload.ranges[index].kind == "prefix" {
                         range_shapes.apply(&mut request);
                     }
-                    metrics::record_scheduled(
-                        Operation::Read,
-                        &ResourceName::new("range").unwrap(),
-                    );
-                    stats.scheduled += 1;
+                    let label = ResourceName::new("range").expect("static metric label");
+                    metrics::record_scheduled(Operation::Read, &label);
+                    stats.scheduled = stats.scheduled.saturating_add(1);
                     try_enqueue(
                         &senders[stable_shard(&request.key, workers_count)],
                         WorkItem::Range {
@@ -1736,6 +2401,7 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                             selector_keep_every: scheduler.workload.ranges[index]
                                 .selector_keep_every,
                             target: scheduler.workload.ranges[index].limit,
+                            accounting: tracked(&accounting, WorkClass::Range),
                         },
                         &mut stats,
                     );
@@ -1749,21 +2415,23 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 let spec = &scheduler.workload.resources[resource];
                 let operation = ResourceOperation::GuaranteedUpdate;
                 let key = resource_key(spec, id);
-                let label =
-                    ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
-                metrics::record_scheduled(operation_metric(operation), &label);
-                stats.scheduled += 1;
-                let item = WorkItem::Txn {
-                    resource,
-                    key: key.clone(),
-                    operation,
-                    value: resource_value(spec, id, ordinal),
-                    pool: spec.lease_pool.clone(),
-                    completion: None,
+                let label = ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string());
+                let Ok(label) = label else {
+                    schedule_error = Some("masterlease metric label is invalid".to_string());
+                    break;
                 };
+                metrics::record_scheduled(operation_metric(operation), &label);
+                stats.scheduled = stats.scheduled.saturating_add(1);
                 try_enqueue(
                     &senders[stable_shard(&key, workers_count)],
-                    item,
+                    WorkItem::Txn {
+                        resource,
+                        key: key.clone(),
+                        operation,
+                        value: resource_value(spec, id, ordinal),
+                        pool: spec.lease_pool.clone(),
+                        accounting: tracked(&accounting, WorkClass::MasterLease),
+                    },
                     &mut stats,
                 );
                 if let Some(at) = masterlease_tick_at(master_lease_interval, ordinal + 1, duration)
@@ -1789,23 +2457,22 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     at: event.at,
                 };
                 let key = item.key.clone();
-                metrics::record_scheduled(
-                    Operation::Update,
-                    &ResourceName::new("node_leases").unwrap(),
-                );
-                stats.scheduled += 1;
+                let label = ResourceName::new("node_leases").expect("static metric label");
+                metrics::record_scheduled(Operation::Update, &label);
+                stats.scheduled = stats.scheduled.saturating_add(1);
                 try_enqueue(
                     &senders[stable_shard(key.as_bytes(), workers_count)],
-                    WorkItem::Heartbeat(item),
+                    WorkItem::Heartbeat {
+                        item,
+                        accounting: tracked(&accounting, WorkClass::Heartbeat),
+                    },
                     &mut stats,
                 );
                 let next = event.at.saturating_add(heartbeat_interval(
                     scheduler.seed,
                     node,
                     event.sequence,
-                    Duration::from_secs_f64(
-                        scheduler.workload.nodes.lease_interval_s * scheduler.time_scale,
-                    ),
+                    Duration::from_secs_f64(scheduler.workload.nodes.lease_interval_s),
                     scheduler.workload.nodes.lease_jitter,
                 ));
                 if next <= duration {
@@ -1820,11 +2487,15 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     at: event.at,
                 };
                 let key = item.key.clone();
-                metrics::record_scheduled(Operation::Update, &ResourceName::new("nodes").unwrap());
-                stats.scheduled += 1;
+                let label = ResourceName::new("nodes").expect("static metric label");
+                metrics::record_scheduled(Operation::Update, &label);
+                stats.scheduled = stats.scheduled.saturating_add(1);
                 try_enqueue(
                     &senders[stable_shard(key.as_bytes(), workers_count)],
-                    WorkItem::Heartbeat(item),
+                    WorkItem::Heartbeat {
+                        item,
+                        accounting: tracked(&accounting, WorkClass::Heartbeat),
+                    },
                     &mut stats,
                 );
                 let next_at = event.at.saturating_add(status_interval);
@@ -1843,13 +2514,17 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             }
             Source::Status(index) => {
                 if index <= status_total {
-                    metrics::record_scheduled(
-                        Operation::Read,
-                        &ResourceName::new("status").unwrap(),
-                    );
-                    stats.scheduled += 1;
+                    let label = ResourceName::new("status").expect("static metric label");
+                    metrics::record_scheduled(Operation::Read, &label);
+                    stats.scheduled = stats.scheduled.saturating_add(1);
                     let shard = index as usize % workers_count;
-                    try_enqueue(&senders[shard], WorkItem::Status, &mut stats);
+                    try_enqueue(
+                        &senders[shard],
+                        WorkItem::Status {
+                            accounting: tracked(&accounting, WorkClass::Status),
+                        },
+                        &mut stats,
+                    );
                     if index < status_total {
                         push(
                             duration.mul_f64((index + 1) as f64 / status_total as f64),
@@ -1862,7 +2537,8 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                 }
             }
             Source::Compact(tick) => {
-                let compact_key = ResourceName::new("compact_rev_key").unwrap();
+                let compact_key =
+                    ResourceName::new("compact_rev_key").expect("static metric label");
                 metrics::record_scheduled(
                     if tick == 0 {
                         Operation::Create
@@ -1871,10 +2547,12 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
                     },
                     &compact_key,
                 );
-                stats.scheduled += 1;
+                stats.scheduled = stats.scheduled.saturating_add(1);
                 try_enqueue(
                     &senders[stable_shard(b"compact_rev_key", workers_count)],
-                    WorkItem::CompactTick,
+                    WorkItem::CompactTick {
+                        accounting: tracked(&accounting, WorkClass::Compact),
+                    },
                     &mut stats,
                 );
                 let next = event.at.saturating_add(compact_interval);
@@ -1884,30 +2562,76 @@ pub async fn run(config: RuntimeConfig, client: ClientBundle) -> Result<Schedule
             }
         }
     }
-    if interrupted {
-        update_task.abort();
-        let _ = update_task.await;
-        stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
-        abort_workers(senders, workers, pools).await;
-        return Ok(stats);
+
+    let schedule_complete = !interrupted && schedule_error.is_none() && heap.is_empty();
+    let join_deadline = TokioInstant::now() + config.operation_timeout;
+    while !interrupted && schedule_error.is_none() && update_task.is_some() {
+        match wait_for_supervised_schedule_event(
+            &mut watch_tasks,
+            &mut worker_tasks,
+            &mut update_task,
+            join_deadline,
+            &mut ctrl_c,
+        )
+        .await
+        {
+            Ok(SupervisedScheduleControl::UpdateFinished(result)) => {
+                update_task.take();
+                schedule_error = result.err();
+            }
+            Ok(SupervisedScheduleControl::Interrupted) => interrupted = true,
+            Ok(SupervisedScheduleControl::Deadline) => {
+                schedule_error = Some("update phase join timed out".to_string());
+            }
+            Err(error) => schedule_error = Some(error),
+        }
     }
-    let update_result = match update_task.await {
-        Ok(Ok(scheduled)) => scheduled,
-        Ok(Err(error)) => {
-            stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
-            abort_workers(senders, workers, pools).await;
-            return Err(error);
+    if interrupted || schedule_error.is_some() {
+        if let Some(task) = update_task.take() {
+            task.abort();
+            let _ = task.await;
         }
-        Err(error) => {
-            stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
-            abort_workers(senders, workers, pools).await;
-            return Err(format!("update phase task failed: {error}"));
-        }
-    };
-    stop_watches(watch_shutdown, watch_tasks, config.operation_timeout).await;
-    drain_workers(senders, workers, pools, config.operation_timeout).await?;
-    stats.scheduled += update_result;
-    Ok(stats)
+        abort_worker_tasks(senders, worker_tasks, pools).await;
+        let (stop_result, interrupted) = stop_watches_with_ctrl(
+            watch_shutdown,
+            watch_tasks,
+            config.operation_timeout,
+            &mut ctrl_c,
+            interrupted,
+        )
+        .await;
+        return accounting.report(
+            targets,
+            interrupted,
+            schedule_complete,
+            combine_errors(schedule_error, stop_result.err()),
+        );
+    }
+
+    // Keep watches live while accepted work drains; both teardown stages
+    // continue observing the same cancellation future used during dispatch.
+    let (drain_result, interrupted) = drain_worker_tasks(
+        senders,
+        worker_tasks,
+        pools,
+        config.operation_timeout,
+        &mut ctrl_c,
+    )
+    .await;
+    let (stop_result, interrupted) = stop_watches_with_ctrl(
+        watch_shutdown,
+        watch_tasks,
+        config.operation_timeout,
+        &mut ctrl_c,
+        interrupted,
+    )
+    .await;
+    accounting.report(
+        targets,
+        interrupted,
+        schedule_complete,
+        combine_errors(drain_result.err(), stop_result.err()),
+    )
 }
 fn bootstrap_allows_main_load(interrupted: bool) -> bool {
     !interrupted
@@ -1917,61 +2641,111 @@ fn update_revision(latest_revision: &AtomicI64, revision: i64) {
     let previous = latest_revision.fetch_max(revision, AtomicOrdering::Relaxed);
     metrics::set_revision(previous.max(revision));
 }
-async fn cleanup_watch_failure(
-    watch_shutdown: shutdown_watch::Sender<bool>,
-    watch_tasks: JoinSet<WatchTaskOutput>,
+
+async fn abort_worker_tasks(
     senders: Vec<mpsc::Sender<WorkItem>>,
-    workers: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    mut worker_tasks: JoinSet<Result<(), String>>,
     pools: Arc<HashMap<String, Arc<SharedPool>>>,
-    timeout: Duration,
 ) {
-    abort_workers(senders, workers, pools).await;
-    stop_watches(watch_shutdown, watch_tasks, timeout).await;
+    drop(senders);
+    worker_tasks.abort_all();
+    while worker_tasks.join_next().await.is_some() {}
+    drop(pools);
 }
 
-async fn drain_workers(
+async fn drain_worker_tasks(
     senders: Vec<mpsc::Sender<WorkItem>>,
-    workers: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    mut worker_tasks: JoinSet<Result<(), String>>,
     pools: Arc<HashMap<String, Arc<SharedPool>>>,
     timeout: Duration,
-) -> Result<(), String> {
+    ctrl_c: &mut CtrlCFuture,
+) -> (Result<(), String>, bool) {
     drop(senders);
-    let drain_deadline = TokioInstant::now() + timeout;
+    let deadline = TokioInstant::now() + timeout;
     let mut errors = Vec::new();
-    for (index, worker) in workers.into_iter().enumerate() {
-        let mut worker = worker;
-        match time::timeout_at(drain_deadline, &mut worker).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => errors.push(format!("worker {index}: {error}")),
-            Ok(Err(error)) => errors.push(format!("worker {index} join failed: {error}")),
-            Err(_) => {
-                worker.abort();
-                let _ = worker.await;
-                errors.push(format!("worker {index} drain timed out"));
+    let mut interrupted = false;
+    while !worker_tasks.is_empty() {
+        if interrupted {
+            worker_tasks.abort_all();
+            while worker_tasks.join_next().await.is_some() {}
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = ctrl_c.as_mut() => {
+                interrupted = true;
+            }
+            result = worker_tasks.join_next() => {
+                match result {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => {
+                        push_bounded_error(&mut errors, format!("worker failed: {error}"));
+                    }
+                    Some(Err(error)) => {
+                        push_bounded_error(&mut errors, format!("worker task failed: {error}"));
+                    }
+                    None => break,
+                }
+            }
+            _ = time::sleep_until(deadline) => {
+                worker_tasks.abort_all();
+                while worker_tasks.join_next().await.is_some() {}
+                push_bounded_error(&mut errors, "worker drain timed out".to_string());
+                break;
             }
         }
     }
     drop(pools);
-    if errors.is_empty() {
+    let result = if errors.is_empty() {
         Ok(())
     } else {
         Err(errors.join("; "))
-    }
+    };
+    (result, interrupted)
 }
 
-async fn abort_workers(
-    senders: Vec<mpsc::Sender<WorkItem>>,
-    workers: Vec<tokio::task::JoinHandle<Result<(), String>>>,
-    pools: Arc<HashMap<String, Arc<SharedPool>>>,
-) {
-    drop(senders);
-    for worker in &workers {
-        worker.abort();
+async fn stop_watches_with_ctrl(
+    shutdown: shutdown_watch::Sender<bool>,
+    mut tasks: JoinSet<WatchTaskOutput>,
+    timeout: Duration,
+    ctrl_c: &mut CtrlCFuture,
+    mut interrupted: bool,
+) -> (Result<(), String>, bool) {
+    let _ = shutdown.send(true);
+    let deadline = TokioInstant::now() + timeout;
+    let mut errors = Vec::new();
+    while !tasks.is_empty() {
+        tokio::select! {
+            biased;
+            _ = ctrl_c.as_mut(), if !interrupted => interrupted = true,
+            result = tasks.join_next() => {
+                match result {
+                    Some(Ok((name, result))) => {
+                        if let Some(error) = watch_failure(&name, result) {
+                            push_bounded_error(&mut errors, error);
+                        }
+                    }
+                    Some(Err(error)) => push_bounded_error(
+                        &mut errors,
+                        format!("watch task failed during shutdown: {error}"),
+                    ),
+                    None => break,
+                }
+            }
+            _ = time::sleep_until(deadline) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                push_bounded_error(&mut errors, "watch shutdown timed out".to_string());
+                break;
+            }
+        }
     }
-    for worker in workers {
-        let _ = worker.await;
-    }
-    drop(pools);
+    let result = if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    };
+    (result, interrupted)
 }
 
 fn lease_pool(spec: &EtcdLeasePoolSpec) -> LeasePool {
@@ -1994,7 +2768,8 @@ async fn worker_loop(
 ) -> Result<(), String> {
     let mut states = HashMap::new();
     let mut compactor = CompactorState::default();
-    while let Some(item) = receiver.recv().await {
+    while let Some(mut item) = receiver.recv().await {
+        item.record_dequeue();
         match item {
             WorkItem::Txn {
                 resource,
@@ -2002,14 +2777,21 @@ async fn worker_loop(
                 operation,
                 value,
                 pool,
-                completion,
+                mut accounting,
             } => {
-                let spec = workload
-                    .resources
-                    .get(resource)
-                    .ok_or_else(|| format!("unknown resource index {resource}"))?;
-                let label = ResourceName::try_from(spec.name.as_str())
-                    .map_err(|error| error.to_string())?;
+                let spec = workload.resources.get(resource).ok_or_else(|| {
+                    let error = format!("unknown resource index {resource}");
+                    accounting
+                        .accounting
+                        .note_error(accounting.class, error.clone());
+                    error
+                })?;
+                let label = ResourceName::try_from(spec.name.as_str()).map_err(|error| {
+                    accounting
+                        .accounting
+                        .note_error(accounting.class, error.to_string());
+                    error.to_string()
+                })?;
                 let operation_started = Instant::now();
                 let lease_pool = if operation.uses_native_lease() {
                     pool.as_deref()
@@ -2035,23 +2817,27 @@ async fn worker_loop(
                     value,
                     operation,
                     inject_conflict,
-                    retry_policy(spec),
-                    CasRetryPolicy::generic_controller(),
-                    spec.retry_policy == ConfigRetryPolicy::MasterLease,
+                    CasRetryPolicy::until_deadline(),
+                    spec.behavior == ResourceBehavior::MasterLease,
                     remaining_timeout,
                     lease_pool,
                     lease_epoch,
                     latest_revision.clone(),
                 )
                 .await;
-                if let Some(completion) = completion {
-                    completion.record(resource, outcome);
+                if outcome != Outcome::Success {
+                    accounting.accounting.note_error(
+                        accounting.class,
+                        format!("transaction outcome: {}", outcome.as_str()),
+                    );
                 }
+                accounting.mark_complete(outcome);
             }
             WorkItem::Range {
                 request,
                 selector_keep_every,
                 target,
+                mut accounting,
             } => {
                 let selector = configured_range_selector(selector_keep_every, target);
                 let label = ResourceName::new("range").unwrap();
@@ -2076,14 +2862,21 @@ async fn worker_loop(
                         Outcome::Success
                     }
                     Err(error) => {
-                        let _ = error.message;
+                        accounting
+                            .accounting
+                            .note_error(WorkClass::Range, error.message.clone());
                         error.outcome
                     }
                 };
                 metrics::record_operation(Operation::Read, &label, outcome);
+                accounting.mark_complete(outcome);
             }
-            WorkItem::Bootstrap { item, done } => {
-                let result = execute_heartbeat(
+            WorkItem::Bootstrap {
+                item,
+                done,
+                mut accounting,
+            } => {
+                let outcome = execute_heartbeat(
                     &client,
                     &mut states,
                     item,
@@ -2093,10 +2886,25 @@ async fn worker_loop(
                     latest_revision.clone(),
                 )
                 .await;
+                if outcome != Outcome::Success {
+                    accounting.accounting.note_error(
+                        WorkClass::Bootstrap,
+                        format!("heartbeat outcome: {}", outcome.as_str()),
+                    );
+                }
+                accounting.mark_complete(outcome);
+                let result = if outcome == Outcome::Success {
+                    Ok(())
+                } else {
+                    Err(format!("heartbeat failed: {}", outcome.as_str()))
+                };
                 let _ = done.send(result);
             }
-            WorkItem::Heartbeat(item) => {
-                let _ = execute_heartbeat(
+            WorkItem::Heartbeat {
+                item,
+                mut accounting,
+            } => {
+                let outcome = execute_heartbeat(
                     &client,
                     &mut states,
                     item,
@@ -2106,15 +2914,37 @@ async fn worker_loop(
                     latest_revision.clone(),
                 )
                 .await;
+                if outcome != Outcome::Success {
+                    accounting.accounting.note_error(
+                        WorkClass::Heartbeat,
+                        format!("heartbeat outcome: {}", outcome.as_str()),
+                    );
+                }
+                accounting.mark_complete(outcome);
             }
-            WorkItem::Status => {
+            WorkItem::Status { mut accounting } => {
                 let label = ResourceName::new("status").unwrap();
                 let outcome = execute_status(&client, timeout, latest_revision.clone()).await;
+                if outcome != Outcome::Success {
+                    accounting.accounting.note_error(
+                        WorkClass::Status,
+                        format!("status outcome: {}", outcome.as_str()),
+                    );
+                }
                 metrics::record_operation(Operation::Read, &label, outcome);
+                accounting.mark_complete(outcome);
             }
-            WorkItem::CompactTick => {
-                execute_compact_tick(&client, &mut compactor, timeout, latest_revision.clone())
-                    .await;
+            WorkItem::CompactTick { mut accounting } => {
+                let outcome =
+                    execute_compact_tick(&client, &mut compactor, timeout, latest_revision.clone())
+                        .await;
+                if outcome != Outcome::Success {
+                    accounting.accounting.note_error(
+                        WorkClass::Compact,
+                        format!("compact tick outcome: {}", outcome.as_str()),
+                    );
+                }
+                accounting.mark_complete(outcome);
             }
         }
     }
@@ -2179,7 +3009,7 @@ async fn execute_compact_tick(
     compactor: &mut CompactorState,
     timeout: Duration,
     latest_revision: Arc<AtomicI64>,
-) {
+) -> Outcome {
     let (coordination_version, previous_txn_header_revision) = compactor.txn_inputs();
     let value = previous_txn_header_revision.to_string();
     let label = ResourceName::new("compact_rev_key").unwrap();
@@ -2193,7 +3023,7 @@ async fn execute_compact_tick(
     let deadline = Instant::now() + timeout;
     if timeout.is_zero() {
         metrics::record_operation(operation, &label, Outcome::Timeout);
-        return;
+        return Outcome::Timeout;
     }
 
     let request = build_compact_revision_txn(value.as_bytes(), coordination_version);
@@ -2218,12 +3048,12 @@ async fn execute_compact_tick(
             };
             metrics::record_request(Rpc::Txn, outcome);
             metrics::record_operation(operation, &label, outcome);
-            return;
+            return outcome;
         }
         Err(_) => {
             metrics::record_request(Rpc::Txn, Outcome::ResultUnknown);
             metrics::record_operation(operation, &label, Outcome::ResultUnknown);
-            return;
+            return Outcome::ResultUnknown;
         }
     };
 
@@ -2237,7 +3067,7 @@ async fn execute_compact_tick(
             metrics::record_compactor_error(error.as_metric());
             metrics::set_compactor_state(compactor.status.as_metric());
             metrics::record_operation(operation, &label, Outcome::GrpcError);
-            return;
+            return Outcome::GrpcError;
         }
     };
     metrics::set_compactor_state(compactor.status.as_metric());
@@ -2258,25 +3088,25 @@ async fn execute_compact_tick(
         },
     );
     if !observation.succeeded {
-        // A CAS conflict is coordination, not a business-object retry.  The
+        // A CAS conflict is coordination, not a business-object retry. The
         // embedded Range supplies both the next logical version and the
         // revision another compactor already published.
         if let Some(revision) = observation.remote_compact_revision {
             metrics::set_compact_revision(revision);
         }
         metrics::record_operation(operation, &label, Outcome::Success);
-        return;
+        return Outcome::Success;
     }
     metrics::record_operation(operation, &label, Outcome::Success);
 
     let Some(revision) = observation.compact_target else {
-        return;
+        return Outcome::Success;
     };
     let compact = ResourceName::new("compact").unwrap();
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         metrics::record_operation(Operation::Compact, &compact, Outcome::Timeout);
-        return;
+        return Outcome::Timeout;
     }
     let start = Instant::now();
     metrics::add_inflight(Rpc::Compact);
@@ -2313,6 +3143,7 @@ async fn execute_compact_tick(
     metrics::record_request(Rpc::Compact, outcome);
     metrics::record_compact(outcome);
     metrics::record_operation(Operation::Compact, &compact, outcome);
+    outcome
 }
 async fn acquire_lease(
     shared: &SharedPool,
@@ -2411,19 +3242,6 @@ async fn acquire_lease(
         }
     }
 }
-fn retry_policy(spec: &ResourceSpec) -> CasRetryPolicy {
-    match spec.retry_policy {
-        ConfigRetryPolicy::CreateOnly => CasRetryPolicy {
-            max_attempts: 1,
-            delay: Duration::ZERO,
-            jitter_ratio: 0.0,
-        },
-        ConfigRetryPolicy::GuaranteedUpdate
-        | ConfigRetryPolicy::ConditionalDelete
-        | ConfigRetryPolicy::MasterLease => CasRetryPolicy::generic_controller(),
-        ConfigRetryPolicy::Event => CasRetryPolicy::event(),
-    }
-}
 fn operation_metric(op: ResourceOperation) -> Operation {
     match op {
         ResourceOperation::Create => Operation::Create,
@@ -2459,18 +3277,6 @@ fn take_storage_attempt(used: &mut u32, limit: u32) -> bool {
     *used = used.saturating_add(1);
     true
 }
-fn cas_retry_delay(
-    policy: CasRetryPolicy,
-    key: &[u8],
-    attempt: u32,
-    remaining: Duration,
-) -> Option<Duration> {
-    let seed = key
-        .iter()
-        .fold(0u64, |state, byte| splitmix(state ^ u64::from(*byte)));
-    let delay = policy.delay_for(seed, attempt);
-    (delay < remaining).then_some(delay)
-}
 
 async fn execute_txn(
     client: &ClientBundle,
@@ -2480,7 +3286,6 @@ async fn execute_txn(
     value: Vec<u8>,
     operation: ResourceOperation,
     mut inject_conflict: bool,
-    _transport_policy: CasRetryPolicy,
     cas_policy: CasRetryPolicy,
     recreate_missing: bool,
     timeout: Duration,
@@ -2497,8 +3302,8 @@ async fn execute_txn(
         storage_operation_for_state(operation, &state, recreate_missing)
     else {
         metrics::record_txn(label, shape(operation), TxnResult::Conflict);
-        metrics::record_operation(operation_metric(operation), label, Outcome::GrpcError);
-        return Outcome::GrpcError;
+        metrics::record_operation(operation_metric(operation), label, Outcome::NotFound);
+        return Outcome::NotFound;
     };
     loop {
         if Instant::now() >= deadline {
@@ -2525,8 +3330,8 @@ async fn execute_txn(
         let mut cas = CasLoop::new(attempt.clone(), cas_policy, deadline);
         loop {
             if !take_storage_attempt(&mut storage_attempts, cas_policy.max_attempts) {
-                metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
-                return Outcome::Timeout;
+                metrics::record_operation(operation_metric(operation), label, Outcome::Conflict);
+                return Outcome::Conflict;
             }
             // Kubernetes etcd3 gets a lease inside each Put attempt; a CAS
             // retry may therefore reuse or obtain a different lease.
@@ -2628,25 +3433,12 @@ async fn execute_txn(
                     metrics::record_operation(
                         operation_metric(operation),
                         label,
-                        Outcome::GrpcError,
+                        Outcome::Conflict,
                     );
-                    return Outcome::GrpcError;
+                    return Outcome::Conflict;
                 }
                 CasDecision::Retry { latest, .. } => {
                     metrics::record_cas_retry(label, operation_metric(operation));
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let Some(delay) = cas_retry_delay(cas_policy, &key, attempt.number, remaining)
-                    else {
-                        metrics::record_operation(
-                            operation_metric(operation),
-                            label,
-                            Outcome::Timeout,
-                        );
-                        return Outcome::Timeout;
-                    };
-                    if !delay.is_zero() {
-                        time::sleep(delay).await;
-                    }
                     current_value = if storage_operation == ResourceOperation::ConditionalDelete {
                         Vec::new()
                     } else {
@@ -2656,9 +3448,9 @@ async fn execute_txn(
                         metrics::record_operation(
                             operation_metric(operation),
                             label,
-                            Outcome::GrpcError,
+                            Outcome::NotFound,
                         );
-                        return Outcome::GrpcError;
+                        return Outcome::NotFound;
                     };
                     attempt = next.clone();
                 }
@@ -2672,9 +3464,14 @@ async fn execute_txn(
                     storage_operation = ResourceOperation::Create;
                     break;
                 }
-                CasDecision::Exhausted { .. } => {
-                    metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
-                    return Outcome::Timeout;
+                CasDecision::Exhausted { reason, .. } => {
+                    let outcome = match reason {
+                        ExhaustedReason::CancelledOrDeadline => Outcome::Timeout,
+                        ExhaustedReason::MissingFailureKey => Outcome::NotFound,
+                        ExhaustedReason::RetryPolicy => Outcome::Conflict,
+                    };
+                    metrics::record_operation(operation_metric(operation), label, outcome);
+                    return outcome;
                 }
             }
         }
@@ -2695,7 +3492,7 @@ async fn execute_heartbeat(
     status_retry_limit: u32,
     lease_retry_limit: u32,
     latest_revision: Arc<AtomicI64>,
-) -> Result<(), String> {
+) -> Outcome {
     let (resource, kind) = match item.kind {
         HeartbeatItemKind::NodeCreate
         | HeartbeatItemKind::NodeReady
@@ -2725,26 +3522,17 @@ async fn execute_heartbeat(
         count: ResourceCountSpec::Fixed { count: 1 },
         update_amplification: 1,
         value_size_bytes: if resource == "nodes" { 2048 } else { 256 },
-        retry_policy: ConfigRetryPolicy::GuaranteedUpdate,
+        behavior: ResourceBehavior::GuaranteedUpdate,
         lease_pool: None,
     };
-    let label = ResourceName::try_from(resource).map_err(|e| e.to_string())?;
-    let mut policy = if matches!(item.kind, HeartbeatItemKind::NodeStatus) {
-        CasRetryPolicy::node_status()
-    } else if matches!(item.kind, HeartbeatItemKind::NodeLeaseRenew) {
-        CasRetryPolicy::node_lease()
-    } else {
-        CasRetryPolicy {
-            max_attempts: 1,
-            delay: Duration::ZERO,
-            jitter_ratio: 0.0,
-        }
+    let label = ResourceName::try_from(resource).expect("static heartbeat metric label");
+    let policy = CasRetryPolicy {
+        max_attempts: match item.kind {
+            HeartbeatItemKind::NodeStatus => status_retry_limit.max(1),
+            HeartbeatItemKind::NodeLeaseRenew => lease_retry_limit.max(1),
+            _ => 1,
+        },
     };
-    if matches!(item.kind, HeartbeatItemKind::NodeStatus) {
-        policy.max_attempts = status_retry_limit.max(1);
-    } else if matches!(item.kind, HeartbeatItemKind::NodeLeaseRenew) {
-        policy.max_attempts = lease_retry_limit.max(1);
-    }
     let outcome = execute_txn(
         client,
         &label,
@@ -2754,7 +3542,6 @@ async fn execute_heartbeat(
         operation,
         false,
         policy,
-        policy,
         false,
         timeout,
         None,
@@ -2763,20 +3550,21 @@ async fn execute_heartbeat(
     )
     .await;
     metrics::record_node_heartbeat(kind, outcome);
-    if outcome != Outcome::Success {
-        return Err(format!("heartbeat {kind:?} failed: {outcome:?}"));
-    }
-    Ok(())
+    outcome
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::pb::etcdserverpb::ResponseOp;
-    use crate::pb::mvccpb;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
+
     use tokio::sync::oneshot;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
+
+    use super::*;
+    use crate::pb::etcdserverpb::ResponseOp;
+    use crate::pb::etcdserverpb::compare::TargetUnion;
+    use crate::pb::mvccpb;
 
     #[derive(Clone)]
     struct LeaseTxnProbe {
@@ -2963,18 +3751,53 @@ mod tests {
     #[derive(Clone, Default)]
     struct CreatePhaseProbe {
         requests: Arc<std::sync::Mutex<Vec<crate::pb::etcdserverpb::TxnRequest>>>,
+        txn_replies:
+            Arc<std::sync::Mutex<VecDeque<oneshot::Receiver<Result<TxnResponse, tonic::Status>>>>>,
+        txn_entered: Arc<Notify>,
+        range_requests: Arc<std::sync::Mutex<Vec<RangeRequest>>>,
+        range_reply: Arc<std::sync::Mutex<Option<crate::pb::etcdserverpb::RangeResponse>>>,
+        compact_requests: Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
+    }
+
+    impl CreatePhaseProbe {
+        fn next_txn_reply(&self) -> oneshot::Sender<Result<TxnResponse, tonic::Status>> {
+            let (sender, receiver) = oneshot::channel();
+            self.txn_replies.lock().unwrap().push_back(receiver);
+            sender
+        }
+
+        async fn wait_for_txns(&self, count: usize) {
+            time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let notified = self.txn_entered.notified();
+                    if self.requests.lock().unwrap().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("probe did not receive the expected Txn");
+        }
     }
 
     #[tonic::async_trait]
     impl crate::pb::etcdserverpb::kv_server::Kv for CreatePhaseProbe {
         async fn range(
             &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::RangeRequest>,
+            request: tonic::Request<crate::pb::etcdserverpb::RangeRequest>,
         ) -> Result<tonic::Response<crate::pb::etcdserverpb::RangeResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented(
-                "range is not part of this probe",
-            ))
+            self.range_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            self.range_reply
+                .lock()
+                .unwrap()
+                .clone()
+                .map(tonic::Response::new)
+                .ok_or_else(|| tonic::Status::unimplemented("unscripted Range"))
         }
 
         async fn put(
@@ -3000,26 +3823,235 @@ mod tests {
             &self,
             request: tonic::Request<crate::pb::etcdserverpb::TxnRequest>,
         ) -> Result<tonic::Response<crate::pb::etcdserverpb::TxnResponse>, tonic::Status> {
-            let mut requests = self.requests.lock().unwrap();
-            requests.push(request.into_inner());
-            Ok(tonic::Response::new(crate::pb::etcdserverpb::TxnResponse {
-                header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                    revision: requests.len() as i64,
-                    ..Default::default()
-                }),
-                succeeded: true,
-                ..Default::default()
-            }))
+            let revision = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.into_inner());
+                requests.len() as i64
+            };
+            let reply = self.txn_replies.lock().unwrap().pop_front();
+            self.txn_entered.notify_one();
+            match reply {
+                Some(reply) => reply
+                    .await
+                    .expect("test dropped a scripted Txn response")
+                    .map(tonic::Response::new),
+                None => Ok(tonic::Response::new(compact_response(
+                    revision, true, 0, b"",
+                ))),
+            }
         }
 
         async fn compact(
             &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::CompactionRequest>,
+            request: tonic::Request<crate::pb::etcdserverpb::CompactionRequest>,
         ) -> Result<tonic::Response<crate::pb::etcdserverpb::CompactionResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented(
-                "compact is not part of this probe",
+            self.compact_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            Err(tonic::Status::permission_denied(
+                "compaction denied after journal commit",
             ))
+        }
+    }
+
+    async fn start_create_probe(
+        probe: CreatePhaseProbe,
+    ) -> (ClientBundle, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(probe))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let client = ClientBundle::connect(
+            &format!("http://{address}"),
+            Duration::from_secs(3),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        (client, server)
+    }
+
+    fn spawn_probe_worker(
+        client: ClientBundle,
+        workload: WorkloadSpec,
+    ) -> (
+        mpsc::Sender<WorkItem>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let (sender, receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(worker_loop(
+            receiver,
+            client,
+            workload,
+            Duration::from_secs(3),
+            Arc::new(HashMap::new()),
+            Arc::new(AtomicI64::new(0)),
+            TokioInstant::now(),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        (sender, worker)
+    }
+
+    fn spawn_owned_probe_worker(
+        client: ClientBundle,
+        workload: WorkloadSpec,
+    ) -> (
+        mpsc::Sender<WorkItem>,
+        JoinSet<Result<(), String>>,
+        std::sync::Weak<()>,
+    ) {
+        let (sender, receiver) = mpsc::channel(4);
+        let lifetime = Arc::new(());
+        let weak = Arc::downgrade(&lifetime);
+        let mut workers = JoinSet::new();
+        workers.spawn(async move {
+            let _lifetime = lifetime;
+            worker_loop(
+                receiver,
+                client,
+                workload,
+                Duration::from_secs(3),
+                Arc::new(HashMap::new()),
+                Arc::new(AtomicI64::new(0)),
+                TokioInstant::now(),
+                Arc::new(AtomicU64::new(0)),
+            )
+            .await
+        });
+        (sender, workers, weak)
+    }
+
+    fn pending_ctrl_c() -> CtrlCFuture {
+        Box::pin(std::future::pending::<Result<(), std::io::Error>>())
+    }
+
+    fn controlled_ctrl_c() -> (oneshot::Sender<()>, CtrlCFuture) {
+        let (sender, receiver) = oneshot::channel();
+        let future: CtrlCFuture = Box::pin(async move {
+            receiver
+                .await
+                .expect("test canceled signal sender prematurely");
+            Ok(())
+        });
+        (sender, future)
+    }
+
+    fn report_class(report: &RunReport, class: WorkClass) -> &WorkItemReport {
+        report
+            .work_items
+            .iter()
+            .find(|item| item.work_class == class.as_str())
+            .unwrap()
+    }
+
+    fn assert_report_equations(report: &RunReport) {
+        for item in &report.work_items {
+            assert_eq!(
+                item.offered,
+                item.accepted + item.dropped + item.unissued,
+                "{}",
+                item.work_class
+            );
+            assert_eq!(
+                item.accepted,
+                item.completed + item.unfinished,
+                "{}",
+                item.work_class
+            );
+            assert_eq!(
+                item.completed,
+                item.succeeded + item.failed,
+                "{}",
+                item.work_class
+            );
+            assert_eq!(
+                item.dropped,
+                item.dropped_full + item.dropped_closed,
+                "{}",
+                item.work_class
+            );
+            assert!(item.result_unknown <= item.failed, "{}", item.work_class);
+        }
+        assert!(
+            report
+                .accounting_invariants
+                .offered_equals_accepted_plus_dropped_plus_unissued
+        );
+        assert!(
+            report
+                .accounting_invariants
+                .accepted_equals_completed_plus_unfinished
+        );
+        assert!(
+            report
+                .accounting_invariants
+                .accepted_equals_succeeded_plus_failed_plus_unfinished
+        );
+        assert!(report.accounting_invariants.result_unknown_subset_failed);
+    }
+
+    async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(
+                future.as_mut().poll(cx).is_pending(),
+                "operation unexpectedly completed"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    fn probe_heartbeat(kind: HeartbeatItemKind) -> HeartbeatItem {
+        HeartbeatItem {
+            node: 0,
+            kind,
+            key: "/registry/minions/node-0000".into(),
+            at: Duration::ZERO,
+        }
+    }
+
+    fn probe_workload() -> WorkloadSpec {
+        let mut workload = exact_phase_workload();
+        workload.topology.node_count = 1;
+        workload.topology.pod_count = 1;
+        workload
+            .resources
+            .retain(|resource| resource.name == "pods");
+        workload.resources[0].update_amplification = 1;
+        workload.etcd_lease_pools.clear();
+        workload.watches.clear();
+        workload.ranges.clear();
+        workload.range_count_only_count = 0;
+        workload.cas_conflicts = 0;
+        workload.status_count = 0;
+        workload.compact_interval_s = 300.0;
+        workload.timeline = vec![crate::config::TimelineSegment {
+            duration_s: 1.0,
+            range_rps: 0.0,
+        }];
+        workload
+    }
+
+    fn probe_config(workload: WorkloadSpec) -> RuntimeConfig {
+        RuntimeConfig {
+            endpoint: "http://127.0.0.1:1".into(),
+            nodes: workload.topology.node_count,
+            pod_size: workload.pod_size_bytes,
+            workload,
+            workers: 2,
+            queue_capacity: 8,
+            request_timeout: Duration::from_secs(3),
+            operation_timeout: Duration::from_secs(3),
+            max_message_size: 1024 * 1024,
+            metrics_listen: "127.0.0.1:0".parse().unwrap(),
+            seed: 7,
         }
     }
 
@@ -3054,13 +4086,7 @@ mod tests {
         .unwrap();
         let key = b"k".to_vec();
         let mut states = HashMap::new();
-        states.insert(
-            key.clone(),
-            KeyState::Present {
-                mod_revision: 1,
-                version: 1,
-            },
-        );
+        states.insert(key.clone(), KeyState::Present { mod_revision: 1 });
         let shared = SharedPool {
             name: PoolName::new("masterleases").unwrap(),
             pool: Mutex::new(LeasePool::new(LeasePoolConfig {
@@ -3077,8 +4103,7 @@ mod tests {
             b"value".to_vec(),
             ResourceOperation::GuaranteedUpdate,
             false,
-            CasRetryPolicy::node_status(),
-            CasRetryPolicy::node_status(),
+            CasRetryPolicy { max_attempts: 5 },
             false,
             Duration::from_secs(2),
             Some(&shared),
@@ -3094,6 +4119,252 @@ mod tests {
         server.abort();
         let _ = server.await;
     }
+
+    fn resource_cas_conflict(mod_revision: Option<i64>) -> TxnResponse {
+        TxnResponse {
+            header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                revision: 10,
+                ..Default::default()
+            }),
+            succeeded: false,
+            responses: vec![crate::pb::etcdserverpb::ResponseOp {
+                response: Some(
+                    crate::pb::etcdserverpb::response_op::Response::ResponseRange(
+                        crate::pb::etcdserverpb::RangeResponse {
+                            kvs: mod_revision
+                                .map(|mod_revision| mvccpb::KeyValue {
+                                    key: b"k".to_vec(),
+                                    value: b"latest".to_vec(),
+                                    mod_revision,
+                                    ..Default::default()
+                                })
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }],
+        }
+    }
+
+    async fn run_resource_cas_probe(
+        operation: ResourceOperation,
+        recreate_missing: bool,
+        max_attempts: u32,
+        timeout: Duration,
+        replies: Vec<Result<TxnResponse, tonic::Status>>,
+    ) -> (
+        Outcome,
+        Vec<crate::pb::etcdserverpb::TxnRequest>,
+        Option<i64>,
+    ) {
+        let probe = CreatePhaseProbe::default();
+        let expected_requests = replies.len();
+        for reply in replies {
+            probe.next_txn_reply().send(reply).unwrap();
+        }
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let key = b"k".to_vec();
+        let mut states = HashMap::from([(key.clone(), KeyState::Present { mod_revision: 1 })]);
+        let outcome = execute_txn(
+            &client,
+            &ResourceName::new("pods").unwrap(),
+            &mut states,
+            key.clone(),
+            b"value".to_vec(),
+            operation,
+            false,
+            CasRetryPolicy { max_attempts },
+            recreate_missing,
+            timeout,
+            None,
+            TokioInstant::now(),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        let requests = std::mem::take(&mut *probe.requests.lock().unwrap());
+        assert_eq!(
+            requests.len(),
+            expected_requests,
+            "resource CAS must issue exactly the scripted attempts"
+        );
+        (
+            outcome,
+            requests,
+            states.get(&key).and_then(KeyState::mod_revision),
+        )
+    }
+
+    #[tokio::test]
+    async fn resource_cas_distinguishes_conflict_and_not_found() {
+        for (name, operation, recreate, budget, replies, expected, revisions) in [
+            (
+                "create collision",
+                ResourceOperation::Create,
+                false,
+                u32::MAX,
+                vec![TxnResponse {
+                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                        revision: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                Outcome::Conflict,
+                vec![0],
+            ),
+            (
+                "ordinary missing key",
+                ResourceOperation::GuaranteedUpdate,
+                false,
+                5,
+                vec![resource_cas_conflict(None)],
+                Outcome::NotFound,
+                vec![1],
+            ),
+            (
+                "finite attempt exhaustion",
+                ResourceOperation::GuaranteedUpdate,
+                false,
+                2,
+                vec![
+                    resource_cas_conflict(Some(2)),
+                    resource_cas_conflict(Some(3)),
+                ],
+                Outcome::Conflict,
+                vec![1, 2],
+            ),
+            (
+                "masterlease recreation shares the attempt budget",
+                ResourceOperation::GuaranteedUpdate,
+                true,
+                1,
+                vec![resource_cas_conflict(None)],
+                Outcome::Conflict,
+                vec![1],
+            ),
+        ] {
+            let (outcome, requests, _) = run_resource_cas_probe(
+                operation,
+                recreate,
+                budget,
+                Duration::from_secs(3),
+                replies.into_iter().map(Ok).collect(),
+            )
+            .await;
+            assert_eq!(outcome, expected, "{name}");
+            for (request, revision) in requests.iter().zip(revisions) {
+                assert_eq!(
+                    request.compare[0].target_union,
+                    Some(TargetUnion::ModRevision(revision)),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_cas_rebuilds_from_failure_kv_and_publishes_commit_revision() {
+        let (outcome, requests, revision) = run_resource_cas_probe(
+            ResourceOperation::GuaranteedUpdate,
+            false,
+            u32::MAX,
+            Duration::from_secs(3),
+            vec![
+                Ok(resource_cas_conflict(Some(2))),
+                Ok(TxnResponse {
+                    succeeded: true,
+                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                        revision: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            ],
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(revision, Some(10));
+        assert_eq!(
+            requests[0].compare[0].target_union,
+            Some(TargetUnion::ModRevision(1))
+        );
+        assert_eq!(
+            requests[1].compare[0].target_union,
+            Some(TargetUnion::ModRevision(2))
+        );
+        assert_ne!(requests[0].success, requests[1].success);
+    }
+
+    #[tokio::test]
+    async fn resource_cas_recreates_missing_masterlease_without_resetting_budget() {
+        let (outcome, requests, revision) = run_resource_cas_probe(
+            ResourceOperation::GuaranteedUpdate,
+            true,
+            2,
+            Duration::from_secs(3),
+            vec![
+                Ok(resource_cas_conflict(None)),
+                Ok(TxnResponse {
+                    succeeded: true,
+                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                        revision: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            ],
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(revision, Some(10));
+        assert_eq!(
+            requests[0].compare[0].target_union,
+            Some(TargetUnion::ModRevision(1))
+        );
+        assert_eq!(
+            requests[1].compare[0].target_union,
+            Some(TargetUnion::ModRevision(0))
+        );
+        assert!(requests[1].failure.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resource_cas_expired_before_send_is_timeout() {
+        let (outcome, requests, _) = run_resource_cas_probe(
+            ResourceOperation::GuaranteedUpdate,
+            false,
+            5,
+            Duration::ZERO,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Timeout);
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resource_cas_unknown_mutable_result_is_not_replayed() {
+        for status in [
+            tonic::Status::unavailable("response lost after possible commit"),
+            tonic::Status::deadline_exceeded("commit result is unknown"),
+        ] {
+            let (outcome, requests, _) = run_resource_cas_probe(
+                ResourceOperation::GuaranteedUpdate,
+                false,
+                5,
+                Duration::from_secs(3),
+                vec![Err(status)],
+            )
+            .await;
+            assert_eq!(outcome, Outcome::ResultUnknown);
+            assert_eq!(requests.len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn create_barrier_precedes_exact_successful_update_phase() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3120,6 +4391,7 @@ mod tests {
             .retain(|resource| resource.name == "pods");
         workload.etcd_lease_pools.clear();
         let plan = WorkloadPlan::build(&workload).unwrap();
+        let accounting = RunAccounting::new();
         let pools = Arc::new(HashMap::new());
         let (sender, receiver) = mpsc::channel(2);
         let worker = tokio::spawn(worker_loop(
@@ -3139,6 +4411,7 @@ mod tests {
             std::slice::from_ref(&sender),
             1,
             Duration::from_secs(2),
+            &accounting,
         )
         .await
         .unwrap();
@@ -3153,6 +4426,7 @@ mod tests {
             7,
             TokioInstant::now(),
             Duration::from_millis(100),
+            Arc::clone(&accounting),
         )
         .await
         .unwrap();
@@ -3241,7 +4515,7 @@ mod tests {
                 },
                 update_amplification: 1,
                 value_size_bytes: 4096,
-                retry_policy: ConfigRetryPolicy::GuaranteedUpdate,
+                behavior: ResourceBehavior::GuaranteedUpdate,
                 lease_pool: None,
             }],
             ranges: vec![],
@@ -3253,7 +4527,7 @@ mod tests {
             cas_conflicts: 0,
             range_count_only_count: 0,
         };
-        let cursor = RateCursor::new(&workload, 1.0, 1, 1);
+        let cursor = RateCursor::new(&workload, 1, 1);
         assert_eq!(cursor.total(), 10000);
     }
     #[test]
@@ -3372,11 +4646,11 @@ mod tests {
             .unwrap();
         let expected = 8 * nodes + 1 + 2 * waves;
         assert_eq!(application_operation_total(&workload), expected);
-        let ranges = RateCursor::new(&workload, 1.0, 1, 0xB2);
+        let ranges = RateCursor::new(&workload, 1, 0xB2);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
         let producer = RangeProducer::new(weights.iter().copied());
         let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
-        range_shape_plan(&workload, prefix_total, 1.0).unwrap();
+        range_shape_plan(&workload, prefix_total).unwrap();
     }
 
     #[test]
@@ -3409,12 +4683,12 @@ mod tests {
     fn range_shape_plan_emits_exact_trace_counts() {
         let workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        let ranges = RateCursor::new(&workload, 1.0, 1, 0xB2);
+        let ranges = RateCursor::new(&workload, 1, 0xB2);
         assert_eq!(ranges.total(), 22_080);
         let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
         let producer = RangeProducer::new(weights.iter().copied());
         let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
-        let mut plan = range_shape_plan(&workload, prefix_total, 1.0).unwrap();
+        let mut plan = range_shape_plan(&workload, prefix_total).unwrap();
         assert_eq!(plan.prefix_total, 16_875);
         assert_eq!(plan.count_only, 220);
         let mut count_only = 0;
@@ -3456,7 +4730,7 @@ mod tests {
         let producer = RangeProducer::new(weights.iter().copied());
         let prefix_total = exact_prefix_total(producer.clone(), &weights, &workload.ranges, 3);
         assert_eq!(prefix_total, 1);
-        let mut plan = range_shape_plan(&workload, prefix_total, 1.0).unwrap();
+        let mut plan = range_shape_plan(&workload, prefix_total).unwrap();
         let mut producer = producer;
         let mut shaped = 0;
         for _ in 0..3 {
@@ -3515,7 +4789,7 @@ mod tests {
         assert_eq!(next.key, b"b\0");
         assert_eq!(next.range_end, b"/registry/pods0");
         assert_eq!(next.revision, 42);
-        let second = range_page(42, &[b"c", b"d"], false, 4);
+        let second = range_page(45, &[b"c", b"d"], false, 4);
         assert_eq!(
             pager.observe_response(&second, 2).unwrap(),
             RangePageOutcome::Complete
@@ -3527,7 +4801,7 @@ mod tests {
     }
 
     #[test]
-    fn range_pager_rejects_revision_change_and_empty_more_page() {
+    fn range_pager_rejects_missing_revision_and_empty_more_page() {
         let request = RangeRequest {
             key: b"/registry/pods/".to_vec(),
             range_end: b"/registry/pods0".to_vec(),
@@ -3535,15 +4809,41 @@ mod tests {
             ..Default::default()
         };
         let mut pager = RangePager::new(request.clone(), RangeSelector::All { target: None });
-        let first = range_page(7, &[b"a"], true, 2);
-        assert!(pager.observe_response(&first, 1).is_ok());
-        let changed = range_page(8, &[b"b"], false, 2);
-        assert!(pager.observe_response(&changed, 1).is_err());
+        let missing_revision = range_page(0, &[b"a"], true, 2);
+        assert!(pager.observe_response(&missing_revision, 1).is_err());
 
         let mut empty = RangePager::new(request, RangeSelector::All { target: None });
         let response = range_page(7, &[], true, 1);
         let error = empty.observe_response(&response, 0).unwrap_err();
         assert!(error.contains("more=true"));
+    }
+
+    #[test]
+    fn range_pager_preserves_explicit_snapshot_with_advancing_headers() {
+        let request = RangeRequest {
+            key: b"/registry/pods/".to_vec(),
+            range_end: b"/registry/pods0".to_vec(),
+            revision: 7,
+            limit: 500,
+            ..Default::default()
+        };
+        let mut pager = RangePager::new(request, RangeSelector::All { target: None });
+        assert!(matches!(
+            pager
+                .observe_response(&range_page(9, &[b"a"], true, 2), 1)
+                .unwrap(),
+            RangePageOutcome::Continue(_)
+        ));
+        assert_eq!(pager.request().revision, 7);
+        assert_eq!(pager.request().key, b"a\0");
+        assert_eq!(
+            pager
+                .observe_response(&range_page(12, &[b"b"], false, 1), 1)
+                .unwrap(),
+            RangePageOutcome::Complete
+        );
+        assert_eq!(pager.result().snapshot_revision, 7);
+        assert_eq!(pager.result().selected, 2);
     }
 
     #[test]
@@ -3649,17 +4949,6 @@ mod tests {
     }
 
     #[test]
-    fn event_retry_delay_is_bounded_by_operation_deadline() {
-        let policy = CasRetryPolicy::event();
-        assert!(
-            cas_retry_delay(policy, b"/registry/events/ns/e", 1, Duration::from_secs(7)).is_none()
-        );
-        let delay =
-            cas_retry_delay(policy, b"/registry/events/ns/e", 1, Duration::from_secs(13)).unwrap();
-        assert!((Duration::from_millis(7_500)..=Duration::from_millis(12_500)).contains(&delay));
-    }
-
-    #[test]
     fn embedded_read_only_resources_are_created_before_ranges() {
         let workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
@@ -3678,32 +4967,44 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_bootstrap_blocks_main_load() {
-        assert!(!bootstrap_allows_main_load(true));
-        assert!(bootstrap_allows_main_load(false));
-    }
-
-    #[test]
     fn try_enqueue_counts_closed_queue_as_drop() {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let mut stats = ScheduleStats::default();
-        assert!(!try_enqueue(&sender, WorkItem::Status, &mut stats));
+        let accounting = RunAccounting::new();
+        assert!(!try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status),
+            },
+            &mut stats,
+        ));
         assert_eq!(stats.dropped, 1);
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        let status = report_class(&report, WorkClass::Status);
+        assert_eq!(status.offered, 1);
+        assert_eq!(status.accepted, 0);
+        assert_eq!(status.dropped_closed, 1);
+        assert_eq!(status.dropped_full, 0);
+        assert_eq!(status.unissued, 0);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
     }
 
     #[tokio::test]
-    async fn drain_workers_propagates_worker_error() {
-        let worker = tokio::spawn(async { Err("worker failed".to_string()) });
-        let error = drain_workers(
+    async fn drain_worker_tasks_propagates_worker_error() {
+        let mut workers = JoinSet::new();
+        workers.spawn(async { Err("worker failed".to_string()) });
+        let (result, interrupted) = drain_worker_tasks(
             Vec::new(),
-            vec![worker],
+            workers,
             Arc::new(HashMap::new()),
             Duration::from_secs(1),
+            &mut pending_ctrl_c(),
         )
-        .await
-        .unwrap_err();
-        assert!(error.contains("worker failed"));
+        .await;
+        assert!(result.unwrap_err().contains("worker failed"));
+        assert!(!interrupted);
     }
 
     #[tokio::test]
@@ -3723,12 +5024,18 @@ mod tests {
         let mut ctrl_c: CtrlCFuture =
             Box::pin(std::future::pending::<Result<(), std::io::Error>>());
 
-        let result = wait_for_schedule_event(
-            &mut tasks,
-            TokioInstant::now() + Duration::from_secs(60),
-            &mut ctrl_c,
+        let result = time::timeout(
+            Duration::from_secs(1),
+            wait_for_supervised_schedule_event(
+                &mut tasks,
+                &mut JoinSet::new(),
+                &mut None,
+                TokioInstant::now() + Duration::from_secs(60),
+                &mut ctrl_c,
+            ),
         )
-        .await;
+        .await
+        .unwrap();
 
         let Err(error) = result else {
             panic!("watch terminal should stop scheduling");
@@ -3749,9 +5056,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_failure_aborts_queued_workers_before_returning() {
-        let mut watch_tasks = JoinSet::new();
-        watch_tasks.spawn(async {
+    async fn watch_failure_aborts_actual_inflight_and_queued_workers_before_returning() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, mut workers, worker_lifetime) =
+            spawn_owned_probe_worker(client, probe_workload());
+        let (done, ack) = oneshot::channel();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut ScheduleStats::default()
+        ));
+        probe.wait_for_txns(1).await;
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status),
+            },
+            &mut ScheduleStats::default()
+        ));
+
+        let mut watches = JoinSet::new();
+        watches.spawn(async {
             (
                 "pods".to_string(),
                 Err(crate::watch::WatchError::Rpc(tonic::Status::internal(
@@ -3759,60 +5091,51 @@ mod tests {
                 ))),
             )
         });
-        let mut ctrl_c: CtrlCFuture =
-            Box::pin(std::future::pending::<Result<(), std::io::Error>>());
-        let result = wait_for_schedule_event(
-            &mut watch_tasks,
-            TokioInstant::now() + Duration::from_secs(60),
-            &mut ctrl_c,
+        let mut ctrl_c = pending_ctrl_c();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            wait_for_supervised_schedule_event(
+                &mut watches,
+                &mut workers,
+                &mut None,
+                TokioInstant::now() + Duration::from_secs(60),
+                &mut ctrl_c,
+            ),
         )
-        .await;
+        .await
+        .unwrap();
         let Err(error) = result else {
             panic!("watch failure should stop scheduling");
         };
-        assert!(error.starts_with("watch pods failed: watch RPC:"));
         assert!(error.contains("server failed"));
-
-        let (sender, mut receiver) = mpsc::channel(2);
-        let processed = Arc::new(AtomicU64::new(0));
-        let processed_by_worker = processed.clone();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let entered_by_worker = entered.clone();
-        let worker = tokio::spawn(async move {
-            while receiver.recv().await.is_some() {
-                processed_by_worker.fetch_add(1, AtomicOrdering::Relaxed);
-                entered_by_worker.notify_waiters();
-                std::future::pending::<()>().await;
-            }
-            Ok(())
-        });
-        let entered_wait = entered.notified();
-        sender.send(WorkItem::Status).await.unwrap();
-        entered_wait.await;
-        sender.send(WorkItem::Status).await.unwrap();
-
-        let pool = Arc::new(SharedPool {
-            name: PoolName::new("test").unwrap(),
-            pool: Mutex::new(LeasePool::new(LeasePoolConfig::default())),
-        });
-        let pool_weak = Arc::downgrade(&pool);
-        let mut pool_map = HashMap::new();
-        pool_map.insert("test".to_string(), pool.clone());
-        drop(pool);
-
-        let (watch_shutdown, _) = shutdown_watch::channel(false);
-        cleanup_watch_failure(
-            watch_shutdown,
-            watch_tasks,
-            vec![sender],
-            vec![worker],
-            Arc::new(pool_map),
+        time::timeout(
             Duration::from_secs(1),
+            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
+        )
+        .await
+        .unwrap();
+        let (shutdown, _) = shutdown_watch::channel(false);
+        let (stopped, interrupted) = stop_watches_with_ctrl(
+            shutdown,
+            watches,
+            Duration::from_secs(1),
+            &mut ctrl_c,
+            false,
         )
         .await;
-
-        assert_eq!(processed.load(AtomicOrdering::Relaxed), 1);
-        assert!(pool_weak.upgrade().is_none());
+        stopped.unwrap();
+        assert!(!interrupted);
+        assert!(worker_lifetime.upgrade().is_none());
+        assert!(ack.await.is_err());
+        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+        let report = accounting.report(RunTargets::default(), false, false, Some(error));
+        assert_eq!(report_class(&report, WorkClass::Bootstrap).unfinished, 1);
+        assert_eq!(report_class(&report, WorkClass::Status).unfinished, 1);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
     }
 
     fn compact_response(
@@ -4134,5 +5457,1247 @@ mod tests {
         assert!(error.contains("target=3"));
         assert!(error.contains("succeeded=2"));
         assert!(error.contains("deficit=1"));
+    }
+    #[test]
+    fn run_accounting_reports_all_terminal_buckets_and_equations() {
+        let accounting = RunAccounting::new();
+        let mut success = tracked(&accounting, WorkClass::Create);
+        success.mark_accepted();
+        success.mark_complete(Outcome::Success);
+
+        let mut unknown = tracked(&accounting, WorkClass::Create);
+        unknown.mark_accepted();
+        unknown.mark_complete(Outcome::ResultUnknown);
+
+        let mut dropped = tracked(&accounting, WorkClass::Create);
+        dropped.mark_dropped(DropReason::Backpressure);
+
+        let mut unissued = tracked(&accounting, WorkClass::Create);
+        unissued.mark_unissued();
+
+        {
+            let mut unfinished = tracked(&accounting, WorkClass::Create);
+            unfinished.mark_accepted();
+        }
+
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        let create = report
+            .work_items
+            .iter()
+            .find(|item| item.work_class == "create")
+            .unwrap();
+        assert_eq!(create.offered, 5);
+        assert_eq!(create.accepted, 3);
+        assert_eq!(create.completed, 2);
+        assert_eq!(create.succeeded, 1);
+        assert_eq!(create.failed, 1);
+        assert_eq!(create.result_unknown, 1);
+        assert_eq!(create.dropped, 1);
+        assert_eq!(create.dropped_full, 1);
+        assert_eq!(create.unfinished, 1);
+        assert_eq!(create.unissued, 1);
+        assert!(
+            report
+                .accounting_invariants
+                .offered_equals_accepted_plus_dropped_plus_unissued
+        );
+        assert!(
+            report
+                .accounting_invariants
+                .accepted_equals_completed_plus_unfinished
+        );
+        assert!(
+            report
+                .accounting_invariants
+                .accepted_equals_succeeded_plus_failed_plus_unfinished
+        );
+        assert!(report.accounting_invariants.result_unknown_subset_failed);
+        assert!(!report.achieved);
+    }
+
+    #[tokio::test]
+    async fn blocking_enqueue_timeout_marks_item_unissued() {
+        let accounting = RunAccounting::new();
+        let (sender, receiver) = mpsc::channel(1);
+        let mut stats = ScheduleStats::default();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status)
+            },
+            &mut stats,
+        ));
+
+        let second = WorkItem::Status {
+            accounting: tracked(&accounting, WorkClass::Status),
+        };
+        let result = enqueue_until(
+            &sender,
+            second,
+            TokioInstant::now() + Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(result, EnqueueResult::Unissued));
+        drop(receiver);
+
+        let report = accounting.report(RunTargets::default(), true, false, None);
+        let status = report
+            .work_items
+            .iter()
+            .find(|item| item.work_class == "status")
+            .unwrap();
+        assert_eq!(status.offered, 2);
+        assert_eq!(status.accepted, 1);
+        assert_eq!(status.unfinished, 1);
+        assert_eq!(status.unissued, 1);
+        assert_report_equations(&report);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_worker_preserves_unknown_rpc_result_and_error_ack() {
+        let probe = CreatePhaseProbe::default();
+        probe
+            .next_txn_reply()
+            .send(Err(tonic::Status::deadline_exceeded("response lost")))
+            .unwrap();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, worker) = spawn_probe_worker(client, probe_workload());
+        let (done, ack) = oneshot::channel();
+        let mut stats = ScheduleStats::default();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut stats,
+        ));
+        drop(sender);
+        let error = time::timeout(Duration::from_secs(3), ack)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("result_unknown"));
+        time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        let bootstrap = report_class(&report, WorkClass::Bootstrap);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        assert_eq!(bootstrap.offered, 1);
+        assert_eq!(bootstrap.accepted, 1);
+        assert_eq!(bootstrap.completed, 1);
+        assert_eq!(bootstrap.succeeded, 0);
+        assert_eq!(bootstrap.failed, 1);
+        assert_eq!(bootstrap.result_unknown, 1);
+        assert_eq!(bootstrap.unfinished, 0);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+        let untouched_run = RunAccounting::new().report(RunTargets::default(), false, true, None);
+        assert!(
+            untouched_run
+                .work_items
+                .iter()
+                .all(|item| item.offered == 0)
+        );
+        assert_report_equations(&untouched_run);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_worker_preserves_unknown_rpc_result_after_bootstrap() {
+        let probe = CreatePhaseProbe::default();
+        probe
+            .next_txn_reply()
+            .send(Ok(compact_response(11, true, 0, b"")))
+            .unwrap();
+        probe
+            .next_txn_reply()
+            .send(Err(tonic::Status::unavailable("committed response lost")))
+            .unwrap();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, worker) = spawn_probe_worker(client, probe_workload());
+        let (done, ack) = oneshot::channel();
+        let mut stats = ScheduleStats::default();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut stats,
+        ));
+        time::timeout(Duration::from_secs(3), ack)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Heartbeat {
+                item: probe_heartbeat(HeartbeatItemKind::NodeStatus),
+                accounting: tracked(&accounting, WorkClass::Heartbeat),
+            },
+            &mut stats,
+        ));
+        drop(sender);
+        time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        let heartbeat = report_class(&report, WorkClass::Heartbeat);
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "periodic heartbeat must reach the RPC, without replay"
+        );
+        assert!(matches!(
+            requests[1].compare[0].target_union,
+            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                11
+            ))
+        ));
+        drop(requests);
+        assert_eq!(report_class(&report, WorkClass::Bootstrap).succeeded, 1);
+        assert_eq!(heartbeat.offered, 1);
+        assert_eq!(heartbeat.accepted, 1);
+        assert_eq!(heartbeat.completed, 1);
+        assert_eq!(heartbeat.succeeded, 0);
+        assert_eq!(heartbeat.failed, 1);
+        assert_eq!(heartbeat.result_unknown, 1);
+        assert_eq!(heartbeat.unfinished, 0);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    async fn run_compact_probe(responses: Vec<TxnResponse>) -> (RunReport, CreatePhaseProbe) {
+        let probe = CreatePhaseProbe::default();
+        let ticks = responses.len();
+        for response in responses {
+            probe.next_txn_reply().send(Ok(response)).unwrap();
+        }
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, worker) = spawn_probe_worker(client, probe_workload());
+        let mut stats = ScheduleStats::default();
+        for _ in 0..ticks {
+            assert!(try_enqueue(
+                &sender,
+                WorkItem::CompactTick {
+                    accounting: tracked(&accounting, WorkClass::Compact)
+                },
+                &mut stats,
+            ));
+        }
+        drop(sender);
+        time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        assert_report_equations(&report);
+        let compact = report_class(&report, WorkClass::Compact);
+        assert_eq!(compact.offered, ticks as u64);
+        assert_eq!(compact.accepted, ticks as u64);
+        assert_eq!(compact.completed, ticks as u64);
+        assert_eq!(compact.unfinished, 0);
+        server.abort();
+        let _ = server.await;
+        (report, probe)
+    }
+
+    #[tokio::test]
+    async fn compact_worker_first_journal_is_one_successful_noop_tick() {
+        let (report, probe) = run_compact_probe(vec![compact_response(11, true, 0, b"")]).await;
+        assert_eq!(
+            *probe.requests.lock().unwrap(),
+            vec![build_compact_revision_txn(b"0", 0)]
+        );
+        assert!(probe.compact_requests.lock().unwrap().is_empty());
+        let compact = report_class(&report, WorkClass::Compact);
+        assert_eq!(compact.succeeded, 1);
+        assert_eq!(compact.failed, 0);
+        assert_eq!(compact.result_unknown, 0);
+        assert!(report.achieved);
+    }
+
+    #[tokio::test]
+    async fn compact_worker_legal_cas_resync_succeeds_without_compact_or_retry() {
+        let (report, probe) = run_compact_probe(vec![
+            compact_response(11, true, 0, b""),
+            compact_response(22, false, 9, b"7"),
+        ])
+        .await;
+        assert_eq!(
+            *probe.requests.lock().unwrap(),
+            vec![
+                build_compact_revision_txn(b"0", 0),
+                build_compact_revision_txn(b"11", 1),
+            ]
+        );
+        assert!(probe.compact_requests.lock().unwrap().is_empty());
+        let compact = report_class(&report, WorkClass::Compact);
+        assert_eq!(compact.succeeded, 2);
+        assert_eq!(compact.failed, 0);
+        assert_eq!(compact.result_unknown, 0);
+        assert!(report.achieved);
+    }
+
+    #[tokio::test]
+    async fn compact_worker_rpc_failure_is_not_hidden_by_successful_journal() {
+        let (report, probe) = run_compact_probe(vec![
+            compact_response(11, true, 0, b""),
+            compact_response(22, true, 0, b""),
+        ])
+        .await;
+        assert_eq!(
+            *probe.requests.lock().unwrap(),
+            vec![
+                build_compact_revision_txn(b"0", 0),
+                build_compact_revision_txn(b"11", 1),
+            ]
+        );
+        assert_eq!(
+            *probe.compact_requests.lock().unwrap(),
+            vec![CompactionRequest {
+                revision: 11,
+                physical: false,
+            }]
+        );
+        let compact = report_class(&report, WorkClass::Compact);
+        assert_eq!(compact.succeeded, 1);
+        assert_eq!(compact.failed, 1);
+        assert_eq!(compact.result_unknown, 0);
+        assert!(compact.first_error.is_some());
+        assert!(!report.achieved);
+    }
+
+    #[tokio::test]
+    async fn range_worker_rejects_invalid_page_despite_successful_rpc() {
+        let probe = CreatePhaseProbe::default();
+        *probe.range_reply.lock().unwrap() = Some(range_page(7, &[], true, 1));
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, worker) = spawn_probe_worker(client, probe_workload());
+        let request = RangeRequest {
+            key: b"/registry/pods/".to_vec(),
+            range_end: b"/registry/pods0".to_vec(),
+            limit: 500,
+            ..Default::default()
+        };
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Range {
+                request: request.clone(),
+                selector_keep_every: 1,
+                target: 0,
+                accounting: tracked(&accounting, WorkClass::Range),
+            },
+            &mut ScheduleStats::default(),
+        ));
+        drop(sender);
+        time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        assert_eq!(*probe.range_requests.lock().unwrap(), vec![request]);
+        let range = report_class(&report, WorkClass::Range);
+        assert_eq!(range.accepted, 1);
+        assert_eq!(range.completed, 1);
+        assert_eq!(range.succeeded, 0);
+        assert_eq!(range.failed, 1);
+        assert_eq!(range.result_unknown, 0);
+        assert_eq!(range.unfinished, 0);
+        assert!(range.first_error.as_ref().unwrap().contains("more=true"));
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn try_enqueue_full_keeps_rejected_item_out_of_accepted_bucket() {
+        let accounting = RunAccounting::new();
+        let (sender, receiver) = mpsc::channel(1);
+        let mut stats = ScheduleStats::default();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status)
+            },
+            &mut stats,
+        ));
+        assert!(!try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status)
+            },
+            &mut stats,
+        ));
+        drop(receiver);
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        let status = report_class(&report, WorkClass::Status);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(status.offered, 2);
+        assert_eq!(status.accepted, 1);
+        assert_eq!(status.dropped_full, 1);
+        assert_eq!(status.dropped_closed, 0);
+        assert_eq!(status.unfinished, 1);
+        assert_eq!(status.unissued, 0);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+    }
+
+    #[tokio::test]
+    async fn canceled_pending_reserve_is_unissued_not_accepted_or_dropped() {
+        let accounting = RunAccounting::new();
+        let (sender, receiver) = mpsc::channel(1);
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status)
+            },
+            &mut ScheduleStats::default(),
+        ));
+        let mut enqueue = Box::pin(enqueue_until(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status),
+            },
+            TokioInstant::now() + Duration::from_secs(60),
+        ));
+        assert_pending(enqueue.as_mut()).await;
+        drop(enqueue);
+        drop(receiver);
+
+        let report = accounting.report(RunTargets::default(), true, false, None);
+        let status = report_class(&report, WorkClass::Status);
+        assert_eq!(status.offered, 2);
+        assert_eq!(status.accepted, 1);
+        assert_eq!(status.completed, 0);
+        assert_eq!(status.dropped, 0);
+        assert_eq!(status.unfinished, 1);
+        assert_eq!(status.unissued, 1);
+        assert_report_equations(&report);
+    }
+
+    #[tokio::test]
+    async fn aborted_worker_preserves_inflight_and_queued_items_as_unfinished() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, probe_workload());
+        let (first_done, first_ack) = oneshot::channel();
+        let (second_done, second_ack) = oneshot::channel();
+        let mut stats = ScheduleStats::default();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done: first_done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut stats,
+        ));
+        probe.wait_for_txns(1).await;
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeReady),
+                done: second_done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut stats,
+        ));
+        time::timeout(
+            Duration::from_secs(3),
+            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
+        )
+        .await
+        .unwrap();
+        assert!(worker_lifetime.upgrade().is_none());
+        assert!(first_ack.await.is_err());
+        assert!(second_ack.await.is_err());
+        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+
+        let report = accounting.report(RunTargets::default(), true, false, None);
+        let bootstrap = report_class(&report, WorkClass::Bootstrap);
+        assert_eq!(
+            probe.requests.lock().unwrap().len(),
+            1,
+            "queued work must not reach RPC"
+        );
+        assert_eq!(bootstrap.offered, 2);
+        assert_eq!(bootstrap.accepted, 2);
+        assert_eq!(bootstrap.completed, 0);
+        assert_eq!(bootstrap.succeeded, 0);
+        assert_eq!(bootstrap.failed, 0);
+        assert_eq!(bootstrap.result_unknown, 0);
+        assert_eq!(bootstrap.unfinished, 2);
+        assert_eq!(bootstrap.unissued, 0);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn readiness_barrier_requires_every_created_before_update_rpc() {
+        let probe = CreatePhaseProbe::default();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let workload = probe_workload();
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        let accounting = RunAccounting::new();
+        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, workload.clone());
+        run_create_phase(
+            &workload,
+            &plan,
+            std::slice::from_ref(&sender),
+            1,
+            Duration::from_secs(3),
+            &accounting,
+        )
+        .await
+        .unwrap();
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        let (first_created, first_ready) = oneshot::channel();
+        let (last_created, last_ready) = oneshot::channel();
+        let mut watches = JoinSet::new();
+        for _ in 0..2 {
+            watches.spawn(std::future::pending::<WatchTaskOutput>());
+        }
+        let mut ctrl_c = pending_ctrl_c();
+        let update_started = std::cell::Cell::new(false);
+        let mut gated_update = Box::pin(async {
+            wait_for_watch_ready(
+                &mut watches,
+                vec![first_ready, last_ready],
+                Duration::from_secs(3),
+                &mut ctrl_c,
+            )
+            .await?;
+            update_started.set(true);
+            run_update_phase(
+                workload,
+                plan,
+                vec![sender.clone()],
+                1,
+                7,
+                TokioInstant::now(),
+                Duration::from_secs(3),
+                Arc::clone(&accounting),
+            )
+            .await
+        });
+        assert_pending(gated_update.as_mut()).await;
+        assert!(!update_started.get());
+        first_created.send(()).unwrap();
+        assert_pending(gated_update.as_mut()).await;
+        assert!(
+            !update_started.get(),
+            "one Created must not release a two-Watch barrier"
+        );
+        assert_eq!(
+            probe.requests.lock().unwrap().len(),
+            1,
+            "no update RPC before final Created"
+        );
+        last_created.send(()).unwrap();
+        assert_eq!(
+            time::timeout(Duration::from_secs(3), gated_update)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert!(update_started.get());
+        assert_eq!(probe.requests.lock().unwrap().len(), 2);
+        assert!(matches!(
+            probe.requests.lock().unwrap()[1].compare[0].target_union,
+            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                1
+            ))
+        ));
+        let (drained, interrupted) = drain_worker_tasks(
+            vec![sender],
+            workers,
+            Arc::new(HashMap::new()),
+            Duration::from_secs(1),
+            &mut ctrl_c,
+        )
+        .await;
+        drained.unwrap();
+        assert!(!interrupted);
+        assert!(worker_lifetime.upgrade().is_none());
+        watches.abort_all();
+        while watches.join_next().await.is_some() {}
+        let report = accounting.report(RunTargets::default(), false, true, None);
+        assert_eq!(report_class(&report, WorkClass::Update).succeeded, 1);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn readiness_closed_channel_preserves_delayed_watch_terminal_cause() {
+        let (created, ready) = oneshot::channel();
+        let (terminal, terminate) = oneshot::channel();
+        let mut watches = JoinSet::new();
+        watches.spawn(async move {
+            terminate.await.unwrap();
+            (
+                "pods".to_string(),
+                Ok(crate::watch::WatchOutcome {
+                    terminal: crate::watch::WatchTerminal::Canceled {
+                        reason: "authorization revoked".into(),
+                    },
+                    state: crate::watch::WatchState::default(),
+                }),
+            )
+        });
+        drop(created);
+        let mut ctrl_c = pending_ctrl_c();
+        let mut readiness = Box::pin(wait_for_watch_ready(
+            &mut watches,
+            vec![ready],
+            Duration::from_secs(3),
+            &mut ctrl_c,
+        ));
+        assert_pending(readiness.as_mut()).await;
+        terminal.send(()).unwrap();
+        let error = time::timeout(Duration::from_secs(1), readiness)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("watch pods terminated"));
+        assert!(error.contains("authorization revoked"));
+        assert!(watches.is_empty());
+        let report = RunAccounting::new().report(RunTargets::default(), false, false, Some(error));
+        assert!(!report.achieved);
+        assert!(
+            report
+                .termination_error
+                .unwrap()
+                .contains("authorization revoked")
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_does_not_release_update_phase() {
+        let (_created, ready) = oneshot::channel();
+        let mut watches = JoinSet::new();
+        watches.spawn(std::future::pending::<WatchTaskOutput>());
+        let mut ctrl_c = pending_ctrl_c();
+        let error = time::timeout(
+            Duration::from_secs(1),
+            wait_for_watch_ready(
+                &mut watches,
+                vec![ready],
+                Duration::from_millis(1),
+                &mut ctrl_c,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error, "watch readiness timed out");
+        watches.abort_all();
+        while watches.join_next().await.is_some() {}
+        let report = RunAccounting::new().report(RunTargets::default(), false, false, Some(error));
+        assert!(!report.achieved);
+        assert_eq!(
+            report.termination_error.as_deref(),
+            Some("watch readiness timed out")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_blocked_rpc_prevents_application_offers_until_cancellation() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let (cancel, ctrl_c) = controlled_ctrl_c();
+        let run = tokio::spawn(run_with_ctrl_c(
+            probe_config(probe_workload()),
+            client,
+            ctrl_c,
+        ));
+        probe.wait_for_txns(1).await;
+        cancel.send(()).unwrap();
+        let report = time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+        assert!(report.interrupted);
+        assert!(!report.achieved);
+        assert!(!report.schedule_complete);
+        assert_eq!(report_class(&report, WorkClass::Create).offered, 0);
+        assert_eq!(report_class(&report, WorkClass::Update).offered, 0);
+        let bootstrap = report_class(&report, WorkClass::Bootstrap);
+        assert_eq!(bootstrap.accepted, 2);
+        assert_eq!(bootstrap.unfinished, 2);
+        assert_eq!(bootstrap.completed, 0);
+        assert_eq!(bootstrap.result_unknown, 0);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_error_ack_stops_before_application_create_or_update() {
+        let probe = CreatePhaseProbe::default();
+        probe
+            .next_txn_reply()
+            .send(Err(tonic::Status::permission_denied("bootstrap rejected")))
+            .unwrap();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let report = time::timeout(
+            Duration::from_secs(1),
+            run_with_ctrl_c(probe_config(probe_workload()), client, pending_ctrl_c()),
+        )
+        .await
+        .unwrap();
+        assert!(!report.achieved);
+        assert!(!report.interrupted);
+        assert!(!report.schedule_complete);
+        assert!(
+            report
+                .termination_error
+                .as_ref()
+                .unwrap()
+                .starts_with("bootstrap:")
+        );
+        assert_eq!(report_class(&report, WorkClass::Create).offered, 0);
+        assert_eq!(report_class(&report, WorkClass::Update).offered, 0);
+        assert!(report_class(&report, WorkClass::Bootstrap).failed >= 1);
+        assert_eq!(
+            report_class(&report, WorkClass::Bootstrap).result_unknown,
+            0
+        );
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn nonempty_drain_cancellation_joins_owned_tasks_before_partial_report() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, probe_workload());
+        let (done, ack) = oneshot::channel();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut ScheduleStats::default()
+        ));
+        probe.wait_for_txns(1).await;
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status),
+            },
+            &mut ScheduleStats::default()
+        ));
+        let (shutdown, mut watch_shutdown) = shutdown_watch::channel(false);
+        let watch_guard = Arc::new(());
+        let watch_lifetime = Arc::downgrade(&watch_guard);
+        let mut watches = JoinSet::new();
+        watches.spawn(async move {
+            let _guard = watch_guard;
+            watch_shutdown.changed().await.unwrap();
+            (
+                "pods".into(),
+                Ok(crate::watch::WatchOutcome {
+                    terminal: crate::watch::WatchTerminal::ContextCanceled,
+                    state: crate::watch::WatchState::default(),
+                }),
+            )
+        });
+        let (cancel, mut ctrl_c) = controlled_ctrl_c();
+        let mut draining = Box::pin(drain_worker_tasks(
+            vec![sender],
+            workers,
+            Arc::new(HashMap::new()),
+            Duration::from_secs(60),
+            &mut ctrl_c,
+        ));
+        assert_pending(draining.as_mut()).await;
+        assert!(worker_lifetime.upgrade().is_some());
+        assert!(watch_lifetime.upgrade().is_some());
+        cancel.send(()).unwrap();
+        let (drain_result, interrupted) = time::timeout(Duration::from_secs(1), draining)
+            .await
+            .unwrap();
+        drain_result.unwrap();
+        assert!(interrupted);
+        assert!(worker_lifetime.upgrade().is_none());
+        assert!(ack.await.is_err());
+        let (stop_result, interrupted) = time::timeout(
+            Duration::from_secs(1),
+            stop_watches_with_ctrl(
+                shutdown,
+                watches,
+                Duration::from_secs(1),
+                &mut ctrl_c,
+                interrupted,
+            ),
+        )
+        .await
+        .unwrap();
+        stop_result.unwrap();
+        assert!(
+            interrupted,
+            "completed cancellation future must remain latched through Watch stop"
+        );
+        assert!(watch_lifetime.upgrade().is_none());
+        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+        let report = accounting.report(RunTargets::default(), interrupted, true, None);
+        assert!(report.interrupted);
+        assert!(report.schedule_complete);
+        assert!(!report.achieved);
+        for class in [WorkClass::Bootstrap, WorkClass::Status] {
+            let item = report_class(&report, class);
+            assert_eq!(item.accepted, 1);
+            assert_eq!(item.completed, 0);
+            assert_eq!(item.failed, 0);
+            assert_eq!(item.result_unknown, 0);
+            assert_eq!(item.unfinished, 1);
+        }
+        assert_report_equations(&report);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn late_watch_terminal_during_normal_drain_remains_a_run_failure() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, probe_workload());
+        let (done, ack) = oneshot::channel();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut ScheduleStats::default()
+        ));
+        probe.wait_for_txns(1).await;
+        let (shutdown, shutdown_observer) = shutdown_watch::channel(false);
+        let (terminal, terminate) = oneshot::channel();
+        let (observed, observation) = oneshot::channel();
+        let guard = Arc::new(());
+        let watch_lifetime = Arc::downgrade(&guard);
+        let mut watches = JoinSet::new();
+        watches.spawn(async move {
+            let _guard = guard;
+            terminate.await.unwrap();
+            observed.send(()).unwrap();
+            (
+                "pods".into(),
+                Ok(crate::watch::WatchOutcome {
+                    terminal: crate::watch::WatchTerminal::Canceled {
+                        reason: "late server cancellation".into(),
+                    },
+                    state: crate::watch::WatchState::default(),
+                }),
+            )
+        });
+        let mut ctrl_c = pending_ctrl_c();
+        let mut draining = Box::pin(drain_worker_tasks(
+            vec![sender],
+            workers,
+            Arc::new(HashMap::new()),
+            Duration::from_secs(3),
+            &mut ctrl_c,
+        ));
+        assert_pending(draining.as_mut()).await;
+        assert!(
+            !*shutdown_observer.borrow(),
+            "Watch must remain live while worker RPC is held"
+        );
+        terminal.send(()).unwrap();
+        time::timeout(Duration::from_secs(1), observation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_pending(draining.as_mut()).await;
+        held_reply
+            .send(Ok(compact_response(11, true, 0, b"")))
+            .unwrap();
+        let (drained, interrupted) = time::timeout(Duration::from_secs(1), draining)
+            .await
+            .unwrap();
+        drained.unwrap();
+        assert!(!interrupted);
+        ack.await.unwrap().unwrap();
+        assert!(worker_lifetime.upgrade().is_none());
+        let (stopped, interrupted) = stop_watches_with_ctrl(
+            shutdown,
+            watches,
+            Duration::from_secs(1),
+            &mut ctrl_c,
+            false,
+        )
+        .await;
+        let error = stopped.unwrap_err();
+        assert!(error.contains("late server cancellation"));
+        assert!(!interrupted);
+        assert!(watch_lifetime.upgrade().is_none());
+        let report = accounting.report(RunTargets::default(), false, true, Some(error));
+        assert_eq!(report_class(&report, WorkClass::Bootstrap).succeeded, 1);
+        assert!(!report.achieved);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn watch_stop_timeout_aborts_and_joins_before_failure_report() {
+        let (shutdown, observer) = shutdown_watch::channel(false);
+        let guard = Arc::new(());
+        let lifetime = Arc::downgrade(&guard);
+        let mut watches = JoinSet::new();
+        watches.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<WatchTaskOutput>().await
+        });
+        let (stopped, interrupted) = time::timeout(
+            Duration::from_secs(1),
+            stop_watches_with_ctrl(
+                shutdown,
+                watches,
+                Duration::from_millis(1),
+                &mut pending_ctrl_c(),
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(*observer.borrow());
+        assert!(
+            lifetime.upgrade().is_none(),
+            "Watch task must be dropped before reporting timeout"
+        );
+        assert!(!interrupted);
+        let error = stopped.unwrap_err();
+        assert!(error.contains("watch shutdown timed out"));
+        let report = RunAccounting::new().report(RunTargets::default(), false, true, Some(error));
+        assert!(!report.achieved);
+        assert!(
+            report
+                .termination_error
+                .unwrap()
+                .contains("watch shutdown timed out")
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_update_completion_does_not_discard_pending_periodic_event() {
+        let probe = CreatePhaseProbe::default();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let mut workload = probe_workload();
+        workload.compact_interval_s = 1.0;
+        let report = time::timeout(
+            Duration::from_secs(3),
+            run_with_ctrl_c(probe_config(workload), client, pending_ctrl_c()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report_class(&report, WorkClass::Update).succeeded, 1);
+        assert_eq!(report_class(&report, WorkClass::Compact).accepted, 1);
+        assert_eq!(report_class(&report, WorkClass::Compact).succeeded, 1);
+        assert_eq!(probe.requests.lock().unwrap().len(), 5);
+        assert!(probe.compact_requests.lock().unwrap().is_empty());
+        assert!(report.schedule_complete);
+        assert!(report.achieved, "{:?}", report.termination_error);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn early_worker_panic_is_supervised_before_long_timeline_and_aborts_owned_work() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let (sender, mut workers, worker_lifetime) =
+            spawn_owned_probe_worker(client, probe_workload());
+        let (done, ack) = oneshot::channel();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut ScheduleStats::default()
+        ));
+        probe.wait_for_txns(1).await;
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Status {
+                accounting: tracked(&accounting, WorkClass::Status),
+            },
+            &mut ScheduleStats::default()
+        ));
+        workers.spawn(async {
+            panic!("injected worker panic");
+        });
+        let producer_guard = Arc::new(());
+        let producer_lifetime = Arc::downgrade(&producer_guard);
+        let mut update = Some(tokio::spawn(async move {
+            let _guard = producer_guard;
+            std::future::pending::<Result<u64, String>>().await
+        }));
+        let mut watches = JoinSet::new();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            wait_for_supervised_schedule_event(
+                &mut watches,
+                &mut workers,
+                &mut update,
+                TokioInstant::now() + Duration::from_secs(60),
+                &mut pending_ctrl_c(),
+            ),
+        )
+        .await
+        .unwrap();
+        let Err(error) = result else {
+            panic!("fatal worker panic must preempt timeline");
+        };
+        assert!(error.contains("worker task failed"));
+        assert!(error.contains("injected worker panic"));
+        let producer = update.take().unwrap();
+        producer.abort();
+        assert!(producer.await.unwrap_err().is_cancelled());
+        time::timeout(
+            Duration::from_secs(1),
+            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
+        )
+        .await
+        .unwrap();
+        assert!(producer_lifetime.upgrade().is_none());
+        assert!(worker_lifetime.upgrade().is_none());
+        assert!(ack.await.is_err());
+        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+        let report = accounting.report(RunTargets::default(), false, false, Some(error));
+        assert_eq!(report_class(&report, WorkClass::Bootstrap).unfinished, 1);
+        assert_eq!(report_class(&report, WorkClass::Status).unfinished, 1);
+        assert_eq!(report_class(&report, WorkClass::Status).completed, 0);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        assert!(!report.achieved);
+        assert!(!report.schedule_complete);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn early_update_producer_queue_failure_is_supervised_before_long_timeline() {
+        let probe = CreatePhaseProbe::default();
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let accounting = RunAccounting::new();
+        let workload = probe_workload();
+        let plan = WorkloadPlan::build(&workload).unwrap();
+        let (sender, mut workers, worker_lifetime) =
+            spawn_owned_probe_worker(client, workload.clone());
+        let (done, ack) = oneshot::channel();
+        assert!(try_enqueue(
+            &sender,
+            WorkItem::Bootstrap {
+                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
+                done,
+                accounting: tracked(&accounting, WorkClass::Bootstrap),
+            },
+            &mut ScheduleStats::default()
+        ));
+        probe.wait_for_txns(1).await;
+        let (closed_sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let producer_guard = Arc::new(());
+        let producer_lifetime = Arc::downgrade(&producer_guard);
+        let producer_accounting = Arc::clone(&accounting);
+        let mut update = Some(tokio::spawn(async move {
+            let _guard = producer_guard;
+            run_update_phase(
+                workload,
+                plan,
+                vec![closed_sender],
+                1,
+                7,
+                TokioInstant::now(),
+                Duration::from_secs(60),
+                producer_accounting,
+            )
+            .await
+        }));
+        let mut watches = JoinSet::new();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            wait_for_supervised_schedule_event(
+                &mut watches,
+                &mut workers,
+                &mut update,
+                TokioInstant::now() + Duration::from_secs(60),
+                &mut pending_ctrl_c(),
+            ),
+        )
+        .await
+        .unwrap();
+        let Ok(SupervisedScheduleControl::UpdateFinished(Err(error))) = result else {
+            panic!("actual update producer failure must preempt the long timeline");
+        };
+        update.take();
+        assert!(error.contains("update phase worker queue closed"));
+        time::timeout(
+            Duration::from_secs(1),
+            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
+        )
+        .await
+        .unwrap();
+        assert!(producer_lifetime.upgrade().is_none());
+        assert!(worker_lifetime.upgrade().is_none());
+        assert!(ack.await.is_err());
+        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+        let report = accounting.report(RunTargets::default(), false, false, Some(error));
+        let update = report_class(&report, WorkClass::Update);
+        assert_eq!(update.offered, 1);
+        assert_eq!(update.accepted, 0);
+        assert_eq!(update.dropped_closed, 1);
+        assert_eq!(update.unissued, 0);
+        assert_eq!(report_class(&report, WorkClass::Bootstrap).unfinished, 1);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        assert!(!report.achieved);
+        assert!(!report.schedule_complete);
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn run_cancellation_during_final_compact_drain_returns_interrupted_partial_report() {
+        let probe = CreatePhaseProbe::default();
+        for revision in 1..=3 {
+            probe
+                .next_txn_reply()
+                .send(Ok(compact_response(revision, true, 0, b"")))
+                .unwrap();
+        }
+        let held_reply = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let mut workload = probe_workload();
+        workload.resources[0].update_amplification = 0;
+        workload.timeline[0].duration_s = 0.05;
+        workload.compact_interval_s = 0.05;
+        let (cancel, ctrl_c) = controlled_ctrl_c();
+        let run = tokio::spawn(run_with_ctrl_c(probe_config(workload), client, ctrl_c));
+        probe.wait_for_txns(4).await;
+        cancel.send(()).unwrap();
+        let report = time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = held_reply.send(Ok(compact_response(4, true, 0, b"")));
+        assert!(
+            report.schedule_complete,
+            "cancellation must exercise post-schedule drain"
+        );
+        assert!(report.interrupted);
+        assert!(!report.achieved);
+        assert!(report.termination_error.is_none());
+        assert_eq!(report_class(&report, WorkClass::Bootstrap).succeeded, 2);
+        assert_eq!(report_class(&report, WorkClass::Create).succeeded, 1);
+        let compact = report_class(&report, WorkClass::Compact);
+        assert_eq!(compact.accepted, 1);
+        assert_eq!(compact.completed, 0);
+        assert_eq!(compact.unfinished, 1);
+        assert_eq!(compact.failed, 0);
+        assert_eq!(compact.result_unknown, 0);
+        assert!(probe.compact_requests.lock().unwrap().is_empty());
+        assert_report_equations(&report);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn watch_stop_cancellation_is_latched_until_owned_watch_joins() {
+        let (shutdown, observer) = shutdown_watch::channel(false);
+        let (finish, finished) = oneshot::channel();
+        let guard = Arc::new(());
+        let lifetime = Arc::downgrade(&guard);
+        let mut watches = JoinSet::new();
+        watches.spawn(async move {
+            let _guard = guard;
+            finished.await.unwrap();
+            (
+                "pods".into(),
+                Ok(crate::watch::WatchOutcome {
+                    terminal: crate::watch::WatchTerminal::ContextCanceled,
+                    state: crate::watch::WatchState::default(),
+                }),
+            )
+        });
+        let (cancel, mut ctrl_c) = controlled_ctrl_c();
+        let mut stopping = Box::pin(stop_watches_with_ctrl(
+            shutdown,
+            watches,
+            Duration::from_secs(3),
+            &mut ctrl_c,
+            false,
+        ));
+        assert_pending(stopping.as_mut()).await;
+        assert!(*observer.borrow());
+        cancel.send(()).unwrap();
+        assert_pending(stopping.as_mut()).await;
+        assert!(
+            lifetime.upgrade().is_some(),
+            "report must wait for the owned Watch task"
+        );
+        finish.send(()).unwrap();
+        let (stopped, interrupted) = time::timeout(Duration::from_secs(1), stopping)
+            .await
+            .unwrap();
+        stopped.unwrap();
+        assert!(interrupted);
+        assert!(lifetime.upgrade().is_none());
+        let report = RunAccounting::new().report(RunTargets::default(), interrupted, true, None);
+        assert!(report.interrupted);
+        assert!(!report.achieved);
     }
 }

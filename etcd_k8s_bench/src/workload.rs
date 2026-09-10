@@ -6,7 +6,9 @@
 //! feed that response straight back into [`CasLoop`] without issuing another
 //! Range RPC.
 
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
 use etcdserverpb::{
@@ -41,7 +43,6 @@ pub enum KeyState {
     Absent,
     Present {
         mod_revision: i64,
-        version: i64,
     },
 }
 
@@ -53,17 +54,9 @@ impl KeyState {
         }
     }
 
-    pub fn version(&self) -> Option<i64> {
-        match self {
-            Self::Absent => None,
-            Self::Present { version, .. } => Some(*version),
-        }
-    }
-
     fn from_kv(kv: &mvccpb::KeyValue) -> Self {
         Self::Present {
             mod_revision: kv.mod_revision,
-            version: kv.version,
         }
     }
 }
@@ -302,10 +295,8 @@ pub fn apply_txn_response(
         match attempt.operation {
             ResourceOperation::ConditionalDelete => *state = KeyState::Absent,
             ResourceOperation::Create | ResourceOperation::GuaranteedUpdate => {
-                let version = state.version().unwrap_or(0).saturating_add(1);
                 *state = KeyState::Present {
                     mod_revision: header_revision,
-                    version,
                 };
             }
         }
@@ -335,12 +326,12 @@ pub fn apply_txn_response(
 /// cancel an in-flight attempt.
 pub struct CasLoop {
     current: TxnAttempt,
-    policy: RetryPolicy,
+    policy: CasRetryPolicy,
     deadline: Instant,
 }
 
 impl CasLoop {
-    pub fn new(current: TxnAttempt, policy: RetryPolicy, deadline: Instant) -> Self {
+    pub fn new(current: TxnAttempt, policy: CasRetryPolicy, deadline: Instant) -> Self {
         Self {
             current,
             policy,
@@ -445,70 +436,23 @@ pub enum ExhaustedReason {
     RetryPolicy,
 }
 
-/// Resource-level retry policy.  Timing is data only; the scheduler decides
-/// when to run the next logical operation.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RetryPolicy {
-    /// Maximum storage attempts, including the first attempt. `u32::MAX`
-    /// represents controller-style rate-limited requeue.
+/// Storage-side CAS attempt budget; the driving operation owns its deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CasRetryPolicy {
+    /// Maximum storage attempts, including the first. `u32::MAX` lets the
+    /// operation deadline bound normal storage CAS contention.
     pub max_attempts: u32,
-    pub delay: Duration,
-    /// Symmetric jitter ratio. Event policy is 0.25 (±25%).
-    pub jitter_ratio: f64,
 }
 
-impl RetryPolicy {
-    pub const fn generic_controller() -> Self {
+impl CasRetryPolicy {
+    pub const fn until_deadline() -> Self {
         Self {
             max_attempts: u32::MAX,
-            delay: Duration::ZERO,
-            jitter_ratio: 0.0,
-        }
-    }
-
-    pub const fn node_status() -> Self {
-        Self {
-            max_attempts: 5,
-            delay: Duration::ZERO,
-            jitter_ratio: 0.0,
-        }
-    }
-
-    pub const fn node_lease() -> Self {
-        Self {
-            max_attempts: 5,
-            delay: Duration::ZERO,
-            jitter_ratio: 0.0,
-        }
-    }
-
-    pub const fn event() -> Self {
-        Self {
-            max_attempts: 12,
-            delay: Duration::from_secs(10),
-            jitter_ratio: 0.25,
         }
     }
 
     fn allows_retry(&self, attempt: u32, now: Instant, deadline: Instant) -> bool {
         attempt < self.max_attempts && now < deadline
-    }
-
-    /// Deterministically derive the event retry delay from a seed.  This is a
-    /// pure calculation; no timer is started here.
-    pub fn delay_for(&self, seed: u64, attempt: u32) -> Duration {
-        if self.jitter_ratio == 0.0 || self.delay.is_zero() {
-            return self.delay;
-        }
-        // SplitMix64 gives stable, inexpensive pseudo-randomness without a
-        // global RNG or a dynamic label.  `unit` is in [0, 1).
-        let mut x = seed.wrapping_add((attempt as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        x ^= x >> 31;
-        let unit = (x as f64) / (u64::MAX as f64);
-        let factor = 1.0 - self.jitter_ratio + 2.0 * self.jitter_ratio * unit;
-        self.delay.mul_f64(factor)
     }
 }
 
@@ -605,24 +549,18 @@ mod tests {
     #[test]
     fn conflict_kv_drives_next_attempt_revision_and_new_value() {
         let first = TxnAttempt::update(b"k", b"old", 3);
-        let mut state = KeyState::Present {
-            mod_revision: 3,
-            version: 1,
-        };
+        let mut state = KeyState::Present { mod_revision: 3 };
         let applied = first.apply_response(&conflict(9, b"latest", 4), &mut state);
         assert_eq!(
             applied,
             AppliedTxn::Conflict {
                 header_revision: 10,
-                latest: KeyState::Present {
-                    mod_revision: 9,
-                    version: 4,
-                }
+                latest: KeyState::Present { mod_revision: 9 }
             }
         );
         let mut loop_state = CasLoop::new(
             first,
-            RetryPolicy::node_status(),
+            CasRetryPolicy { max_attempts: 5 },
             Instant::now() + Duration::from_secs(1),
         );
         let decision = loop_state.observe(&conflict(9, b"latest", 4), Instant::now());
@@ -655,7 +593,7 @@ mod tests {
         let attempt = TxnAttempt::create(b"k", b"v");
         let mut loop_state = CasLoop::new(
             attempt,
-            RetryPolicy::generic_controller(),
+            CasRetryPolicy::until_deadline(),
             Instant::now() + Duration::from_secs(1),
         );
         let response = TxnResponse {
@@ -669,16 +607,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn event_policy_is_twelve_attempts_and_symmetric_jitter() {
-        let policy = RetryPolicy::event();
-        assert_eq!(policy.max_attempts, 12);
-        for attempt in 0..32 {
-            let delay = policy.delay_for(attempt as u64, attempt);
-            assert!(delay >= Duration::from_millis(7_500));
-            assert!(delay <= Duration::from_millis(12_500));
-        }
-    }
     #[test]
     fn native_lease_attachment_is_limited_to_put_transactions() {
         assert!(ResourceOperation::Create.uses_native_lease());

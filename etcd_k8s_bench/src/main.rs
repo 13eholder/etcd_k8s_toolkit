@@ -5,6 +5,7 @@ mod heartbeat;
 mod lease;
 mod metrics;
 mod pb;
+mod report;
 mod scheduler;
 mod watch;
 mod workload;
@@ -95,10 +96,18 @@ async fn run() -> Result<(), String> {
         ));
     }
 
-    let stats = scheduler::run(config, client).await?;
-    eprintln!(
-        "scheduled {} work items ({} dropped due to backpressure)",
-        stats.scheduled, stats.dropped
-    );
+    let report = scheduler::run(config, client).await;
+    let json = serde_json::to_string(&report).map_err(|error| format!("encode report: {error}"))?;
+    println!("{json}");
+    if !report.achieved {
+        let reason = report
+            .termination_error
+            .as_deref()
+            .unwrap_or("required work was not fully completed");
+        return Err(format!("scheduler did not achieve target: {reason}"));
+    }
+    let offered: u64 = report.work_items.iter().map(|item| item.offered).sum();
+    let dropped: u64 = report.work_items.iter().map(|item| item.dropped).sum();
+    eprintln!("offered {offered} work items ({dropped} dropped)");
     Ok(())
 }

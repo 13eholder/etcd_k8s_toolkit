@@ -13,7 +13,7 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:2379";
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "etcd_k8s_bench",
-    about = "Apply Kubernetes etcd API pressure from an exact workload model"
+    about = "Apply synthetic Kubernetes-type etcd API pressure"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -71,10 +71,6 @@ pub struct RunArgs {
     #[arg(long, value_parser = parse_positive_u64)]
     pub pods: Option<u64>,
 
-    /// Scale update-phase duration and periodic task intervals; exact object and update counts are unchanged.
-    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f64)]
-    pub time_scale: f64,
-
     /// Number of gRPC workers.
     #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
     pub workers: usize,
@@ -101,13 +97,13 @@ pub struct GenProfileArgs {
     #[command(flatten)]
     pub base: BaseArgs,
 
-    /// Pods recreated per rolling-update wave (sets the DaemonSet update
-    /// count, 2 per wave).
+    /// Modeled Pods per batch; derives two DaemonSet updates per batch.
+    /// Does not execute rollout waves or recreate Pods.
     #[arg(long, default_value_t = 500, value_parser = parse_positive_u64)]
     pub batch_size: u64,
 
-    /// Target application transactions per second; the run duration is
-    /// derived as total operation budget divided by this rate.
+    /// Application operation-budget rate used to derive timeline duration.
+    /// Includes creates and updates; not a guaranteed RPC throughput.
     #[arg(long, default_value_t = 2000.0, value_parser = parse_positive_f64)]
     pub txn_rps: f64,
 
@@ -207,12 +203,6 @@ impl RunArgs {
         if self.endpoint.trim().is_empty() {
             return Err(ConfigError::Invalid("endpoint must not be empty".into()));
         }
-        if !self.time_scale.is_finite() || self.time_scale <= 0.0 {
-            return Err(ConfigError::Invalid(
-                "time_scale must be greater than zero".into(),
-            ));
-        }
-        validate_scaled_durations(&workload, self.time_scale)?;
         if self.base.max_message_size == 0 {
             return Err(ConfigError::Invalid(
                 "max_message_size must be greater than zero".into(),
@@ -224,7 +214,6 @@ impl RunArgs {
             pod_size: workload.pod_size_bytes,
             nodes: workload.topology.node_count,
             workload,
-            time_scale: self.time_scale,
             workers: self.workers,
             queue_capacity: self.queue_capacity,
             request_timeout: self.request_timeout,
@@ -250,47 +239,6 @@ impl RunArgs {
             )),
         }
     }
-}
-fn validate_scaled_duration(
-    seconds: f64,
-    scale: f64,
-    field: &str,
-) -> Result<Duration, ConfigError> {
-    let scaled = seconds * scale;
-    let max_seconds = Duration::MAX.as_secs() as f64;
-    if !scaled.is_finite() || scaled < 0.0 || scaled >= max_seconds {
-        return Err(ConfigError::Invalid(format!(
-            "{field} scaled duration is not representable"
-        )));
-    }
-    Ok(Duration::from_secs_f64(scaled))
-}
-
-fn validate_scaled_durations(workload: &WorkloadSpec, scale: f64) -> Result<(), ConfigError> {
-    let mut timeline_total = Duration::ZERO;
-    for (index, segment) in workload.timeline.iter().enumerate() {
-        let duration = validate_scaled_duration(
-            segment.duration_s,
-            scale,
-            &format!("timeline[{index}].duration_s"),
-        )?;
-        timeline_total = timeline_total.checked_add(duration).ok_or_else(|| {
-            ConfigError::Invalid("scaled timeline duration is not representable".into())
-        })?;
-    }
-    let _ = timeline_total;
-    validate_scaled_duration(
-        workload.nodes.status_interval_s,
-        scale,
-        "nodes.status_interval_s",
-    )?;
-    validate_scaled_duration(
-        workload.nodes.lease_interval_s,
-        scale,
-        "nodes.lease_interval_s",
-    )?;
-    validate_scaled_duration(workload.compact_interval_s, scale, "compact_interval_s")?;
-    Ok(())
 }
 
 fn parse_profile_name(value: &str) -> Result<String, String> {
@@ -543,16 +491,20 @@ mod tests {
     }
 
     #[test]
-    fn time_scale_changes_duration_without_changing_exact_targets() {
-        let base = run_config(&[]).unwrap();
-        let scaled = run_config(&["--time-scale", "0.5"]).unwrap();
-        assert_eq!(
-            crate::scheduler::application_operation_total(&base.workload),
-            crate::scheduler::application_operation_total(&scaled.workload)
+    fn removed_time_option_is_rejected_and_profile_duration_is_used() {
+        assert!(Cli::try_parse_from(["bench", "run", "--time-scale", "0.5"]).is_err());
+        let config = run_config(&[]).unwrap();
+        let expected = Duration::from_secs_f64(
+            config
+                .workload
+                .timeline
+                .iter()
+                .map(|segment| segment.duration_s)
+                .sum(),
         );
         assert_eq!(
-            crate::scheduler::Scheduler::new(&scaled).duration(),
-            crate::scheduler::Scheduler::new(&base).duration() / 2
+            crate::scheduler::Scheduler::new(&config).duration(),
+            expected
         );
     }
 
@@ -604,6 +556,17 @@ mod tests {
         assert_eq!(pods.update_amplification, 4);
         let total = crate::scheduler::application_operation_total(&spec);
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_profile_rejects_subnanosecond_duration_before_write() {
+        let dir = temp_dir("subnanosecond");
+        let args = gen_args(&["--txn-rps", "1e15", "--name", "subnanosecond"]);
+        let error = args.generate_to(&dir).unwrap_err().to_string();
+        assert!(error.contains("timeline[0].duration_s"));
+        assert!(error.contains("nanosecond"));
+        assert!(!dir.join("subnanosecond.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -692,6 +655,17 @@ mod tests {
         assert_eq!(
             crate::scheduler::application_operation_total(&config.workload),
             8 * 10 + 1 + 2 * 2
+        );
+        assert_eq!(
+            crate::scheduler::Scheduler::new(&config).duration(),
+            Duration::from_secs_f64(
+                config
+                    .workload
+                    .timeline
+                    .iter()
+                    .map(|segment| segment.duration_s)
+                    .sum(),
+            ),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -39,7 +39,7 @@
       },
       "update_amplification": 4,
       "value_size_bytes": 4096,
-      "retry_policy": "guaranteed_update",
+      "behavior": "guaranteed_update",
       "lease_pool": null
     },
     {
@@ -51,7 +51,7 @@
       },
       "update_amplification": 0,
       "value_size_bytes": 677,
-      "retry_policy": "event",
+      "behavior": "event",
       "lease_pool": "events"
     },
     {
@@ -63,7 +63,7 @@
       },
       "update_amplification": 40,
       "value_size_bytes": 2858,
-      "retry_policy": "guaranteed_update",
+      "behavior": "guaranteed_update",
       "lease_pool": null
     },
     {
@@ -75,7 +75,7 @@
       },
       "update_amplification": 0,
       "value_size_bytes": 66,
-      "retry_policy": "master_lease",
+      "behavior": "master_lease",
       "lease_pool": "masterleases"
     }
   ],
@@ -240,6 +240,34 @@
     {
       "name": "pods",
       "resource_prefix": "/registry/pods",
+      "start_revision": 0,
+      "prev_kv": true,
+      "progress_notify": true
+    },
+    {
+      "name": "events",
+      "resource_prefix": "/registry/events",
+      "start_revision": 0,
+      "prev_kv": true,
+      "progress_notify": true
+    },
+    {
+      "name": "leases",
+      "resource_prefix": "/registry/leases",
+      "start_revision": 0,
+      "prev_kv": true,
+      "progress_notify": true
+    },
+    {
+      "name": "daemonsets",
+      "resource_prefix": "/registry/daemonsets",
+      "start_revision": 0,
+      "prev_kv": true,
+      "progress_notify": true
+    },
+    {
+      "name": "nodes",
+      "resource_prefix": "/registry/minions",
       "start_revision": 0,
       "prev_kv": true,
       "progress_notify": true

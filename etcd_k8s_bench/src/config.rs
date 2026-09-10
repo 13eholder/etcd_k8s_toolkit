@@ -21,7 +21,6 @@ pub struct RuntimeConfig {
     pub workload: WorkloadSpec,
     pub pod_size: usize,
     pub nodes: u64,
-    pub time_scale: f64,
     pub workers: usize,
     pub queue_capacity: usize,
     pub request_timeout: Duration,
@@ -179,7 +178,7 @@ pub struct ResourceSpec {
     pub count: ResourceCountSpec,
     pub update_amplification: u64,
     pub value_size_bytes: usize,
-    pub retry_policy: RetryPolicy,
+    pub behavior: ResourceBehavior,
     #[serde(default)]
     pub lease_pool: Option<String>,
 }
@@ -213,10 +212,9 @@ pub struct EtcdLeasePoolSpec {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum RetryPolicy {
+pub enum ResourceBehavior {
     CreateOnly,
     GuaranteedUpdate,
-    ConditionalDelete,
     Event,
     MasterLease,
 }
@@ -235,6 +233,21 @@ pub enum ConfigError {
     Invalid(String),
 }
 const MAX_ETCD_LEASE_SECONDS: u64 = i64::MAX as u64;
+fn checked_duration(seconds: f64, field: &str) -> Result<Duration, ConfigError> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    let duration = Duration::try_from_secs_f64(seconds)
+        .map_err(|_| ConfigError::Invalid(format!("{field} duration is not representable")))?;
+    if duration.is_zero() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} duration is below nanosecond precision"
+        )));
+    }
+    Ok(duration)
+}
 
 impl WorkloadSpec {
     pub fn from_json(input: &str) -> Result<Self, ConfigError> {
@@ -269,15 +282,18 @@ impl WorkloadSpec {
         }
         self.topology.validate()?;
         self.nodes.validate()?;
+        checked_duration(self.nodes.status_interval_s, "nodes.status_interval_s")?;
+        checked_duration(self.nodes.lease_interval_s, "nodes.lease_interval_s")?;
         if self.timeline.is_empty() {
             return Err(ConfigError::Invalid("timeline must not be empty".into()));
         }
+        let mut timeline_total = Duration::ZERO;
         for (index, segment) in self.timeline.iter().enumerate() {
-            if !segment.duration_s.is_finite() || segment.duration_s <= 0.0 {
-                return Err(ConfigError::Invalid(format!(
-                    "timeline[{index}].duration_s must be greater than zero"
-                )));
-            }
+            let duration =
+                checked_duration(segment.duration_s, &format!("timeline[{index}].duration_s"))?;
+            timeline_total = timeline_total.checked_add(duration).ok_or_else(|| {
+                ConfigError::Invalid("timeline duration is not representable".into())
+            })?;
             if !segment.range_rps.is_finite() || segment.range_rps < 0.0 {
                 return Err(ConfigError::Invalid(format!(
                     "timeline[{index}].range_rps must be non-negative"
@@ -300,14 +316,14 @@ impl WorkloadSpec {
             }
             resource.validate(index, &self.topology, &self.relationships, max_message_size)?;
             let requires_native_lease = matches!(
-                &resource.retry_policy,
-                RetryPolicy::Event | RetryPolicy::MasterLease
+                &resource.behavior,
+                ResourceBehavior::Event | ResourceBehavior::MasterLease
             );
             match (&resource.lease_pool, requires_native_lease) {
                 (None, true) => {
                     return Err(ConfigError::Invalid(format!(
-                        "resources[{index}].retry_policy {:?} requires lease_pool",
-                        resource.retry_policy
+                        "resources[{index}].behavior {:?} requires lease_pool",
+                        resource.behavior
                     )));
                 }
                 (Some(_), false) => {
@@ -397,16 +413,8 @@ impl WorkloadSpec {
             }
             pool.validate(index)?;
         }
-        if self.compact_interval_s <= 0.0 || !self.compact_interval_s.is_finite() {
-            return Err(ConfigError::Invalid(
-                "compact_interval_s must be greater than zero".into(),
-            ));
-        }
-        if !self.master_lease_interval_s.is_finite() || self.master_lease_interval_s <= 0.0 {
-            return Err(ConfigError::Invalid(
-                "master_lease_interval_s must be greater than zero".into(),
-            ));
-        }
+        checked_duration(self.compact_interval_s, "compact_interval_s")?;
+        checked_duration(self.master_lease_interval_s, "master_lease_interval_s")?;
         Ok(())
     }
 
@@ -546,27 +554,37 @@ impl WorkloadSpec {
         resources.extend(
             self.resources
                 .iter()
-                .filter(|r| r.retry_policy == RetryPolicy::MasterLease)
+                .filter(|r| r.behavior == ResourceBehavior::MasterLease)
                 .cloned(),
         );
         spec.resources = resources;
+        spec.watches.retain(|watch| {
+            watch.resource_prefix == "/registry/minions"
+                || (spec.nodes.node_lease_enabled && watch.resource_prefix == "/registry/leases")
+                || spec.resources.iter().any(|resource| {
+                    resource
+                        .key_pattern
+                        .strip_prefix(watch.resource_prefix.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+        });
 
-        // Scale the count-only Range share by the duration ratio and clamp it
-        // against the exact deterministic prefix capacity at the floored
-        // segment total; the runtime cursor never schedules fewer ranges
-        // than that floor, so range_shape_plan can never fail at scale 1.
-        // The margin (one per range shape, two per segment) covers rounding
-        // drift when run-time duration scaling changes the number of
-        // scheduled Range requests.
+        // Adjust the count-only Range share for the generated profile's
+        // timeline duration and clamp it against the exact deterministic
+        // prefix capacity at the floored segment total. The runtime cursor
+        // never schedules fewer ranges than that floor, so range_shape_plan
+        // can never fail for a valid generated profile. The margin (one per
+        // range shape, two per segment) covers rounding drift.
         let floor_range_total = (range_rps * seconds).floor() as u64;
-        let scaled_count_only = if base_seconds > 0.0 {
+        let duration_adjusted_count_only = if base_seconds > 0.0 {
             (self.range_count_only_count as f64 * seconds / base_seconds).round() as u64
         } else {
             self.range_count_only_count
         };
         let capacity = crate::scheduler::exact_prefix_capacity(&spec, floor_range_total);
         let drift_margin = spec.ranges.len() as u64 + 2;
-        spec.range_count_only_count = scaled_count_only.min(capacity.saturating_sub(drift_margin));
+        spec.range_count_only_count =
+            duration_adjusted_count_only.min(capacity.saturating_sub(drift_margin));
         Ok(spec)
     }
 }
@@ -888,13 +906,13 @@ impl ResourceSpec {
             })?;
         if self.update_amplification > 0
             && matches!(
-                self.retry_policy,
-                RetryPolicy::CreateOnly | RetryPolicy::ConditionalDelete | RetryPolicy::MasterLease
+                self.behavior,
+                ResourceBehavior::CreateOnly | ResourceBehavior::MasterLease
             )
         {
             return Err(ConfigError::Invalid(format!(
-                "resources[{index}] retry_policy {:?} cannot have update_amplification",
-                self.retry_policy
+                "resources[{index}] behavior {:?} cannot have update_amplification",
+                self.behavior
             )));
         }
         if self.value_size_bytes == 0 {
@@ -980,6 +998,41 @@ mod tests {
 
     fn embedded() -> WorkloadSpec {
         WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap()
+    }
+
+    #[test]
+    fn active_profiles_round_trip_resource_behavior() {
+        for input in [
+            include_str!("../workloads/k8s.json"),
+            include_str!("../workloads/k8s-no-node-lease.json"),
+            include_str!("../workloads/rolling-update.json"),
+        ] {
+            let spec = WorkloadSpec::from_json(input).unwrap();
+            let serialized = serde_json::to_string(&spec).unwrap();
+            assert_eq!(WorkloadSpec::from_json(&serialized).unwrap(), spec);
+        }
+    }
+
+    #[test]
+    fn legacy_retry_policy_field_is_rejected() {
+        let mut json = serde_json::to_value(embedded()).unwrap();
+        let resource = json["resources"][0].as_object_mut().unwrap();
+        let behavior = resource.remove("behavior").unwrap();
+        resource.insert("retry_policy".into(), behavior);
+        let error = WorkloadSpec::from_json(&json.to_string()).unwrap_err();
+        assert!(error.to_string().contains("unknown field `retry_policy`"));
+    }
+
+    #[test]
+    fn unsupported_conditional_delete_behavior_is_rejected() {
+        let mut json = serde_json::to_value(embedded()).unwrap();
+        json["resources"][0]["behavior"] = serde_json::json!("conditional_delete");
+        let error = WorkloadSpec::from_json(&json.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown variant `conditional_delete`")
+        );
     }
 
     #[test]
@@ -1271,16 +1324,6 @@ mod tests {
         assert!(real.nodes.node_lease_enabled);
     }
     #[test]
-    fn built_in_watch_uses_resource_root_without_trailing_slash() {
-        for spec in [
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap(),
-            WorkloadSpec::from_json(include_str!("../workloads/k8s.json")).unwrap(),
-        ] {
-            assert_eq!(spec.watches.len(), 1);
-            assert_eq!(spec.watches[0].resource_prefix, "/registry/pods");
-        }
-    }
-    #[test]
     fn watch_rejects_legacy_or_non_root_prefixes() {
         let mut input: serde_json::Value =
             serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
@@ -1384,10 +1427,205 @@ mod tests {
         assert!(error.contains("selector_keep_every"));
     }
 
+    #[test]
+    fn duration_validation_preserves_effective_and_total_boundaries() {
+        let mut exact = embedded();
+        exact.timeline[0].duration_s = 1e-9;
+        exact.validate(64 * 1024 * 1024).unwrap();
+
+        let mut subnano = embedded();
+        subnano.timeline[0].duration_s = 0.1e-9;
+        let error = subnano.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("timeline[0].duration_s"));
+        assert!(error.contains("nanosecond"));
+
+        for field in [
+            "nodes.status_interval_s",
+            "nodes.lease_interval_s",
+            "compact_interval_s",
+            "master_lease_interval_s",
+        ] {
+            let mut spec = embedded();
+            match field {
+                "nodes.status_interval_s" => spec.nodes.status_interval_s = 0.1e-9,
+                "nodes.lease_interval_s" => spec.nodes.lease_interval_s = 0.1e-9,
+                "compact_interval_s" => spec.compact_interval_s = 0.1e-9,
+                "master_lease_interval_s" => spec.master_lease_interval_s = 0.1e-9,
+                _ => unreachable!(),
+            }
+            let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("nanosecond"), "{error}");
+        }
+
+        let mut too_large = embedded();
+        too_large.timeline[0].duration_s = f64::MAX;
+        let error = too_large
+            .validate(64 * 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timeline[0].duration_s"));
+        assert!(error.contains("not representable"));
+
+        let mut overflowing = embedded();
+        overflowing.timeline = vec![
+            TimelineSegment {
+                duration_s: 1e19,
+                range_rps: 0.0,
+            },
+            TimelineSegment {
+                duration_s: 1e19,
+                range_rps: 0.0,
+            },
+        ];
+        let error = overflowing
+            .validate(64 * 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timeline duration is not representable"));
+    }
+
     fn rolling(base: &WorkloadSpec, nodes: u64, batch: u64) -> Result<WorkloadSpec, ConfigError> {
         let range = crate::scheduler::range_request_total(base, 1);
         let app = crate::scheduler::application_operation_total(base);
         base.rolling_update(nodes, batch, 500.0, "rolling-test", range, app)
+    }
+
+    #[test]
+    fn embedded_watch_defaults_cover_modeled_api_roots() {
+        let expected: HashSet<_> = [
+            "/registry/pods",
+            "/registry/events",
+            "/registry/replicasets",
+            "/registry/deployments",
+            "/registry/leases",
+            "/registry/daemonsets",
+            "/registry/services",
+            "/registry/endpointslices",
+            "/registry/minions",
+        ]
+        .into_iter()
+        .collect();
+        for input in [
+            include_str!("../workloads/k8s.json"),
+            include_str!("../workloads/k8s-no-node-lease.json"),
+        ] {
+            let spec = WorkloadSpec::from_json(input).unwrap();
+            let roots: HashSet<_> = spec
+                .watches
+                .iter()
+                .map(|watch| watch.resource_prefix.as_str())
+                .collect();
+            assert_eq!(roots, expected);
+            assert_eq!(spec.watches.len(), expected.len());
+            assert!(spec.watches.iter().all(|watch| {
+                watch.start_revision == 0 && watch.prev_kv && watch.progress_notify
+            }));
+        }
+    }
+
+    #[test]
+    fn rolling_update_preserves_matching_subscriptions_and_their_options() {
+        let mut base = embedded();
+        let duplicate = WatchSpec {
+            name: "pods-secondary".into(),
+            start_revision: 17,
+            prev_kv: false,
+            progress_notify: false,
+            ..base.watches[0].clone()
+        };
+        base.watches.insert(1, duplicate.clone());
+        base.watches.push(WatchSpec {
+            name: "prefix-collision".into(),
+            resource_prefix: "/registry/pod".into(),
+            ..duplicate.clone()
+        });
+        base.watches.push(WatchSpec {
+            name: "explicit-masterleases".into(),
+            resource_prefix: "/registry/masterleases".into(),
+            ..duplicate
+        });
+        let expected: Vec<_> = base
+            .watches
+            .iter()
+            .filter(|watch| {
+                matches!(
+                    watch.resource_prefix.as_str(),
+                    "/registry/pods"
+                        | "/registry/events"
+                        | "/registry/daemonsets"
+                        | "/registry/minions"
+                        | "/registry/masterleases"
+                )
+            })
+            .cloned()
+            .collect();
+        let spec = rolling(&base, 50, 7).unwrap();
+        assert_eq!(spec.watches, expected);
+        assert_eq!(spec.watches.len(), 6);
+        spec.validate(64 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn rolling_update_watches_follow_custom_resource_paths() {
+        let mut base = embedded();
+        base.resources
+            .iter_mut()
+            .find(|resource| resource.name == "pods")
+            .unwrap()
+            .key_pattern = "/registry/custom-pods/bench-{ns}/{id}".into();
+        let custom = WatchSpec {
+            name: "custom-pods".into(),
+            resource_prefix: "/registry/custom-pods".into(),
+            ..base.watches[0].clone()
+        };
+        base.watches.push(custom.clone());
+        let spec = rolling(&base, 50, 7).unwrap();
+        assert!(spec.watches.contains(&custom));
+        assert!(
+            !spec
+                .watches
+                .iter()
+                .any(|watch| watch.resource_prefix == "/registry/pods")
+        );
+        spec.validate(64 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn rolling_update_watch_roots_follow_nodelease_enablement() {
+        let mut base = embedded();
+        for enabled in [false, true] {
+            base.nodes.node_lease_enabled = enabled;
+            let spec = rolling(&base, 50, 7).unwrap();
+            assert_eq!(spec.watches.len(), if enabled { 5 } else { 4 });
+            assert_eq!(
+                spec.watches
+                    .iter()
+                    .any(|watch| watch.resource_prefix == "/registry/leases"),
+                enabled
+            );
+            assert!(
+                spec.watches
+                    .iter()
+                    .any(|watch| watch.resource_prefix == "/registry/minions")
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_update_does_not_invent_subscriptions() {
+        let mut base = embedded();
+        base.watches.clear();
+        assert!(rolling(&base, 50, 7).unwrap().watches.is_empty());
+    }
+
+    #[test]
+    fn published_rolling_watch_defaults_match_generated_profile() {
+        let base = WorkloadSpec::from_json(include_str!("../workloads/k8s.json")).unwrap();
+        let generated = rolling(&base, 10_000, 500).unwrap();
+        let published =
+            WorkloadSpec::from_json(include_str!("../workloads/rolling-update.json")).unwrap();
+        assert_eq!(published.watches, generated.watches);
     }
 
     #[test]
@@ -1429,7 +1667,7 @@ mod tests {
         assert!(
             spec.resources
                 .iter()
-                .any(|r| r.retry_policy == RetryPolicy::MasterLease)
+                .any(|r| r.behavior == ResourceBehavior::MasterLease)
         );
         spec.validate(64 * 1024 * 1024).unwrap();
     }
@@ -1444,7 +1682,6 @@ mod tests {
         assert_eq!(spec.nodes.node_lease_enabled, base.nodes.node_lease_enabled);
         assert_eq!(spec.ranges, base.ranges);
         assert_eq!(spec.status_count, base.status_count);
-        assert_eq!(spec.watches, base.watches);
         // Budget 8*50+1+2*ceil(50/7) = 417 at 500 rps -> 0.834s.
         assert_eq!(spec.timeline[0].duration_s, 0.834);
     }
@@ -1472,7 +1709,7 @@ mod tests {
         // A base without events/daemonsets must not budget their operations.
         let mut base = embedded();
         base.resources
-            .retain(|r| r.name == "pods" || r.retry_policy == RetryPolicy::MasterLease);
+            .retain(|r| r.name == "pods" || r.behavior == ResourceBehavior::MasterLease);
         let spec = rolling(&base, 100, 10).unwrap();
         assert!(
             spec.resources
@@ -1498,10 +1735,10 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_count_only_clamp_covers_scaling_drift() {
-        // Tight count-only budget at the floored capacity: without the drift
-        // margin a run with --time-scale != 1 could still fail
-        // range_shape_plan. The clamp must land at zero here.
+    fn rolling_update_count_only_clamp_covers_rounding_drift() {
+        // Tight count-only budget at the floored capacity: without the
+        // drift margin, generated range scheduling could exceed the shape
+        // capacity. The clamp must land at zero here.
         let mut base = embedded();
         base.timeline = vec![TimelineSegment {
             duration_s: 30.0,
