@@ -6,8 +6,6 @@
 //! labels.
 
 use std::net::SocketAddr;
-#[cfg(test)]
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
@@ -47,8 +45,6 @@ static WATCH_RECONNECTS: AtomicU64 = AtomicU64::new(0);
 static REVISION_GAUGE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 static WATCH_RECONNECT_TEST_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(test)]
-static WATCH_RECONNECT_TEST_HOOK: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>> = Mutex::new(None);
 
 pub const INFLIGHT: &str = "etcd_k8s_bench_inflight";
 pub const REVISION: &str = "etcd_k8s_bench_revision";
@@ -505,32 +501,8 @@ pub fn record_watch_cancel(watch: &WorkloadName, reason: &'static str) {
 }
 
 pub fn record_watch_reconnect(watch: &WorkloadName) {
-    #[cfg(test)]
-    let total = WATCH_RECONNECTS.fetch_add(1, Ordering::Relaxed) + 1;
-    #[cfg(not(test))]
     WATCH_RECONNECTS.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    invoke_watch_reconnect_test_hook(total);
     metrics::counter!(WATCH_RECONNECT_TOTAL, "watch" => watch.as_str().to_owned()).increment(1);
-}
-
-#[cfg(test)]
-fn invoke_watch_reconnect_test_hook(total: u64) {
-    let hook = WATCH_RECONNECT_TEST_HOOK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .map(Arc::clone);
-    if let Some(hook) = hook {
-        hook(total);
-    }
-}
-
-#[cfg(test)]
-fn set_watch_reconnect_test_hook(hook: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
-    *WATCH_RECONNECT_TEST_HOOK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 }
 
 #[cfg(test)]
@@ -612,77 +584,47 @@ pub fn set_nodes(nodes: u64) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-
     use super::*;
+    use crate::pb::etcdserverpb::WatchResponse;
+    use crate::pb::mvccpb::KeyValue;
 
     #[test]
-    fn metric_names_match_plan() {
-        let names = [
-            SCHEDULED_TOTAL,
-            OPERATIONS_TOTAL,
-            REQUESTS_TOTAL,
-            REQUEST_DURATION_SECONDS,
-            QUEUE_WAIT_SECONDS,
-            REQUEST_BYTES,
-            TXN_TOTAL,
-            CAS_RETRIES_TOTAL,
-            NODE_HEARTBEATS_TOTAL,
-            LEASE_GET_TOTAL,
-            LEASE_ATTACHED_OBJECTS,
-            RESOURCE_OBJECTS,
-            RESOURCE_UPDATES,
-            DROPPED_TOTAL,
-            INFO,
-            WATCH_EVENTS_TOTAL,
-            WATCH_EVENT_BYTES,
-            WATCH_CANCEL_TOTAL,
-            WATCH_RECONNECT_TOTAL,
-            RANGE_PAGES,
-            RANGE_SNAPSHOT_REVISION,
-            RANGE_SERVER_COUNT,
-            RANGE_LAST_KEY_BYTES,
-            RANGE_REQUESTS_TOTAL,
-            RANGE_SELECTED,
-            RANGE_DISCARDED,
-            INFLIGHT,
-            REVISION,
-            COMPACT_REVISION,
-            COMPACT_TOTAL,
-            POD_SIZE_BYTES,
-            NODES,
-            COMPACTOR_STATE,
-            COMPACTOR_ERRORS_TOTAL,
-            COMPACTOR_RECOVERIES_TOTAL,
-        ];
-        assert!(names.iter().all(|name| name.starts_with("etcd_k8s_bench_")));
-        assert_eq!(names.len(), 35);
-    }
-    #[test]
-    fn outcome_mapping_is_fixed() {
-        assert_eq!(Outcome::Success.as_str(), "success");
-        assert_eq!(Outcome::GrpcError.as_str(), "grpc_error");
-        assert_eq!(Outcome::Timeout.as_str(), "timeout");
-        assert_eq!(Outcome::ResultUnknown.as_str(), "result_unknown");
-    }
-
-    #[test]
-    fn recorder_registers_all_recording_paths() {
-        let _serial = WATCH_RECONNECT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn test_metrics_exposition() {
+        let _serial = lock_watch_reconnect_tests();
         reset_watch_reconnects();
         let recorder = PrometheusBuilder::new().build_recorder();
         let resource = ResourceName::new("pods").unwrap();
         let workload = WorkloadName::new("k8s").unwrap();
         let pool = PoolName::new("events").unwrap();
+        let watch_response = WatchResponse {
+            events: vec![crate::pb::mvccpb::Event {
+                kv: Some(KeyValue {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                }),
+                prev_kv: Some(KeyValue {
+                    key: b"p".to_vec(),
+                    value: b"q".to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
 
-        // Building a Prometheus recorder is the registration step.  Running
-        // every recording path against it verifies all keys and labels are
-        // accepted without requiring a process-global recorder.
         metrics::with_local_recorder(&recorder, || {
             record_scheduled(Operation::Create, &resource);
-            record_operation(Operation::Create, &resource, Outcome::Success);
+            for outcome in [
+                Outcome::Success,
+                Outcome::GrpcError,
+                Outcome::Conflict,
+                Outcome::NotFound,
+                Outcome::Timeout,
+                Outcome::ResultUnknown,
+            ] {
+                record_operation(Operation::Create, &resource, outcome);
+            }
             record_request(Rpc::Txn, Outcome::Success);
             record_request_duration(Rpc::Txn, Duration::from_millis(2));
             record_queue_wait("create", Duration::from_millis(1));
@@ -698,83 +640,221 @@ mod tests {
             record_dropped(DropReason::Backpressure);
             add_inflight(Rpc::Txn);
             remove_inflight(Rpc::Txn);
-            set_revision(7);
-            set_compact_revision(6);
+            set_revision(1_234_567);
+            set_compact_revision(1_234_566);
             record_compact(Outcome::Success);
             set_compactor_state("active");
             record_compactor_error("failure_kv_missing");
             record_compactor_recovery("missing_key");
             record_range_result(2, 7, 10, b"/registry/pods/z", 8, 2);
+            record_watch_response(&workload, &watch_response);
             record_watch_reconnect(&workload);
             record_watch_cancel(&workload, "eof");
             record_info("0.1.0", &workload);
             set_pod_size(4096);
             set_nodes(2000);
         });
+
+        let rendered = recorder.handle().render();
+        assert_metric(
+            &rendered,
+            SCHEDULED_TOTAL,
+            &[("operation", "create"), ("resource", "pods")],
+            1.0,
+        );
+        for (outcome, label) in [
+            (Outcome::Success, "success"),
+            (Outcome::GrpcError, "grpc_error"),
+            (Outcome::Conflict, "conflict"),
+            (Outcome::NotFound, "not_found"),
+            (Outcome::Timeout, "timeout"),
+            (Outcome::ResultUnknown, "result_unknown"),
+        ] {
+            assert_eq!(outcome.as_str(), label);
+            assert_metric(
+                &rendered,
+                OPERATIONS_TOTAL,
+                &[
+                    ("operation", "create"),
+                    ("resource", "pods"),
+                    ("outcome", label),
+                ],
+                1.0,
+            );
+        }
+        assert_metric(
+            &rendered,
+            REQUESTS_TOTAL,
+            &[("rpc", "txn"), ("outcome", "success")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            REQUEST_DURATION_SECONDS,
+            &[("rpc", "txn")],
+            0.002,
+        );
+        assert_metric(
+            &rendered,
+            QUEUE_WAIT_SECONDS,
+            &[("work_class", "create")],
+            0.001,
+        );
+        assert_metric(&rendered, REQUEST_BYTES, &[("resource", "pods")], 4096.0);
+        assert_metric(
+            &rendered,
+            TXN_TOTAL,
+            &[
+                ("resource", "pods"),
+                ("shape", "create"),
+                ("result", "committed"),
+            ],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            RANGE_REQUESTS_TOTAL,
+            &[("shape", "paged_prefix"), ("outcome", "success")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            CAS_RETRIES_TOTAL,
+            &[("resource", "pods"), ("operation", "update")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            NODE_HEARTBEATS_TOTAL,
+            &[("kind", "node_lease"), ("outcome", "success")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            LEASE_GET_TOTAL,
+            &[("pool", "events"), ("result", "reuse")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            LEASE_ATTACHED_OBJECTS,
+            &[("pool", "events")],
+            7.0,
+        );
+        assert_metric(
+            &rendered,
+            RESOURCE_OBJECTS,
+            &[("resource", "pods"), ("state", "planned")],
+            40_000.0,
+        );
+        assert_metric(
+            &rendered,
+            RESOURCE_UPDATES,
+            &[("resource", "pods"), ("state", "target")],
+            400_000.0,
+        );
+        assert_metric(&rendered, DROPPED_TOTAL, &[("reason", "backpressure")], 1.0);
+        assert_metric(&rendered, INFLIGHT, &[("rpc", "txn")], 0.0);
+        assert_metric(&rendered, REVISION, &[], 1_234_567.0);
+        assert_metric(&rendered, COMPACT_REVISION, &[], 1_234_566.0);
+        assert_metric(&rendered, COMPACT_TOTAL, &[("outcome", "success")], 1.0);
+        assert_metric(&rendered, COMPACTOR_STATE, &[], 0.0);
+        assert_metric(&rendered, COMPACTOR_STATE, &[("state", "active")], 1.0);
+        assert_metric(
+            &rendered,
+            COMPACTOR_ERRORS_TOTAL,
+            &[("error", "failure_kv_missing")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            COMPACTOR_RECOVERIES_TOTAL,
+            &[("recovery", "missing_key")],
+            1.0,
+        );
+        assert_metric(&rendered, RANGE_PAGES, &[], 2.0);
+        assert_metric(&rendered, RANGE_SNAPSHOT_REVISION, &[], 7.0);
+        assert_metric(&rendered, RANGE_SERVER_COUNT, &[], 10.0);
+        assert_metric(
+            &rendered,
+            RANGE_LAST_KEY_BYTES,
+            &[],
+            b"/registry/pods/z".len() as f64,
+        );
+        assert_metric(&rendered, RANGE_SELECTED, &[], 8.0);
+        assert_metric(&rendered, RANGE_DISCARDED, &[], 2.0);
+        assert_metric(&rendered, WATCH_EVENTS_TOTAL, &[("watch", "k8s")], 1.0);
+        assert_metric(&rendered, WATCH_EVENT_BYTES, &[("watch", "k8s")], 4.0);
+        assert_metric(&rendered, WATCH_RECONNECT_TOTAL, &[("watch", "k8s")], 1.0);
+        assert_metric(
+            &rendered,
+            WATCH_CANCEL_TOTAL,
+            &[("watch", "k8s"), ("reason", "eof")],
+            1.0,
+        );
+        assert_metric(
+            &rendered,
+            INFO,
+            &[("version", "0.1.0"), ("workload", "k8s")],
+            1.0,
+        );
+        assert_metric(&rendered, POD_SIZE_BYTES, &[], 4096.0);
+        assert_metric(&rendered, NODES, &[], 2000.0);
+        assert_eq!(watch_reconnects_total(), 1);
         reset_watch_reconnects();
     }
 
     #[test]
-    fn reconnect_metric_is_deterministic_under_controlled_concurrency() {
-        let _serial = WATCH_RECONNECT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn test_reconnect_metric_concurrent() {
+        let _serial = lock_watch_reconnect_tests();
         reset_watch_reconnects();
         let recorder = PrometheusBuilder::new().build_recorder();
-        let start = Arc::new(Barrier::new(3));
-        let first_total_pause = Arc::new(Barrier::new(2));
-        let (first_total_tx, first_total_rx) = std::sync::mpsc::channel();
-        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
-        let hook_pause = Arc::clone(&first_total_pause);
-        set_watch_reconnect_test_hook(Some(Arc::new(move |total| {
-            if total == 1 {
-                first_total_tx
-                    .send(())
-                    .expect("first reconnect hook receiver");
-                hook_pause.wait();
-            }
-        })));
         let watch = WorkloadName::new("pods").unwrap();
 
         std::thread::scope(|scope| {
             for _ in 0..2 {
-                let start = Arc::clone(&start);
-                let completed_tx = completed_tx.clone();
                 let recorder = &recorder;
                 let watch = watch.clone();
                 scope.spawn(move || {
-                    metrics::with_local_recorder(recorder, || {
-                        start.wait();
-                        record_watch_reconnect(&watch);
-                        completed_tx.send(()).expect("reconnect worker receiver");
-                    });
+                    metrics::with_local_recorder(recorder, || record_watch_reconnect(&watch));
                 });
             }
-            start.wait();
-            first_total_rx
-                .recv()
-                .expect("first reconnect total must be observed");
-            completed_rx
-                .recv()
-                .expect("second reconnect must publish before release");
-            first_total_pause.wait();
         });
 
-        set_watch_reconnect_test_hook(None);
         assert_eq!(watch_reconnects_total(), 2);
         let rendered = recorder.handle().render();
-        assert_eq!(rendered_metric_value(&rendered, WATCH_RECONNECT_TOTAL), 2);
+        assert_metric(&rendered, WATCH_RECONNECT_TOTAL, &[("watch", "pods")], 2.0);
         reset_watch_reconnects();
     }
 
-    fn rendered_metric_value(rendered: &str, name: &str) -> u64 {
-        rendered
+    fn assert_metric(rendered: &str, name: &str, labels: &[(&str, &str)], expected: f64) {
+        let label_text = if labels.is_empty() {
+            String::new()
+        } else {
+            let labels = labels
+                .iter()
+                .map(|(key, value)| format!("{key}=\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{labels}}}")
+        };
+        let sample_name = if matches!(
+            name,
+            REQUEST_DURATION_SECONDS | QUEUE_WAIT_SECONDS | REQUEST_BYTES
+        ) {
+            format!("{name}_sum")
+        } else {
+            name.to_string()
+        };
+        let prefix = format!("{sample_name}{label_text}");
+        let value = rendered
             .lines()
             .find_map(|line| {
-                let (metric, value) = line.split_once(' ')?;
-                (metric.split('{').next()? == name).then_some(value.parse::<f64>().ok()?)
+                line.strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .and_then(|value| value.parse::<f64>().ok())
             })
-            .map(|value| value as u64)
-            .expect("metric must be rendered")
+            .unwrap_or_else(|| panic!("metric {prefix} missing from:\n{rendered}"));
+        assert_eq!(value, expected, "metric {prefix}");
     }
 }

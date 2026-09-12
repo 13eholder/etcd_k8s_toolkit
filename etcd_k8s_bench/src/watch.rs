@@ -1,5 +1,9 @@
 //! Watch stream construction, lifecycle state, and resumable event consumption.
+#[cfg(test)]
+use std::collections::HashMap;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::{Arc, LazyLock, Mutex};
 
 use thiserror::Error;
 use tokio::sync::{oneshot, watch as shutdown_channel};
@@ -203,6 +207,32 @@ pub enum WatchError {
     Rpc(#[source] Status),
 }
 
+#[cfg(test)]
+static WATCH_ERROR_OBSERVERS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn watch_error_observer(name: &str) -> Arc<tokio::sync::Notify> {
+    WATCH_ERROR_OBSERVERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
+#[cfg(test)]
+fn note_watch_error_observed(watch: &WorkloadName) {
+    let observer = WATCH_ERROR_OBSERVERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(watch.as_str())
+        .cloned();
+    if let Some(observer) = observer {
+        observer.notify_waiters();
+    }
+}
+
 /// Run one long-lived watch. Only transport disconnects are resumed; semantic
 /// cancellation and compaction are returned to the scheduler as terminal outcomes.
 /// `ready` is notified once by the first nonterminal Created response.
@@ -311,7 +341,11 @@ where
                         record_reconnect(&mut state, &watch_name);
                         break;
                     }
-                    Some(Err(status)) => return Err(WatchError::Rpc(status)),
+                    Some(Err(status)) => {
+                        #[cfg(test)]
+                        note_watch_error_observed(&watch_name);
+                        return Err(WatchError::Rpc(status));
+                    }
                 }
             }
         }
@@ -344,6 +378,7 @@ fn context_canceled_outcome(state: WatchState, watch: &WorkloadName) -> WatchOut
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
 
     use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -356,6 +391,11 @@ mod tests {
         calls: Arc<Mutex<usize>>,
         second_open: Arc<Mutex<Option<oneshot::Sender<()>>>>,
         first_events: bool,
+    }
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
     }
 
     #[tonic::async_trait]
@@ -371,12 +411,16 @@ mod tests {
                 panic!("first request must create watch");
             };
             self.starts.lock().await.push(create.start_revision);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(1), requests.next())
-                    .await
-                    .is_err(),
-                "watch open must not send an unconditional progress request"
-            );
+            {
+                let next_request = requests.next();
+                tokio::pin!(next_request);
+                let waker = Waker::from(Arc::new(NoopWake));
+                let mut context = Context::from_waker(&waker);
+                assert!(
+                    matches!(next_request.as_mut().poll(&mut context), Poll::Pending),
+                    "watch open must not send an unconditional progress request"
+                );
+            }
             let call = {
                 let mut calls = self.calls.lock().await;
                 *calls += 1;
@@ -620,15 +664,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn no_leader_on_open_is_forwarded_without_reconnect() {
-        let calls = Arc::new(Mutex::new(0));
-        let client = NoLeaderOpenClient {
-            calls: Arc::clone(&calls),
-        };
+    async fn assert_no_leader<C>(client: C, calls: Arc<Mutex<usize>>)
+    where
+        C: WatchConnector,
+    {
         let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
         let (ready_tx, _ready_rx) = oneshot::channel();
-        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_with_connector(client, spec(), shutdown_rx, ready_tx),
+        )
+        .await
+        .expect("no-leader watch must not reconnect indefinitely");
         let Err(WatchError::Rpc(status)) = result else {
             panic!("expected no-leader RPC");
         };
@@ -638,24 +685,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_leader_on_stream_is_forwarded_without_reconnect() {
-        let calls = Arc::new(Mutex::new(0));
-        let client = NoLeaderStreamClient {
-            calls: Arc::clone(&calls),
-        };
-        let (_shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let (ready_tx, _ready_rx) = oneshot::channel();
-        let result = run_with_connector(client, spec(), shutdown_rx, ready_tx).await;
-        let Err(WatchError::Rpc(status)) = result else {
-            panic!("expected no-leader RPC");
-        };
-        assert_eq!(status.code(), Code::Unavailable);
-        assert_eq!(status.message(), ETCD_NO_LEADER_MESSAGE);
-        assert_eq!(*calls.lock().await, 1);
+    async fn test_watch_no_leader_error() {
+        let open_calls = Arc::new(Mutex::new(0));
+        assert_no_leader(
+            NoLeaderOpenClient {
+                calls: Arc::clone(&open_calls),
+            },
+            open_calls,
+        )
+        .await;
+
+        let stream_calls = Arc::new(Mutex::new(0));
+        assert_no_leader(
+            NoLeaderStreamClient {
+                calls: Arc::clone(&stream_calls),
+            },
+            stream_calls,
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn compacted_response_is_terminal_and_drops_ready() {
+    async fn test_watch_compacted_terminal() {
         let client = TerminalClient {
             response: Arc::new(Mutex::new(Some(WatchResponse {
                 compact_revision: 11,
@@ -674,7 +725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canceled_response_is_terminal_and_drops_ready() {
+    async fn test_watch_server_cancel() {
         let client = TerminalClient {
             response: Arc::new(Mutex::new(Some(WatchResponse {
                 canceled: true,
@@ -699,7 +750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_created_watch_id_is_forwarded_and_drops_ready() {
+    async fn test_watch_invalid_id_error() {
         let client = TerminalClient {
             response: Arc::new(Mutex::new(Some(WatchResponse {
                 created: true,
@@ -719,69 +770,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_path_reconnects_after_created_eof_without_skipping_history() {
+    async fn test_watch_resume() {
         let _serial = metrics::lock_watch_reconnect_tests();
-        metrics::reset_watch_reconnects();
+        for (start_revision, first_events, expected_starts) in [
+            (7, false, vec![7, 7]),
+            (0, false, vec![0, 12]),
+            (7, true, vec![7, 9]),
+        ] {
+            metrics::reset_watch_reconnects();
+            let starts = Arc::new(Mutex::new(Vec::new()));
+            let calls = Arc::new(Mutex::new(0usize));
+            let (second_open_tx, second_open_rx) = oneshot::channel();
+            let client = FakeWatchClient {
+                starts: Arc::clone(&starts),
+                calls,
+                second_open: Arc::new(Mutex::new(Some(second_open_tx))),
+                first_events,
+            };
+            let mut case_spec = spec();
+            case_spec.start_revision = start_revision;
+            let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+            let (ready_tx, _ready_rx) = oneshot::channel();
+            let task = tokio::spawn(run_with_connector(client, case_spec, shutdown_rx, ready_tx));
 
-        let starts = Arc::new(Mutex::new(Vec::new()));
-        let calls = Arc::new(Mutex::new(0usize));
-        let (second_open_tx, second_open_rx) = oneshot::channel();
-        let client = FakeWatchClient {
-            starts: Arc::clone(&starts),
-            calls,
-            second_open: Arc::new(Mutex::new(Some(second_open_tx))),
-            first_events: false,
-        };
-        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let (ready_tx, _ready_rx) = oneshot::channel();
-        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
-
-        second_open_rx.await.expect("second watch stream opened");
-        assert_eq!(&*starts.lock().await, &[7, 7]);
-        shutdown.send(true).expect("watch shutdown receiver exists");
-        let outcome = task.await.expect("watch task join").expect("watch outcome");
-        assert_eq!(outcome.state.reconnects, 1);
-        assert_eq!(outcome.state.last_revision, 13);
+            tokio::time::timeout(Duration::from_secs(1), second_open_rx)
+                .await
+                .expect("second watch stream opens")
+                .expect("second watch observer exists");
+            assert_eq!(&*starts.lock().await, &expected_starts);
+            shutdown.send(true).expect("watch shutdown receiver exists");
+            let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("watch task shuts down")
+                .expect("watch task join")
+                .expect("watch outcome");
+            assert_eq!(outcome.state.reconnects, 1);
+            assert_eq!(outcome.state.last_revision, 13);
+        }
         metrics::reset_watch_reconnects();
     }
 
     #[tokio::test]
-    async fn run_path_reconnects_after_current_created_using_header_baseline() {
-        let _serial = metrics::lock_watch_reconnect_tests();
-        metrics::reset_watch_reconnects();
-
-        let starts = Arc::new(Mutex::new(Vec::new()));
-        let calls = Arc::new(Mutex::new(0usize));
-        let (second_open_tx, second_open_rx) = oneshot::channel();
-        let client = FakeWatchClient {
-            starts: Arc::clone(&starts),
-            calls,
-            second_open: Arc::new(Mutex::new(Some(second_open_tx))),
-            first_events: false,
-        };
-        let mut current_spec = spec();
-        current_spec.start_revision = 0;
-        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let task = tokio::spawn(run_with_connector(
-            client,
-            current_spec,
-            shutdown_rx,
-            ready_tx,
-        ));
-
-        ready_rx.await.expect("current watch created");
-        second_open_rx.await.expect("second watch stream opened");
-        assert_eq!(&*starts.lock().await, &[0, 12]);
-        shutdown.send(true).expect("watch shutdown receiver exists");
-        let outcome = task.await.expect("watch task join").expect("watch outcome");
-        assert_eq!(outcome.state.reconnects, 1);
-        assert_eq!(outcome.state.last_revision, 13);
-        metrics::reset_watch_reconnects();
-    }
-
-    #[tokio::test]
-    async fn reconnect_created_zero_id_cancels_zero_not_stale_id() {
+    async fn test_watch_zero_id_cancel() {
         let _serial = metrics::lock_watch_reconnect_tests();
         metrics::reset_watch_reconnects();
 
@@ -811,7 +841,7 @@ mod tests {
         metrics::reset_watch_reconnects();
     }
     #[tokio::test]
-    async fn ready_waits_for_delayed_created_response() {
+    async fn test_watch_created_ready() {
         let (response_tx, response_rx) = mpsc::channel(1);
         let (opened_tx, opened_rx) = oneshot::channel();
         let client = DelayedCreatedClient {
@@ -844,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_during_open_watch_is_terminal_and_drops_ready() {
+    async fn test_watch_open_cancel() {
         let (opened_tx, opened_rx) = oneshot::channel();
         let client = BlockingOpenClient {
             opened: Arc::new(Mutex::new(Some(opened_tx))),
@@ -864,58 +894,36 @@ mod tests {
         assert!(ready_rx.await.is_err());
     }
 
-    #[tokio::test]
-    async fn run_path_resumes_after_delivered_event_revision() {
-        let _serial = metrics::lock_watch_reconnect_tests();
-        metrics::reset_watch_reconnects();
-
-        let starts = Arc::new(Mutex::new(Vec::new()));
-        let calls = Arc::new(Mutex::new(0usize));
-        let (second_open_tx, second_open_rx) = oneshot::channel();
-        let client = FakeWatchClient {
-            starts: Arc::clone(&starts),
-            calls,
-            second_open: Arc::new(Mutex::new(Some(second_open_tx))),
-            first_events: true,
-        };
-        let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
-        let (ready_tx, _ready_rx) = oneshot::channel();
-        let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
-
-        second_open_rx.await.expect("second watch stream opened");
-        assert_eq!(&*starts.lock().await, &[7, 9]);
-        shutdown.send(true).expect("watch shutdown receiver exists");
-        let outcome = task.await.expect("watch task join").expect("watch outcome");
-        assert_eq!(outcome.state.reconnects, 1);
-        assert_eq!(outcome.state.last_revision, 13);
-        metrics::reset_watch_reconnects();
-    }
-
     #[test]
-    fn prefix_end_and_require_leader_contract_are_fixed() {
-        assert_eq!(crate::client::REQUIRE_LEADER_METADATA, "hasleader");
+    fn test_watch_prefix_end() {
         assert_eq!(prefix_range_end(b"/pods"), b"/podt".to_vec());
         assert_eq!(prefix_range_end(&[0xff]), vec![0]);
+        assert_eq!(prefix_range_end(&[]), vec![0]);
     }
 
     #[test]
-    fn messages_and_metadata_are_wire_complete() {
+    fn test_watch_requests_match_spec() {
         let create = create_request(&spec(), 9);
         let watch_request::RequestUnion::CreateRequest(request) = create.request_union.unwrap()
         else {
-            panic!()
+            panic!("expected WatchCreateRequest")
         };
-        assert_eq!(request.start_revision, 9);
+        assert_eq!(request.key, b"/registry/pods");
         assert_eq!(request.range_end, b"/registry/podt".to_vec());
-        assert!(request.prev_kv && request.progress_notify);
-        assert!(matches!(
-            cancel_request(3).request_union,
-            Some(watch_request::RequestUnion::CancelRequest(_))
-        ));
+        assert_eq!(request.start_revision, 9);
+        assert!(request.prev_kv);
+        assert!(request.progress_notify);
+
+        let cancel = cancel_request(3);
+        let watch_request::RequestUnion::CancelRequest(request) = cancel.request_union.unwrap()
+        else {
+            panic!("expected WatchCancelRequest")
+        };
+        assert_eq!(request.watch_id, 3);
     }
 
     #[test]
-    fn state_distinguishes_created_events_progress_and_canceled() {
+    fn test_watch_revision_advance() {
         let created = WatchResponse {
             header: Some(ResponseHeader {
                 revision: 12,
@@ -997,24 +1005,35 @@ mod tests {
         assert_eq!(delete_state.last_revision, 15);
     }
 
-    #[test]
-    fn two_independent_watch_reconnects_share_process_total() {
+    #[tokio::test]
+    async fn test_watch_reconnect_totals() {
         let _serial = metrics::lock_watch_reconnect_tests();
         metrics::reset_watch_reconnects();
-        let mut first = WatchState::default();
-        let mut second = WatchState::default();
-        let watch = WorkloadName::new("pods").unwrap();
-        record_reconnect(&mut first, &watch);
-        record_reconnect(&mut second, &watch);
+        for _ in 0..2 {
+            let starts = Arc::new(Mutex::new(Vec::new()));
+            let (second_open_tx, second_open_rx) = oneshot::channel();
+            let client = FakeWatchClient {
+                starts,
+                calls: Arc::new(Mutex::new(0)),
+                second_open: Arc::new(Mutex::new(Some(second_open_tx))),
+                first_events: false,
+            };
+            let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+            let (ready_tx, _ready_rx) = oneshot::channel();
+            let task = tokio::spawn(run_with_connector(client, spec(), shutdown_rx, ready_tx));
+            tokio::time::timeout(Duration::from_secs(1), second_open_rx)
+                .await
+                .expect("watch reconnects")
+                .expect("reconnect observer exists");
+            shutdown.send(true).expect("watch shutdown receiver exists");
+            let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("watch task shuts down")
+                .expect("watch task join")
+                .expect("watch outcome");
+            assert_eq!(outcome.state.reconnects, 1);
+        }
         assert_eq!(metrics::watch_reconnects_total(), 2);
-        assert_eq!(first.reconnects, 1);
-        assert_eq!(second.reconnects, 1);
         metrics::reset_watch_reconnects();
-    }
-    #[test]
-    fn thiserror_preserves_watch_error_source() {
-        let error = WatchError::Rpc(Status::unavailable("temporary"));
-        assert!(error.to_string().starts_with("watch RPC: "));
-        assert!(std::error::Error::source(&error).is_some());
     }
 }

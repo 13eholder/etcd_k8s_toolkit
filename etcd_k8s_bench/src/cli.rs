@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_load_k8s_with_exact_topology_and_node_leases() {
+    fn test_run_defaults_load() {
         let config = run_config(&[]).unwrap();
         assert_eq!(config.workload.name, "k8s");
         assert!(config.workload.nodes.node_lease_enabled);
@@ -418,13 +418,13 @@ mod tests {
         assert_eq!(config.request_timeout, Duration::from_secs(10));
     }
     #[test]
-    fn explicit_no_node_lease_profile_disables_node_leases() {
+    fn test_profile_node_leases_disable() {
         let config = run_config(&["--profile", "k8s-no-node-lease"]).unwrap();
         assert_eq!(config.workload.name, "k8s_no_node_lease");
         assert!(!config.workload.nodes.node_lease_enabled);
     }
     #[test]
-    fn explicit_profile_and_custom_config_are_mutually_exclusive() {
+    fn test_profile_config_conflict() {
         let error = run_config(&["--profile", "k8s", "--config", "custom.json"])
             .unwrap_err()
             .to_string();
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_pod_size_pods_and_nodes_override_workload() {
+    fn test_run_overrides_apply() {
         let config = run_config(&["--pod-size", "8192", "--pods", "800", "--nodes", "7"]).unwrap();
         assert_eq!(config.pod_size, 8192);
         assert_eq!(config.nodes, 7);
@@ -452,13 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cli_values_name_the_field() {
+    fn test_nodes_zero_error() {
         let error = run_config(&["--nodes", "0"]).unwrap_err().to_string();
         assert!(error.contains("nodes"));
     }
 
     #[test]
-    fn nodes_accepts_long_option_and_rejects_positional_compatibility() {
+    fn test_nodes_option_only() {
         let cli = Cli::try_parse_from(["bench", "run", "--nodes", "7"]).unwrap();
         match cli.command {
             Command::Run(run) => assert_eq!(run.base.nodes, Some(7)),
@@ -467,7 +467,7 @@ mod tests {
         assert!(Cli::try_parse_from(["bench", "run", "7"]).is_err());
     }
     #[test]
-    fn queue_capacity_must_cover_workers() {
+    fn test_queue_workers_error() {
         let error = run_config(&["--workers", "4", "--queue-capacity", "3"])
             .unwrap_err()
             .to_string();
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_generation_flags() {
+    fn test_run_unknown_flags_reject() {
         // Derivation parameters belong to gen_profile; run has no such flags.
         assert!(Cli::try_parse_from(["bench", "run", "--duration", "300s"]).is_err());
         assert!(Cli::try_parse_from(["bench", "run", "--max-qps", "500"]).is_err());
@@ -484,14 +484,14 @@ mod tests {
     }
 
     #[test]
-    fn removed_rate_scale_and_legacy_profiles_are_rejected() {
+    fn test_legacy_cli_reject() {
         assert!(Cli::try_parse_from(["bench", "run", "--rate-scale", "2"]).is_err());
         assert!(Cli::try_parse_from(["bench", "run", "--profile", "mock-k8"]).is_err());
         assert!(Cli::try_parse_from(["bench", "run", "--profile", "real-k8"]).is_err());
     }
 
     #[test]
-    fn removed_time_option_is_rejected_and_profile_duration_is_used() {
+    fn test_run_profile_duration() {
         assert!(Cli::try_parse_from(["bench", "run", "--time-scale", "0.5"]).is_err());
         let config = run_config(&[]).unwrap();
         let expected = Duration::from_secs_f64(
@@ -509,25 +509,53 @@ mod tests {
     }
 
     #[test]
-    fn gen_profile_defaults_match_rolling_update() {
+    fn test_gen_defaults_load() {
         let args = gen_args(&[]);
         assert_eq!(args.batch_size, 500);
         assert_eq!(args.txn_rps, 2000.0);
         assert_eq!(args.name, "rolling-update");
+
+        let dir = temp_dir("defaults");
+        let path = args.generate_to(&dir).unwrap();
+        let spec = WorkloadSpec::from_path(&path).unwrap();
+        assert_eq!(spec.name, "rolling-update");
+        assert_eq!(spec.topology.node_count, ROLLING_UPDATE_NODE_COUNT);
+        assert_eq!(spec.timeline.len(), 1);
+        // Budget 80041 at the default 2000 rps -> 40.0205s.
+        assert_eq!(spec.timeline[0].duration_s, 40.0205);
+        let app_total = crate::scheduler::application_operation_total(&spec);
+        assert_eq!(app_total, 8 * 10_000 + 1 + 2 * 20);
+        assert!(crate::scheduler::range_request_total(&spec, 1) > 0);
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    struct TempDir(PathBuf);
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "etcd-k8s-bench-gen-test-{}-{tag}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     #[test]
-    fn generate_profile_writes_loadable_workload() {
+    fn test_gen_profile_load() {
         let dir = temp_dir("write");
         let args = gen_args(&[
             "--nodes",
@@ -556,22 +584,20 @@ mod tests {
         assert_eq!(pods.update_amplification, 4);
         let total = crate::scheduler::application_operation_total(&spec);
         assert_eq!(total, 8 * 100 + 1 + 2 * 10);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn generate_profile_rejects_subnanosecond_duration_before_write() {
+    fn test_gen_short_duration_reject() {
         let dir = temp_dir("subnanosecond");
         let args = gen_args(&["--txn-rps", "1e15", "--name", "subnanosecond"]);
         let error = args.generate_to(&dir).unwrap_err().to_string();
         assert!(error.contains("timeline[0].duration_s"));
         assert!(error.contains("nanosecond"));
         assert!(!dir.join("subnanosecond.json").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn generate_profile_bakes_explicit_overrides() {
+    fn test_gen_overrides_persist() {
         let dir = temp_dir("overrides");
         let args = gen_args(&["--nodes", "7", "--pod-size", "8192", "--name", "small"]);
         let path = args.generate_to(&dir).unwrap();
@@ -586,11 +612,10 @@ mod tests {
                 .value_size_bytes,
             8192
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn gen_profile_rejects_explicit_pod_count() {
+    fn test_gen_pods_reject() {
         assert!(
             Cli::try_parse_from(["bench", "gen_profile", "--pods", "100", "--name", "invalid"])
                 .is_err()
@@ -598,54 +623,40 @@ mod tests {
     }
 
     #[test]
-    fn generate_profile_refuses_overwrite() {
+    fn test_gen_existing_preserve() {
         let dir = temp_dir("overwrite");
         let args = gen_args(&["--nodes", "10", "--name", "dup"]);
-        args.generate_to(&dir).unwrap();
+        let path = args.generate_to(&dir).unwrap();
+        let original = std::fs::read(&path).unwrap();
         let error = args.generate_to(&dir).unwrap_err().to_string();
         assert!(error.contains("already exists"));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
-    fn gen_profile_rejects_run_only_flags() {
-        for flag in [
-            "--endpoint",
-            "--workers",
-            "--queue-capacity",
-            "--request-timeout",
-            "--operation-timeout",
-            "--metrics-listen",
-            "--rate-scale",
-            "--time-scale",
+    fn test_gen_run_flags_reject() {
+        for (flag, value) in [
+            ("--endpoint", "http://127.0.0.1:2379"),
+            ("--workers", "1"),
+            ("--queue-capacity", "1"),
+            ("--request-timeout", "1s"),
+            ("--operation-timeout", "1s"),
+            ("--metrics-listen", "127.0.0.1:9898"),
+            ("--rate-scale", "1"),
+            ("--time-scale", "1"),
         ] {
-            let full = ["bench", "gen_profile", flag, "x"];
-            assert!(
-                Cli::try_parse_from(full).is_err(),
-                "gen_profile must reject {flag}"
+            let full = ["bench", "gen_profile", flag, value];
+            let error = Cli::try_parse_from(full).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "gen_profile must reject {flag} as an unknown argument"
             );
         }
     }
 
     #[test]
-    fn gen_profile_defaults_write_loadable_workload() {
-        let dir = temp_dir("defaults");
-        let args = gen_args(&[]);
-        let path = args.generate_to(&dir).unwrap();
-        let spec = WorkloadSpec::from_path(&path).unwrap();
-        assert_eq!(spec.name, "rolling-update");
-        assert_eq!(spec.topology.node_count, ROLLING_UPDATE_NODE_COUNT);
-        assert_eq!(spec.timeline.len(), 1);
-        // Budget 80041 at the default 2000 rps -> 40.0205s.
-        assert_eq!(spec.timeline[0].duration_s, 40.0205);
-        let app_total = crate::scheduler::application_operation_total(&spec);
-        assert_eq!(app_total, 8 * 10_000 + 1 + 2 * 20);
-        assert!(crate::scheduler::range_request_total(&spec, 1) > 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn generated_profile_loads_via_run_config() {
+    fn test_gen_run_roundtrip() {
         let dir = temp_dir("roundtrip");
         let args = gen_args(&["--nodes", "10", "--batch-size", "5", "--name", "roundtrip"]);
         let path = args.generate_to(&dir).unwrap();
@@ -667,11 +678,10 @@ mod tests {
                     .sum(),
             ),
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn generate_profile_rejects_unsafe_names() {
+    fn test_gen_unsafe_name_reject() {
         for bad in ["../evil", "Foo", "a/b", ""] {
             let mut full = vec!["bench", "gen_profile", "--name"];
             full.push(bad);

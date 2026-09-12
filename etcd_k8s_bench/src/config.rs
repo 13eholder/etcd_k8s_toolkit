@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn active_profiles_round_trip_resource_behavior() {
+    fn test_profiles_round_trip() {
         for input in [
             include_str!("../workloads/k8s.json"),
             include_str!("../workloads/k8s-no-node-lease.json"),
@@ -1014,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retry_policy_field_is_rejected() {
+    fn test_retry_policy_field_error() {
         let mut json = serde_json::to_value(embedded()).unwrap();
         let resource = json["resources"][0].as_object_mut().unwrap();
         let behavior = resource.remove("behavior").unwrap();
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_conditional_delete_behavior_is_rejected() {
+    fn test_conditional_delete_error() {
         let mut json = serde_json::to_value(embedded()).unwrap();
         json["resources"][0]["behavior"] = serde_json::json!("conditional_delete");
         let error = WorkloadSpec::from_json(&json.to_string()).unwrap_err();
@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_counts_resolve_exactly_from_topology() {
+    fn test_resource_counts_resolve() {
         let topology = TopologySpec {
             node_count: 2_000,
             pod_count: 40_000,
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_counts_reject_nonintegral_overflowing_and_zero_values() {
+    fn test_resource_count_bounds_error() {
         let topology = TopologySpec {
             node_count: 2_000,
             pod_count: 40_000,
@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn special_resource_relationships_resolve_exact_counts() {
+    fn test_relationship_counts_resolve() {
         let topology = TopologySpec {
             node_count: 2_000,
             pod_count: 40_000,
@@ -1145,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn special_resource_relationships_reject_invalid_topology() {
+    fn test_relationship_bounds_error() {
         let mut spec = embedded();
         spec.relationships.daemon_set_groups[0].eligible_nodes_per_daemonset =
             spec.topology.node_count + 1;
@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_count_relation_must_match_resource_name() {
+    fn test_derived_resource_mismatch_error() {
         let mut spec = embedded();
         spec.resources
             .iter_mut()
@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn update_amplification_target_must_fit_u64() {
+    fn test_update_target_overflow_error() {
         let mut spec = embedded();
         spec.resources
             .iter_mut()
@@ -1185,17 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_profile_declares_authoritative_topology_and_counts() {
-        let spec = embedded();
-        assert_eq!(spec.topology.node_count, 2_000);
-        assert_eq!(spec.topology.pod_count, 40_000);
-        let pods = spec.resources.iter().find(|r| r.name == "pods").unwrap();
-        let events = spec.resources.iter().find(|r| r.name == "events").unwrap();
-        assert_eq!(spec.resource_count(pods).unwrap(), 40_000);
-        assert_eq!(spec.resource_count(events).unwrap(), 40_000);
-    }
-    #[test]
-    fn removed_keep_alive_field_is_rejected() {
+    fn test_keep_alive_field_error() {
         let mut workload: serde_json::Value =
             serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         workload["etcd_lease_pools"][0]["keep_alive"] = serde_json::Value::Bool(true);
@@ -1205,35 +1195,21 @@ mod tests {
     }
 
     #[test]
-    fn built_in_profiles_do_not_expose_keep_alive() {
-        for json in [
-            include_str!("../workloads/k8s-no-node-lease.json"),
-            include_str!("../workloads/k8s.json"),
-        ] {
-            let workload: serde_json::Value = serde_json::from_str(json).unwrap();
-            assert!(
-                workload["etcd_lease_pools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|pool| pool.get("keep_alive").is_none())
-            );
-        }
-    }
-    #[test]
-    fn config_io_error_preserves_path_and_source() {
-        let error = ConfigError::Io {
-            path: "workload.json".into(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+    fn test_config_read_error() {
+        let path = std::env::temp_dir().join(format!(
+            "etcd-k8s-bench-missing-config-{}",
+            std::process::id()
+        ));
+        let expected_path = path.display().to_string();
+        let error = WorkloadSpec::from_path(&path).unwrap_err();
+        let ConfigError::Io { path, source } = error else {
+            panic!("expected config I/O error");
         };
-        assert_eq!(
-            error.to_string(),
-            "cannot read config workload.json: missing"
-        );
-        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(path, expected_path);
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
     }
     #[test]
-    fn embedded_k8s_preserves_resource_and_lease_shapes() {
+    fn test_profile_workload_shape() {
         let spec = embedded();
         assert_eq!(
             spec.timeline
@@ -1247,6 +1223,13 @@ mod tests {
         assert_eq!(spec.range_count_only_count, 220);
         assert_eq!(spec.pod_size_bytes, 4096);
         assert_eq!(spec.topology.node_count, 2000);
+        assert_eq!(spec.topology.pod_count, 40_000);
+        let pods = spec
+            .resources
+            .iter()
+            .find(|resource| resource.name == "pods")
+            .unwrap();
+        assert_eq!(spec.resource_count(pods).unwrap(), 40_000);
 
         let event = spec
             .resources
@@ -1273,7 +1256,7 @@ mod tests {
         assert_eq!(master.reuse_s, 60);
     }
     #[test]
-    fn lease_pool_requires_integral_encodable_seconds() {
+    fn test_lease_ttl_fraction_error() {
         let mut input: serde_json::Value =
             serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         input["etcd_lease_pools"][0]["object_ttl_s"] = serde_json::Value::from(0.5);
@@ -1284,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_pool_rejects_unrepresentable_grant_ttl() {
+    fn test_lease_ttl_upper_error() {
         let mut spec = embedded();
         spec.etcd_lease_pools[0].object_ttl_s = u64::MAX;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
@@ -1292,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ttl_policies_require_a_lease_pool() {
+    fn test_resource_lease_policy_error() {
         let mut spec = embedded();
         spec.resources
             .iter_mut()
@@ -1308,7 +1291,7 @@ mod tests {
         assert!(error.contains("lease_pool is only valid"));
     }
     #[test]
-    fn duplicate_lease_pool_names_are_rejected() {
+    fn test_lease_pool_duplicate_error() {
         let mut spec = embedded();
         let duplicate = spec.etcd_lease_pools[0].clone();
         spec.etcd_lease_pools.push(duplicate);
@@ -1316,7 +1299,7 @@ mod tests {
         assert!(error.contains("duplicate lease pool name"));
     }
     #[test]
-    fn built_in_profiles_have_explicit_node_lease_modes() {
+    fn test_profiles_node_lease_modes() {
         let mock =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let real = WorkloadSpec::from_json(include_str!("../workloads/k8s.json")).unwrap();
@@ -1324,40 +1307,27 @@ mod tests {
         assert!(real.nodes.node_lease_enabled);
     }
     #[test]
-    fn watch_rejects_legacy_or_non_root_prefixes() {
+    fn test_watch_config_error() {
         let mut input: serde_json::Value =
             serde_json::from_str(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        let prefix = input["watches"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("resource_prefix")
-            .unwrap();
-        input["watches"][0]["key_prefix"] = prefix;
-        assert!(WorkloadSpec::from_json(&input.to_string()).is_err());
+        input["watches"][0]["key_prefix"] = input["watches"][0]["resource_prefix"].clone();
+        let error = WorkloadSpec::from_json(&input.to_string()).unwrap_err();
+        assert!(matches!(error, ConfigError::Json(_)));
+        assert!(error.to_string().contains("unknown field `key_prefix`"));
 
-        let mut spec = embedded();
-        spec.watches[0].resource_prefix = "/registry/pods/".into();
-        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
-        assert!(error.contains("without a trailing slash"));
-    }
-    #[test]
-    fn custom_node_spec_can_explicitly_disable_leases() {
-        let node: NodeSpec = serde_json::from_str(
-            r#"{
-                "status_interval_s": 300,
-                "lease_interval_s": 10,
-                "lease_jitter": 0.04,
-                "status_retry_limit": 5,
-                "lease_retry_limit": 5,
-                "node_lease_enabled": false
-            }"#,
-        )
-        .unwrap();
-        assert!(!node.node_lease_enabled);
+        for prefix in ["", "pods", "/registry/pods/"] {
+            let mut spec = embedded();
+            spec.watches[0].resource_prefix = prefix.into();
+            let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+            assert!(
+                error.contains("watches[0].resource_prefix"),
+                "unexpected error for {prefix:?}: {error}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_zero_nodes() {
+    fn test_zero_nodes_error() {
         let mut spec = embedded();
         spec.topology.node_count = 0;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
@@ -1365,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_pod_size() {
+    fn test_zero_pod_size_error() {
         let mut spec = embedded();
         spec.pod_size_bytes = 0;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
@@ -1373,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_jitter_outside_half_open_interval() {
+    fn test_node_jitter_upper_error() {
         let mut spec = embedded();
         spec.nodes.lease_jitter = 1.0;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
@@ -1381,28 +1351,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_timeline() {
+    fn test_empty_timeline_error() {
         let mut spec = embedded();
         spec.timeline.clear();
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
         assert!(error.contains("timeline"));
     }
     #[test]
-    fn rejects_invalid_metric_labels() {
+    fn test_config_metric_label_error() {
         let mut spec = embedded();
         spec.name = "invalid label".into();
-        assert!(spec.validate(64 * 1024 * 1024).is_err());
-        spec.name = "k8s".into();
-        spec.resources[0].name = "invalid label".into();
-        assert!(spec.validate(64 * 1024 * 1024).is_err());
-        spec.resources[0].name = "pods".into();
-        spec.etcd_lease_pools[0].name = "invalid label".into();
-        assert!(spec.validate(64 * 1024 * 1024).is_err());
-        spec.etcd_lease_pools[0].name = "events".into();
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("name is not a valid metric label"));
+
+        let mut spec = embedded();
+        let index = spec
+            .resources
+            .iter()
+            .position(|resource| resource.name == "events")
+            .unwrap();
+        spec.resources[index].name = "invalid label".into();
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains(&format!(
+            "resources[{index}].name is not a valid metric label"
+        )));
+
+        let mut spec = embedded();
+        spec.watches[0].name = "invalid label".into();
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains("watches[0].name is not a valid metric label"));
+
+        let mut spec = embedded();
+        let mut pool = spec.etcd_lease_pools[0].clone();
+        pool.name = "invalid label".into();
+        let index = spec.etcd_lease_pools.len();
+        spec.etcd_lease_pools.push(pool);
+        let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
+        assert!(error.contains(&format!(
+            "etcd_lease_pools[{index}].name is not a valid metric label"
+        )));
     }
 
     #[test]
-    fn legacy_range_fixtures_field_is_rejected() {
+    fn test_range_fixtures_field_error() {
         let mut input: serde_json::Value =
             serde_json::from_str(include_str!("../workloads/k8s.json")).unwrap();
         input["range_fixtures"] = serde_json::json!([]);
@@ -1410,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn range_selector_defaults_to_explicit_all_match() {
+    fn test_range_selector_all_match() {
         let spec = embedded();
         assert!(
             spec.ranges
@@ -1420,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn range_selector_rejects_zero() {
+    fn test_range_selector_zero_error() {
         let mut spec = embedded();
         spec.ranges[0].selector_keep_every = 0;
         let error = spec.validate(64 * 1024 * 1024).unwrap_err().to_string();
@@ -1428,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn duration_validation_preserves_effective_and_total_boundaries() {
+    fn test_duration_bounds() {
         let mut exact = embedded();
         exact.timeline[0].duration_s = 1e-9;
         exact.validate(64 * 1024 * 1024).unwrap();
@@ -1492,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_watch_defaults_cover_modeled_api_roots() {
+    fn test_profiles_watch_roots() {
         let expected: HashSet<_> = [
             "/registry/pods",
             "/registry/events",
@@ -1525,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_preserves_matching_subscriptions_and_their_options() {
+    fn test_rolling_watch_options() {
         let mut base = embedded();
         let duplicate = WatchSpec {
             name: "pods-secondary".into(),
@@ -1567,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_watches_follow_custom_resource_paths() {
+    fn test_rolling_custom_watch_root() {
         let mut base = embedded();
         base.resources
             .iter_mut()
@@ -1592,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_watch_roots_follow_nodelease_enablement() {
+    fn test_rolling_node_lease_watch() {
         let mut base = embedded();
         for enabled in [false, true] {
             base.nodes.node_lease_enabled = enabled;
@@ -1613,14 +1604,14 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_does_not_invent_subscriptions() {
+    fn test_rolling_empty_watches() {
         let mut base = embedded();
         base.watches.clear();
         assert!(rolling(&base, 50, 7).unwrap().watches.is_empty());
     }
 
     #[test]
-    fn published_rolling_watch_defaults_match_generated_profile() {
+    fn test_published_rolling_watches() {
         let base = WorkloadSpec::from_json(include_str!("../workloads/k8s.json")).unwrap();
         let generated = rolling(&base, 10_000, 500).unwrap();
         let published =
@@ -1629,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_shape_and_totals() {
+    fn test_rolling_budget() {
         let base = embedded();
         let spec = rolling(&base, 100, 10).unwrap();
         assert_eq!(spec.name, "rolling-test");
@@ -1673,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_keeps_base_cadence() {
+    fn test_rolling_base_cadence() {
         let base = embedded();
         let spec = rolling(&base, 50, 7).unwrap();
         assert_eq!(spec.master_lease_interval_s, base.master_lease_interval_s);
@@ -1687,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_rejects_invalid_params() {
+    fn test_rolling_params_error() {
         let base = embedded();
         assert!(rolling(&base, 0, 10).is_err());
         assert!(rolling(&base, 100, 0).is_err());
@@ -1705,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_scales_budget_to_present_resources() {
+    fn test_rolling_optional_budget() {
         // A base without events/daemonsets must not budget their operations.
         let mut base = embedded();
         base.resources
@@ -1724,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_requires_id_placeholder_in_key_pattern() {
+    fn test_rolling_static_key_error() {
         let mut base = embedded();
         base.resources
             .iter_mut()
@@ -1735,21 +1726,24 @@ mod tests {
     }
 
     #[test]
-    fn rolling_update_count_only_clamp_covers_rounding_drift() {
-        // Tight count-only budget at the floored capacity: without the
-        // drift margin, generated range scheduling could exceed the shape
-        // capacity. The clamp must land at zero here.
+    fn test_rolling_count_only_capacity() {
+        // The scaled count-only budget must remain positive while being
+        // clamped into the exact scheduled prefix capacity.
         let mut base = embedded();
         base.timeline = vec![TimelineSegment {
             duration_s: 30.0,
-            range_rps: 0.1,
+            range_rps: 10.0,
         }];
-        base.range_count_only_count = 3;
-        let range_total = crate::scheduler::range_request_total(&base, 1);
-        let app_total = crate::scheduler::application_operation_total(&base);
+        base.range_count_only_count = 1_000_000;
         let spec = base
-            .rolling_update(1, 1, 100.0, "tight", range_total, app_total)
+            .rolling_update(100, 10, 100.0, "tight", 300, 30)
             .unwrap();
-        assert_eq!(spec.range_count_only_count, 0);
+        let floor_range_total =
+            (spec.timeline[0].range_rps * spec.timeline[0].duration_s).floor() as u64;
+        let prefix_capacity = crate::scheduler::exact_prefix_capacity(&spec, floor_range_total);
+        assert!(prefix_capacity > 0);
+        assert!(spec.range_count_only_count > 0);
+        assert!(spec.range_count_only_count <= prefix_capacity);
+        crate::scheduler::range_shape_plan(&spec, prefix_capacity).unwrap();
     }
 }

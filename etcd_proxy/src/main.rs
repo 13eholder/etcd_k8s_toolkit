@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn args_use_documented_defaults() {
+    fn test_proxy_defaults_parse() {
         let args = Args::try_parse_from(["etcd_proxy"]).expect("defaults should parse");
 
         assert_eq!(args.etcd_endpoint, "http://[::1]:2379");
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn args_parse_runtime_overrides() {
+    fn test_proxy_overrides_parse() {
         let args = Args::try_parse_from([
             "etcd_proxy",
             "--etcd-endpoint",
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn args_reject_zero_sizes_and_interval() {
+    fn test_proxy_zero_limits_reject() {
         for argument in [
             "--max-message-size",
             "--log-buffer-size",

@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_pool_reuses_inside_window_until_object_cap() {
+    fn test_lease_object_cap() {
         let mut pool = LeasePool::new(LeasePoolConfig::default());
         assert_eq!(
             pool.acquire_at(Duration::ZERO),
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn reuse_window_is_the_strict_open_interval_after_grant() {
+    fn test_lease_reuse_window() {
         let mut pool = LeasePool::new(LeasePoolConfig::default());
         pool.record_grant(7, Duration::ZERO);
 
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_reuse_is_capped_at_five_percent_of_object_ttl() {
+    fn test_lease_short_ttl_no_reuse() {
         let mut pool = LeasePool::new(LeasePoolConfig {
             object_ttl: Duration::from_secs(15),
             reuse_window: Duration::from_secs(60),
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn object_count_does_not_saturate_past_u64_maximum() {
+    fn test_lease_count_overflow() {
         let mut pool = LeasePool::new(LeasePoolConfig {
             object_ttl: Duration::from_secs(3600),
             reuse_window: Duration::from_secs(60),

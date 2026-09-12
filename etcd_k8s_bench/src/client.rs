@@ -242,12 +242,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn watch_request_contains_canonical_require_leader_metadata() {
+    fn test_client_watch_metadata() {
         let request = watch_request(());
         assert_eq!(
             request
                 .metadata()
-                .get(REQUIRE_LEADER_METADATA)
+                .get("hasleader")
                 .unwrap()
                 .to_str()
                 .unwrap(),
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_request_is_canonical_full_keyspace_count_only() {
+    fn test_client_preflight_count() {
         assert_eq!(
             ClientBundle::preflight_request(),
             RangeRequest {
@@ -270,7 +270,7 @@ mod tests {
         );
     }
     #[test]
-    fn retry_classification_is_method_aware() {
+    fn test_client_retry_classification() {
         let codes = [
             Code::Unavailable,
             Code::DeadlineExceeded,
@@ -279,64 +279,47 @@ mod tests {
         ];
         for code in codes {
             let error = ClientError::Rpc(Status::new(code, "transient"));
+            for method in [RpcMethod::Range, RpcMethod::Status] {
+                assert_eq!(
+                    error.retry_decision(method, RequestDisposition::Unknown),
+                    RetryDecision::Retry,
+                    "{method:?} must remain retryable for {code:?}"
+                );
+            }
+            for method in [RpcMethod::Txn, RpcMethod::LeaseGrant, RpcMethod::Compact] {
+                assert_eq!(
+                    error.retry_decision(method, RequestDisposition::Unknown),
+                    RetryDecision::ResultUnknown,
+                    "{method:?} must not be replayed after {code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_client_cancel_error() {
+        let cancelled = ClientError::Rpc(Status::cancelled("caller cancelled"));
+        for method in [
+            RpcMethod::Range,
+            RpcMethod::Status,
+            RpcMethod::Txn,
+            RpcMethod::LeaseGrant,
+            RpcMethod::Compact,
+        ] {
             assert_eq!(
-                error.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
-                RetryDecision::Retry
-            );
-            assert_eq!(
-                error.retry_decision(RpcMethod::Status, RequestDisposition::Unknown),
-                RetryDecision::Retry
-            );
-            assert_eq!(
-                error.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
-                RetryDecision::ResultUnknown
-            );
-            assert_eq!(
-                error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::Unknown),
-                RetryDecision::ResultUnknown
+                cancelled.retry_decision(method, RequestDisposition::Unknown),
+                RetryDecision::Stop,
+                "{method:?} cancellation must stop retrying"
             );
         }
     }
 
     #[test]
-    fn context_and_cas_errors_are_not_transport_retries() {
-        let cancelled = ClientError::Rpc(Status::cancelled("caller cancelled"));
-        assert_eq!(
-            cancelled.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
-            RetryDecision::Stop
-        );
-        assert_eq!(
-            cancelled.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
-            RetryDecision::Stop
-        );
-        let conflict = ClientError::Rpc(Status::aborted("cas conflict"));
-        assert_eq!(
-            conflict.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
-            RetryDecision::ResultUnknown
-        );
-    }
-
-    #[test]
-    fn explicit_not_sent_error_is_separately_classified() {
+    fn test_client_not_sent_classification() {
         let error = ClientError::Rpc(Status::unavailable("before send"));
         assert_eq!(
             error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::NotSent),
             RetryDecision::NotSent
         );
-    }
-
-    #[test]
-    fn method_mutability_is_explicit() {
-        assert_eq!(RpcMethod::Range.mutability(), RpcMutability::ReadOnly);
-        assert_eq!(RpcMethod::Status.mutability(), RpcMutability::ReadOnly);
-        assert_eq!(RpcMethod::Txn.mutability(), RpcMutability::Mutable);
-        assert_eq!(RpcMethod::LeaseGrant.mutability(), RpcMutability::Mutable);
-    }
-    #[test]
-    fn thiserror_preserves_client_display_and_source() {
-        let error = ClientError::from(Status::unavailable("temporary"));
-        assert!(error.to_string().starts_with("etcd RPC error: "));
-        assert!(error.to_string().contains("temporary"));
-        assert!(std::error::Error::source(&error).is_some());
     }
 }

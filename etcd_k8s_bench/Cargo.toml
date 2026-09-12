@@ -20,5 +20,8 @@ tokio-stream.workspace = true
 
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 [build-dependencies]
 tonic-prost-build.workspace = true

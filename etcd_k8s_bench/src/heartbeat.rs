@@ -133,66 +133,40 @@ impl NodeHeartbeatPlanner {
         result
     }
 
-    /// Emit bootstrap and all runtime items whose timestamp is no later than
-    /// `window`. A status update is never scheduled more than the configured
-    /// status interval apart; NodeLease renewal uses deterministic jitter.
-    #[cfg(test)]
-    pub fn plan_until(&self, window: Duration) -> Vec<HeartbeatItem> {
-        let mut result = self.bootstrap();
-        if window.is_zero() {
-            return result;
-        }
-
-        for node in 0..self.config.nodes {
-            if self.config.node_lease_enabled {
-                let mut lease_at = self.jittered_interval(node as u64, 0);
-                while lease_at <= window {
-                    result.push(HeartbeatItem::new(
-                        node,
-                        HeartbeatItemKind::NodeLeaseRenew,
-                        lease_at,
-                    ));
-                    let next = lease_at.saturating_add(
-                        self.jittered_interval(node as u64, lease_at.as_nanos() as u64),
-                    );
-                    if next <= lease_at {
-                        break;
-                    }
-                    lease_at = next;
-                }
-            }
-
-            let mut status_at = self.config.status_interval;
-            while status_at <= window {
-                result.push(HeartbeatItem::new(
-                    node,
-                    HeartbeatItemKind::NodeStatus,
-                    status_at,
-                ));
-                status_at = status_at.saturating_add(self.config.status_interval);
-            }
-        }
-
-        // Runtime items are emitted in timestamp order, with NodeLease before
-        // Node status at a tie and node index as the final stable tie-breaker.
-        let bootstrap_count =
-            self.config.nodes * if self.config.node_lease_enabled { 3 } else { 2 };
-        result[bootstrap_count..].sort_by_key(|item| {
-            (
-                item.at,
-                match item.kind {
-                    HeartbeatItemKind::NodeLeaseRenew => 0u8,
-                    HeartbeatItemKind::NodeStatus => 1,
-                    _ => 2,
-                },
-                item.node,
-            )
-        });
-        result
+    /// Return the first Node status time for `node` when it falls inside the
+    /// scheduling window.
+    pub fn initial_status_at(&self, node: usize, window: Duration) -> Option<Duration> {
+        let at = self
+            .config
+            .status_interval
+            .mul_f64((node + 1) as f64 / self.config.nodes as f64);
+        (at <= window).then_some(at)
     }
 
-    #[cfg(test)]
-    fn jittered_interval(&self, node: u64, tick: u64) -> Duration {
+    /// Return the next Node status time after `current` when it falls inside
+    /// the scheduling window.
+    pub fn next_status_at(&self, current: Duration, window: Duration) -> Option<Duration> {
+        let at = current.saturating_add(self.config.status_interval);
+        (at <= window).then_some(at)
+    }
+
+    /// Return the next NodeLease renewal after `current` using the production
+    /// deterministic jitter. Disabled NodeLeases never produce renewals.
+    pub fn next_lease_at(
+        &self,
+        current: Duration,
+        node: usize,
+        sequence: u64,
+        window: Duration,
+    ) -> Option<Duration> {
+        if !self.config.node_lease_enabled {
+            return None;
+        }
+        let at = current.saturating_add(self.jittered_interval(node as u64, sequence));
+        (at <= window).then_some(at)
+    }
+
+    fn jittered_interval(&self, node: u64, sequence: u64) -> Duration {
         let base = self.config.lease_interval.as_nanos() as u128;
         let jitter = (base as f64 * self.config.lease_jitter).round() as u128;
         if jitter == 0 {
@@ -204,7 +178,7 @@ impl NodeHeartbeatPlanner {
             .config
             .seed
             .wrapping_add(node.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-            .wrapping_add(tick.rotate_left(17));
+            .wrapping_add(sequence.rotate_left(17));
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^= z >> 31;
@@ -220,61 +194,99 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_is_three_ordered_items_per_node() {
+    fn test_heartbeat_bootstrap_order() {
         let planner = NodeHeartbeatPlanner::new(HeartbeatConfig {
             nodes: 2,
             ..Default::default()
         });
         let items = planner.bootstrap();
-        assert_eq!(items.len(), 6);
-        assert_eq!(items[0].kind, HeartbeatItemKind::NodeCreate);
-        assert_eq!(items[1].kind, HeartbeatItemKind::NodeLeaseCreate);
-        assert_eq!(items[2].kind, HeartbeatItemKind::NodeReady);
-        assert_eq!(items[3].node, 1);
+        let expected = [
+            (
+                0,
+                HeartbeatItemKind::NodeCreate,
+                "/registry/minions/node-0000",
+            ),
+            (
+                0,
+                HeartbeatItemKind::NodeLeaseCreate,
+                "/registry/leases/kube-node-lease/node-0000",
+            ),
+            (
+                0,
+                HeartbeatItemKind::NodeReady,
+                "/registry/minions/node-0000",
+            ),
+            (
+                1,
+                HeartbeatItemKind::NodeCreate,
+                "/registry/minions/node-0001",
+            ),
+            (
+                1,
+                HeartbeatItemKind::NodeLeaseCreate,
+                "/registry/leases/kube-node-lease/node-0001",
+            ),
+            (
+                1,
+                HeartbeatItemKind::NodeReady,
+                "/registry/minions/node-0001",
+            ),
+        ];
+        assert_eq!(items.len(), expected.len());
+        for (item, &(node, kind, key)) in items.iter().zip(&expected) {
+            assert_eq!(item.node, node);
+            assert_eq!(item.kind, kind);
+            assert_eq!(item.key, key);
+            assert_eq!(item.at, Duration::ZERO);
+        }
     }
 
     #[test]
-    fn disabled_node_lease_bootstrap_and_plan_have_no_lease_items() {
+    fn test_heartbeat_lease_disabled() {
         let planner = NodeHeartbeatPlanner::new(HeartbeatConfig {
             nodes: 2,
             node_lease_enabled: false,
             ..Default::default()
         });
-        let items = planner.plan_until(Duration::from_secs(21));
+        let items = planner.bootstrap();
+        assert_eq!(items.len(), 4);
         assert!(items.iter().all(|item| {
-            !matches!(
+            matches!(
                 item.kind,
-                HeartbeatItemKind::NodeLeaseCreate | HeartbeatItemKind::NodeLeaseRenew
+                HeartbeatItemKind::NodeCreate | HeartbeatItemKind::NodeReady
             )
         }));
         assert_eq!(
-            items
-                .iter()
-                .filter(|item| item.kind == HeartbeatItemKind::NodeCreate)
-                .count(),
-            2
+            planner.next_lease_at(Duration::ZERO, 0, 0, Duration::from_secs(60)),
+            None
         );
     }
 
     #[test]
-    fn jitter_is_repeatable_and_within_four_percent() {
+    fn test_heartbeat_jitter_bounds() {
         let planner = NodeHeartbeatPlanner::new(HeartbeatConfig {
             nodes: 1,
             ..Default::default()
         });
-        let a = planner.plan_until(Duration::from_secs(31));
-        let b = planner.plan_until(Duration::from_secs(31));
-        assert_eq!(a, b);
-        let renew_times: Vec<_> = a
-            .iter()
-            .filter(|x| x.kind == HeartbeatItemKind::NodeLeaseRenew)
-            .map(|item| item.at)
-            .collect();
-        assert!(!renew_times.is_empty());
+        let window = Duration::from_secs(31);
+        let collect = || {
+            let mut times = Vec::new();
+            let mut current = Duration::ZERO;
+            let mut sequence = 0;
+            while let Some(next) = planner.next_lease_at(current, 0, sequence, window) {
+                times.push(next);
+                current = next;
+                sequence += 1;
+            }
+            times
+        };
+        let first = collect();
+        assert_eq!(first, collect());
+        assert!(!first.is_empty());
 
         let cadence = Duration::from_millis(9_600)..=Duration::from_millis(10_400);
         let mut previous = Duration::ZERO;
-        for (index, &at) in renew_times.iter().enumerate() {
+        for (index, &at) in first.iter().enumerate() {
             let interval = at
                 .checked_sub(previous)
                 .expect("renew timestamps must be nondecreasing");

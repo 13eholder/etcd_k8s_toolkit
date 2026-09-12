@@ -466,7 +466,7 @@ pub struct LoggerOptions {
 }
 
 enum LogCommand {
-    Entry(LogEntry),
+    Entry(LogEntry, Option<oneshot::Sender<()>>),
     Flush(oneshot::Sender<()>),
 }
 
@@ -495,7 +495,7 @@ impl Logger {
 
     async fn log(&self, entry: LogEntry) {
         self.sender
-            .send(LogCommand::Entry(entry))
+            .send(LogCommand::Entry(entry, None))
             .await
             .expect("log writer stopped");
     }
@@ -552,10 +552,13 @@ async fn collect_entries(
         tokio::select! {
             command = receiver.recv() => {
                 match command {
-                    Some(LogCommand::Entry(entry)) => {
+                    Some(LogCommand::Entry(entry, received)) => {
                         serde_json::to_writer(&mut active, &entry)
                             .expect("failed to serialize log entry");
                         active.push(b'\n');
+                        if let Some(received) = received {
+                            let _ = received.send(());
+                        }
                         if active.len() >= buffer_capacity_bytes {
                             submit_buffer(
                                 &mut active,
@@ -663,7 +666,7 @@ fn now_ms() -> u128 {
 mod tests {
     use super::*;
     #[test]
-    fn require_leader_uses_etcd_canonical_metadata_pair() {
+    fn test_leader_metadata_parse() {
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert(
             "hasleader",
@@ -696,7 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_forwards_upstream_status_verbatim() {
+    async fn test_watch_status_forward() {
         let path = test_log_path("dispatch_upstream_status");
         let logger = Arc::new(Logger::new(
             &path,
@@ -704,7 +707,15 @@ mod tests {
         ));
         let (_inbound_error_tx, inbound_error_rx) = oneshot::channel();
         let (response_tx, mut response_rx) = mpsc::channel(1);
-        let expected = Status::resource_exhausted("upstream status");
+        let mut expected = Status::with_details(
+            tonic::Code::ResourceExhausted,
+            "upstream status",
+            tonic::codegen::Bytes::from_static(b"details"),
+        );
+        expected.metadata_mut().insert(
+            "x-upstream-error",
+            tonic::metadata::MetadataValue::from_static("yes"),
+        );
 
         dispatch_watch_responses(
             tokio_stream::iter([Err(expected)]),
@@ -715,20 +726,21 @@ mod tests {
         )
         .await;
 
-        match response_rx.recv().await {
-            Some(Err(status)) => {
+        match tokio::time::timeout(Duration::from_secs(1), response_rx.recv()).await {
+            Ok(Some(Err(status))) => {
                 assert_eq!(status.code(), tonic::Code::ResourceExhausted);
                 assert_eq!(status.message(), "upstream status");
+                assert_eq!(status.details(), b"details");
+                assert_eq!(status.metadata().get("x-upstream-error").unwrap(), "yes");
             }
             other => panic!("expected upstream status, got {other:?}"),
         }
         assert!(response_rx.recv().await.is_none());
         logger.flush().await;
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
-    async fn dispatch_treats_upstream_eof_as_clean_close() {
+    async fn test_watch_eof_close() {
         let path = test_log_path("dispatch_upstream_eof");
         let logger = Arc::new(Logger::new(
             &path,
@@ -748,118 +760,304 @@ mod tests {
 
         assert!(response_rx.recv().await.is_none());
         logger.flush().await;
-        let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn independent_first_watch_streams_do_not_claim_reconnect() {
-        let request = WatchRequest::default();
-        let first_details = watch_request_details(&request);
-        let second_details = watch_request_details(&request);
-
-        assert!(!first_details.contains("reconnect"));
-        assert!(!second_details.contains("reconnect"));
+    #[derive(Clone, Default)]
+    struct UpstreamWatchProbe {
+        requests: Arc<std::sync::Mutex<Vec<WatchRequest>>>,
+        notified: Arc<tokio::sync::Notify>,
     }
 
-    async fn wait_for_file_size(path: &std::path::Path, minimum_bytes: u64) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if tokio::fs::metadata(path)
-                    .await
-                    .is_ok_and(|metadata| metadata.len() >= minimum_bytes)
-                {
-                    break;
+    #[tonic::async_trait]
+    impl Watch for UpstreamWatchProbe {
+        type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
+
+        async fn watch(
+            &self,
+            request: Request<Streaming<WatchRequest>>,
+        ) -> Result<Response<Self::WatchStream>, Status> {
+            let mut inbound = request.into_inner();
+            let probe = self.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = inbound.message().await {
+                    probe.requests.lock().unwrap().push(request);
+                    probe.notified.notify_one();
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            });
+            Ok(Response::new(Box::pin(tokio_stream::pending())))
+        }
+    }
+
+    async fn wait_for_upstream_watches(probe: &UpstreamWatchProbe, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = probe.notified.notified();
+                if probe.requests.lock().unwrap().len() >= count {
+                    return;
+                }
+                notified.await;
             }
         })
         .await
-        .expect("timed out waiting for log data");
+        .expect("upstream Watch did not receive the proxied request");
     }
 
     #[tokio::test]
-    async fn logger_appends_json_lines() {
-        let path = test_log_path("appends");
-        let logger = Logger::new(&path, logger_options(1024, Duration::from_secs(1)));
+    async fn test_watch_new_stream_logs() {
+        let path = test_log_path("watch_new_streams");
+        let logger = Arc::new(Logger::new(
+            &path,
+            logger_options(4096, Duration::from_secs(60)),
+        ));
+        let probe = UpstreamWatchProbe::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_probe = probe.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(crate::pb::etcdserverpb::watch_server::WatchServer::new(
+                    server_probe,
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let service = ProxyService::new(
+            KvClient::new(channel.clone()),
+            WatchClient::new(channel.clone()),
+            LeaseClient::new(channel.clone()),
+            MaintenanceClient::new(channel),
+            Arc::clone(&logger),
+        );
 
-        logger
-            .log(LogEntry {
-                timestamp_ms: 1,
-                method: "/etcdserverpb.KV/Range",
-                request: "first".to_string(),
-                stream_id: None,
-                direction: None,
-                sequence: None,
-                details: None,
-            })
-            .await;
-        logger
-            .log(LogEntry {
-                timestamp_ms: 2,
-                method: "/etcdserverpb.Lease/LeaseGrant",
-                request: "second".to_string(),
-                stream_id: None,
-                direction: None,
-                sequence: None,
-                details: None,
-            })
-            .await;
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(crate::pb::etcdserverpb::watch_server::WatchServer::new(
+                    service,
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    proxy_listener,
+                ))
+                .await
+                .unwrap();
+        });
+        let proxy_channel =
+            tonic::transport::Endpoint::from_shared(format!("http://{proxy_address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+        let mut proxy_client = WatchClient::new(proxy_channel);
+
+        let mut response_streams = Vec::new();
+        for (key, revision) in [
+            (b"/registry/pods/a".as_slice(), 1),
+            (b"/registry/pods/b", 2),
+        ] {
+            let (request_tx, request_rx) = mpsc::channel(1);
+            let response = proxy_client
+                .watch(Request::new(ReceiverStream::new(request_rx)))
+                .await
+                .unwrap();
+            response_streams.push(response.into_inner());
+            request_tx
+                .send(WatchRequest {
+                    request_union: Some(
+                        crate::pb::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                            crate::pb::etcdserverpb::WatchCreateRequest {
+                                key: key.to_vec(),
+                                range_end: b"\0".to_vec(),
+                                start_revision: revision,
+                                prev_kv: true,
+                                progress_notify: true,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                })
+                .await
+                .unwrap();
+            wait_for_upstream_watches(&probe, response_streams.len()).await;
+        }
         logger.flush().await;
 
-        let content = std::fs::read_to_string(&path).expect("failed to read log file");
-        let lines = content.lines().collect::<Vec<_>>();
+        let content = std::fs::read_to_string(&*path).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|entry| entry["method"] == "/etcdserverpb.Watch/Watch")
+            .collect();
+        assert_eq!(entries.len(), 2);
+        let first_stream = entries[0]["stream_id"].as_u64().unwrap();
+        let second_stream = entries[1]["stream_id"].as_u64().unwrap();
+        assert_ne!(first_stream, second_stream);
+        for (entry, revision) in entries.iter().zip([1, 2]) {
+            assert_eq!(entry["direction"], "inbound");
+            assert_eq!(entry["sequence"], 0);
+            let details = entry["details"].as_str().unwrap();
+            assert!(details.contains("create key="));
+            assert!(details.contains(&format!("start_revision={revision}")));
+            assert!(!details.contains("reconnect"));
+        }
+        drop(response_streams);
+        proxy_server.abort();
+        let _ = proxy_server.await;
+        server.abort();
+        let _ = server.await;
+    }
+    fn test_log_entry(request: String) -> LogEntry {
+        LogEntry {
+            timestamp_ms: 1,
+            method: "/etcdserverpb.KV/Range",
+            request,
+            stream_id: None,
+            direction: None,
+            sequence: None,
+            details: None,
+        }
+    }
+
+    fn encoded_entry_len(entry: &LogEntry) -> usize {
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, entry).unwrap();
+        bytes.push(b'\n');
+        bytes.len()
+    }
+
+    #[tokio::test]
+    async fn test_logger_json_append() {
+        let path = test_log_path("appends");
+        std::fs::write(
+            &*path,
+            "{\"timestamp_ms\":0,\"method\":\"sentinel\",\"request\":\"existing \\\"quoted\\\" entry\"}\n",
+        )
+        .unwrap();
+        let logger = Logger::new(&path, logger_options(1024, Duration::from_secs(60)));
+        logger
+            .log(test_log_entry("first \"quoted\"\nline".into()))
+            .await;
+        logger.flush().await;
+        drop(logger);
+
+        let content = std::fs::read_to_string(&*path).expect("failed to read log file");
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"method\":\"/etcdserverpb.KV/Range\""));
-        assert!(lines[1].contains("\"request\":\"second\""));
-        let _ = std::fs::remove_file(path);
+        assert_eq!(lines[0]["method"], "sentinel");
+        assert_eq!(lines[0]["request"], "existing \"quoted\" entry");
+        assert_eq!(lines[1]["method"], "/etcdserverpb.KV/Range");
+        assert_eq!(lines[1]["request"], "first \"quoted\"\nline");
     }
 
-    #[tokio::test]
-    async fn logger_flushes_on_interval() {
-        let path = test_log_path("interval");
-        let logger = Logger::new(&path, logger_options(1024, Duration::from_millis(20)));
-
-        logger
-            .log(LogEntry {
-                timestamp_ms: 1,
-                method: "/etcdserverpb.KV/Range",
-                request: "interval".to_string(),
-                stream_id: None,
-                direction: None,
-                sequence: None,
-                details: None,
-            })
-            .await;
-
-        wait_for_file_size(&path, 1).await;
-        let content = std::fs::read_to_string(&path).expect("failed to read log file");
-        assert!(content.contains("\"request\":\"interval\""));
-        let _ = std::fs::remove_file(path);
+    async fn wait_entry_received(mut received: oneshot::Receiver<()>) {
+        for _ in 0..100 {
+            if received.try_recv().is_ok() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("collector did not receive the entry");
     }
 
-    #[tokio::test]
-    async fn logger_flushes_at_buffer_capacity() {
-        let path = test_log_path("capacity");
-        let buffer_capacity_bytes = 128;
-        let logger = Logger::new(
-            &path,
-            logger_options(buffer_capacity_bytes, Duration::from_secs(1)),
+    #[tokio::test(start_paused = true)]
+    async fn test_logger_interval_flush() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (batch_tx, mut batch_rx) = mpsc::channel(1);
+        let (_empty_buffer_tx, empty_buffer_rx) = mpsc::channel(1);
+        let collector = tokio::spawn(collect_entries(
+            command_rx,
+            batch_tx,
+            empty_buffer_rx,
+            1024,
+            Duration::from_millis(20),
+        ));
+        tokio::task::yield_now().await;
+        let (received_tx, received_rx) = oneshot::channel();
+        command_tx
+            .send(LogCommand::Entry(
+                test_log_entry("interval".into()),
+                Some(received_tx),
+            ))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        wait_entry_received(received_rx).await;
+        assert!(
+            batch_rx.try_recv().is_err(),
+            "entry must not flush before the interval boundary"
         );
-        logger
-            .log(LogEntry {
-                timestamp_ms: 1,
-                method: "/etcdserverpb.KV/Put",
-                request: "x".repeat(buffer_capacity_bytes),
-                stream_id: None,
-                direction: None,
-                sequence: None,
-                details: None,
-            })
-            .await;
 
-        wait_for_file_size(&path, buffer_capacity_bytes as u64).await;
-        let content = std::fs::read_to_string(&path).expect("failed to read log file");
-        assert!(content.contains("\"method\":\"/etcdserverpb.KV/Put\""));
-        let _ = std::fs::remove_file(path);
+        tokio::time::advance(Duration::from_millis(20)).await;
+        let mut batch = None;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            if let Ok(received) = batch_rx.try_recv() {
+                batch = Some(received);
+                break;
+            }
+        }
+        let batch = batch.expect("entry must flush at the interval boundary");
+        assert!(
+            std::str::from_utf8(&batch.bytes)
+                .unwrap()
+                .contains("\"request\":\"interval\"")
+        );
+        drop(command_tx);
+        collector.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_logger_capacity_flush() {
+        for (case, request, adjust_capacity) in [
+            ("below", "small".to_string(), 1024usize),
+            ("equal", "x".repeat(128), 0),
+            ("above", "x".repeat(128), usize::MAX),
+        ] {
+            let entry = test_log_entry(request);
+            let encoded_len = encoded_entry_len(&entry);
+            let capacity = if case == "below" {
+                adjust_capacity
+            } else if case == "equal" {
+                encoded_len
+            } else {
+                encoded_len - 1
+            };
+            let (command_tx, command_rx) = mpsc::channel(1);
+            let (batch_tx, mut batch_rx) = mpsc::channel(1);
+            let (_empty_buffer_tx, empty_buffer_rx) = mpsc::channel(1);
+            let collector = tokio::spawn(collect_entries(
+                command_rx,
+                batch_tx,
+                empty_buffer_rx,
+                capacity,
+                Duration::from_secs(3600),
+            ));
+            tokio::task::yield_now().await;
+            let (received_tx, received_rx) = oneshot::channel();
+            command_tx
+                .send(LogCommand::Entry(entry, Some(received_tx)))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            wait_entry_received(received_rx).await;
+            let batch = batch_rx.try_recv();
+            if case == "below" {
+                assert!(batch.is_err(), "{case} entry must stay buffered");
+            } else {
+                let batch = batch.unwrap_or_else(|_| panic!("{case} entry must flush"));
+                assert_eq!(batch.bytes.len(), encoded_len);
+            }
+            drop(command_tx);
+            collector.await.unwrap();
+        }
     }
 }

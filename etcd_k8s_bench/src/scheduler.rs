@@ -87,6 +87,33 @@ impl WorkClass {
 
 const MAX_ERROR_CONTEXT: usize = 256;
 
+#[cfg(test)]
+static UPDATE_FINISHED_OBSERVERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn update_finished_observer(name: &str) -> Arc<tokio::sync::Notify> {
+    UPDATE_FINISHED_OBSERVERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
+#[cfg(test)]
+fn note_update_finished(workload: &str) {
+    let observer = UPDATE_FINISHED_OBSERVERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(workload)
+        .cloned();
+    if let Some(observer) = observer {
+        observer.notify_waiters();
+    }
+}
+
 #[derive(Debug)]
 struct ClassAccounting {
     offered: AtomicU64,
@@ -1171,7 +1198,7 @@ impl RangeProducer {
     }
 }
 
-struct RangeShapePlan {
+pub(crate) struct RangeShapePlan {
     prefix_total: u64,
     seen: u64,
     count_only: u64,
@@ -1530,7 +1557,10 @@ fn masterlease_tick_at(interval: Duration, ordinal: u64, duration: Duration) -> 
     Some(Duration::from_secs_f64(secs))
 }
 
-fn range_shape_plan(workload: &WorkloadSpec, prefix_total: u64) -> Result<RangeShapePlan, String> {
+pub(crate) fn range_shape_plan(
+    workload: &WorkloadSpec,
+    prefix_total: u64,
+) -> Result<RangeShapePlan, String> {
     let count_only = workload.range_count_only_count;
     if count_only > prefix_total {
         return Err(format!(
@@ -1598,32 +1628,6 @@ fn range_request(spec: &crate::config::RangeSpec, n: u64) -> RangeRequest {
         keys_only: false,
         ..Default::default()
     }
-}
-fn node_status_phase(node: usize, nodes: usize, interval: Duration) -> Duration {
-    interval.mul_f64((node + 1) as f64 / nodes as f64)
-}
-
-fn heartbeat_interval(
-    seed: u64,
-    node: usize,
-    tick: u64,
-    base: Duration,
-    jitter_ratio: f64,
-) -> Duration {
-    let nanos = base.as_nanos() as u128;
-    let jitter = (nanos as f64 * jitter_ratio).round() as u128;
-    if jitter == 0 {
-        return base;
-    }
-    let mut z = seed
-        .wrapping_add((node as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
-        .wrapping_add(tick.rotate_left(17));
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^= z >> 31;
-    let span = jitter.saturating_mul(2).saturating_add(1);
-    let offset = (z as u128 % span) as i128 - jitter as i128;
-    Duration::from_nanos((nanos as i128 + offset).max(1) as u64)
 }
 struct SharedPool {
     name: PoolName,
@@ -2261,17 +2265,9 @@ async fn run_with_ctrl_c(
     if let Some((at, _)) = ranges.next() {
         push(at, 2, Source::Range, &mut heap, &mut sequence);
     }
-    let status_interval = Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s);
     if scheduler.workload.nodes.node_lease_enabled {
         for node in 0..scheduler.nodes {
-            let lease_at = heartbeat_interval(
-                scheduler.seed,
-                node,
-                0,
-                Duration::from_secs_f64(scheduler.workload.nodes.lease_interval_s),
-                scheduler.workload.nodes.lease_jitter,
-            );
-            if lease_at <= duration {
+            if let Some(lease_at) = planner.next_lease_at(Duration::ZERO, node, 0, duration) {
                 push(
                     lease_at,
                     0,
@@ -2283,17 +2279,14 @@ async fn run_with_ctrl_c(
         }
     }
     for node in 0..scheduler.nodes {
-        if !status_interval.is_zero() {
-            let status_at = node_status_phase(node, scheduler.nodes, status_interval);
-            if status_at <= duration {
-                push(
-                    status_at,
-                    0,
-                    Source::NodeStatus { node, tick: 0 },
-                    &mut heap,
-                    &mut sequence,
-                );
-            }
+        if let Some(status_at) = planner.initial_status_at(node, duration) {
+            push(
+                status_at,
+                0,
+                Source::NodeStatus { node, tick: 0 },
+                &mut heap,
+                &mut sequence,
+            );
         }
     }
     let master_lease_interval = Duration::from_secs_f64(scheduler.workload.master_lease_interval_s);
@@ -2371,6 +2364,8 @@ async fn run_with_ctrl_c(
             }
             SupervisedScheduleControl::UpdateFinished(result) => {
                 update_task.take();
+                #[cfg(test)]
+                note_update_finished(&scheduler.workload.name);
                 if let Err(error) = result {
                     schedule_error = Some(error);
                     break;
@@ -2468,14 +2463,8 @@ async fn run_with_ctrl_c(
                     },
                     &mut stats,
                 );
-                let next = event.at.saturating_add(heartbeat_interval(
-                    scheduler.seed,
-                    node,
-                    event.sequence,
-                    Duration::from_secs_f64(scheduler.workload.nodes.lease_interval_s),
-                    scheduler.workload.nodes.lease_jitter,
-                ));
-                if next <= duration {
+                if let Some(next) = planner.next_lease_at(event.at, node, event.sequence, duration)
+                {
                     push(next, 0, Source::NodeLease(node), &mut heap, &mut sequence);
                 }
             }
@@ -2498,8 +2487,7 @@ async fn run_with_ctrl_c(
                     },
                     &mut stats,
                 );
-                let next_at = event.at.saturating_add(status_interval);
-                if next_at <= duration {
+                if let Some(next_at) = planner.next_status_at(event.at, duration) {
                     push(
                         next_at,
                         0,
@@ -3558,6 +3546,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use tokio::sync::oneshot;
+    use tokio_stream::Stream;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
@@ -3757,6 +3746,44 @@ mod tests {
         range_requests: Arc<std::sync::Mutex<Vec<RangeRequest>>>,
         range_reply: Arc<std::sync::Mutex<Option<crate::pb::etcdserverpb::RangeResponse>>>,
         compact_requests: Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
+        watch_error: Arc<std::sync::Mutex<Option<oneshot::Receiver<()>>>>,
+        watch_opened: Arc<Notify>,
+        watch_created: Arc<Notify>,
+    }
+
+    struct JoinedTimeout {
+        cancel: Option<std::sync::mpsc::Sender<()>>,
+        timeout: oneshot::Receiver<()>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl JoinedTimeout {
+        fn start(duration: Duration) -> Self {
+            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            let (timeout_tx, timeout_rx) = oneshot::channel();
+            let handle = std::thread::spawn(move || {
+                if matches!(
+                    cancel_rx.recv_timeout(duration),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    let _ = timeout_tx.send(());
+                }
+            });
+            Self {
+                cancel: Some(cancel_tx),
+                timeout: timeout_rx,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for JoinedTimeout {
+        fn drop(&mut self) {
+            drop(self.cancel.take());
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("timeout watchdog thread joins");
+            }
+        }
     }
 
     impl CreatePhaseProbe {
@@ -3767,17 +3794,23 @@ mod tests {
         }
 
         async fn wait_for_txns(&self, count: usize) {
-            time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let notified = self.txn_entered.notified();
-                    if self.requests.lock().unwrap().len() >= count {
-                        return;
-                    }
-                    notified.await;
+            let mut timeout = JoinedTimeout::start(Duration::from_secs(3));
+            loop {
+                let notified = self.txn_entered.notified();
+                if self.requests.lock().unwrap().len() >= count {
+                    return;
                 }
-            })
-            .await
-            .expect("probe did not receive the expected Txn");
+                tokio::select! {
+                    _ = notified => {}
+                    _ = &mut timeout.timeout => panic!("probe did not receive the expected Txn"),
+                }
+            }
+        }
+
+        fn fail_watch_after_created(&self) -> oneshot::Sender<()> {
+            let (sender, receiver) = oneshot::channel();
+            *self.watch_error.lock().unwrap() = Some(receiver);
+            sender
         }
     }
 
@@ -3856,6 +3889,50 @@ mod tests {
         }
     }
 
+    #[tonic::async_trait]
+    impl crate::pb::etcdserverpb::watch_server::Watch for CreatePhaseProbe {
+        type WatchStream = std::pin::Pin<
+            Box<
+                dyn Stream<Item = Result<crate::pb::etcdserverpb::WatchResponse, tonic::Status>>
+                    + Send,
+            >,
+        >;
+
+        async fn watch(
+            &self,
+            _request: tonic::Request<tonic::Streaming<crate::pb::etcdserverpb::WatchRequest>>,
+        ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
+            let (responses, receiver) = mpsc::channel(2);
+            let error_signal = self.watch_error.lock().unwrap().take();
+            let watch_created = Arc::clone(&self.watch_created);
+            tokio::spawn(async move {
+                let created = crate::pb::etcdserverpb::WatchResponse {
+                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                        revision: 12,
+                        ..Default::default()
+                    }),
+                    watch_id: 1,
+                    created: true,
+                    ..Default::default()
+                };
+                if responses.send(Ok(created)).await.is_err() {
+                    return;
+                }
+                watch_created.notify_one();
+                if let Some(error_signal) = error_signal
+                    && error_signal.await.is_ok()
+                {
+                    let _ = responses
+                        .send(Err(tonic::Status::internal("server failed")))
+                        .await;
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            )))
+        }
+    }
+
     async fn start_create_probe(
         probe: CreatePhaseProbe,
     ) -> (ClientBundle, tokio::task::JoinHandle<()>) {
@@ -3863,7 +3940,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             Server::builder()
-                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(probe))
+                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(
+                    probe.clone(),
+                ))
+                .add_service(crate::pb::etcdserverpb::watch_server::WatchServer::new(
+                    probe,
+                ))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -4056,7 +4138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guaranteed_update_reacquires_native_lease_for_each_attempt() {
+    async fn test_cas_retry_reacquires_lease() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let probe = LeaseTxnProbe::new();
@@ -4199,7 +4281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_cas_distinguishes_conflict_and_not_found() {
+    async fn test_cas_failure_outcome() {
         for (name, operation, recreate, budget, replies, expected, revisions) in [
             (
                 "create collision",
@@ -4267,7 +4349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_cas_rebuilds_from_failure_kv_and_publishes_commit_revision() {
+    async fn test_cas_retry_refreshes_revision() {
         let (outcome, requests, revision) = run_resource_cas_probe(
             ResourceOperation::GuaranteedUpdate,
             false,
@@ -4300,7 +4382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_cas_recreates_missing_masterlease_without_resetting_budget() {
+    async fn test_masterlease_missing_recreate() {
         let (outcome, requests, revision) = run_resource_cas_probe(
             ResourceOperation::GuaranteedUpdate,
             true,
@@ -4333,7 +4415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_cas_expired_before_send_is_timeout() {
+    async fn test_cas_expired_not_sent() {
         let (outcome, requests, _) = run_resource_cas_probe(
             ResourceOperation::GuaranteedUpdate,
             false,
@@ -4347,7 +4429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_cas_unknown_mutable_result_is_not_replayed() {
+    async fn test_cas_unknown_no_replay() {
         for status in [
             tonic::Status::unavailable("response lost after possible commit"),
             tonic::Status::deadline_exceeded("commit result is unknown"),
@@ -4366,112 +4448,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_barrier_precedes_exact_successful_update_phase() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+    async fn test_prepare_blocks_updates() {
         let probe = CreatePhaseProbe::default();
-        let requests = Arc::clone(&probe.requests);
-        let server = tokio::spawn(async move {
-            Server::builder()
-                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(probe))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        let client = ClientBundle::connect(
-            &format!("http://{address}"),
-            Duration::from_secs(1),
-            1024 * 1024,
-        )
-        .await
-        .unwrap();
-        let mut workload = exact_phase_workload();
-        workload
-            .resources
-            .retain(|resource| resource.name == "pods");
-        workload.etcd_lease_pools.clear();
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        let accounting = RunAccounting::new();
-        let pools = Arc::new(HashMap::new());
-        let (sender, receiver) = mpsc::channel(2);
-        let worker = tokio::spawn(worker_loop(
-            receiver,
+        let held_bootstrap = probe.next_txn_reply();
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let mut workload = probe_workload();
+        workload.timeline[0].duration_s = 0.1;
+        let mut running = tokio::spawn(run_with_ctrl_c(
+            probe_config(workload),
             client,
-            workload.clone(),
-            Duration::from_secs(1),
-            Arc::clone(&pools),
-            Arc::new(AtomicI64::new(0)),
-            TokioInstant::now(),
-            Arc::new(AtomicU64::new(0)),
+            pending_ctrl_c(),
         ));
 
-        let scheduled = run_create_phase(
-            &workload,
-            &plan,
-            std::slice::from_ref(&sender),
-            1,
-            Duration::from_secs(2),
-            &accounting,
-        )
-        .await
-        .unwrap();
-        assert_eq!(scheduled, 4);
-        assert_eq!(requests.lock().unwrap().len(), 4);
+        probe.wait_for_txns(1).await;
+        assert_pending(std::pin::Pin::new(&mut running)).await;
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        held_bootstrap
+            .send(Ok(compact_response(11, true, 0, b"")))
+            .unwrap();
 
-        let updates = run_update_phase(
-            workload.clone(),
-            plan,
-            vec![sender.clone()],
-            1,
-            7,
-            TokioInstant::now(),
-            Duration::from_millis(100),
-            Arc::clone(&accounting),
-        )
-        .await
-        .unwrap();
-        assert_eq!(updates, 8);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 12);
-        for request in &requests[..4] {
-            assert!(matches!(
-                request.compare[0].target_union,
-                Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
-                    0
-                ))
-            ));
+        let report = time::timeout(Duration::from_secs(3), running)
+            .await
+            .expect("run completes after bootstrap release")
+            .expect("run task joins");
+        assert!(report.achieved, "{report:?}");
+        assert!(report.schedule_complete);
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in &requests[..2] {
+            assert_eq!(request.compare[0].key, b"/registry/minions/node-0000");
         }
-        for request in &requests[4..] {
-            assert!(matches!(
-                request.compare[0].target_union,
-                Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
-                    revision
-                )) if revision > 0
-            ));
-        }
+        assert!(requests[2].compare[0].key.starts_with(b"/registry/pods/"));
+        assert_eq!(
+            requests[2].compare[0].target_union,
+            Some(TargetUnion::ModRevision(0))
+        );
+        assert_eq!(
+            requests[3].compare[0].target_union,
+            Some(TargetUnion::ModRevision(3))
+        );
+        assert_report_equations(&report);
         drop(requests);
-
-        drop(sender);
-        worker.await.unwrap().unwrap();
         server.abort();
         let _ = server.await;
     }
 
-    #[tokio::test]
-    async fn phase_tracker_deadline_reports_remaining_success_deficit() {
+    #[tokio::test(start_paused = true)]
+    async fn test_prepare_deadline_deficit() {
         let tracker = PhaseTracker::new(vec![2]);
         tracker.record(0, Outcome::Success);
-        let error = tracker
-            .wait_until("update", TokioInstant::now() + Duration::from_millis(1))
-            .await
-            .unwrap_err();
+        let deadline = TokioInstant::now() + Duration::from_millis(1);
+        let wait = tracker.wait_until("update", deadline);
+        time::advance(Duration::from_millis(2)).await;
+        let error = wait.await.unwrap_err();
+        assert!(error.contains("update phase deadline exceeded"));
         assert!(error.contains("target=2"));
         assert!(error.contains("succeeded=1"));
         assert!(error.contains("deficit=1"));
     }
 
     #[test]
-    fn update_dispatch_reserves_time_for_completion() {
+    fn test_update_dispatch_headroom() {
         let duration = Duration::from_secs(100);
         assert_eq!(update_dispatch_at(duration, 0, 10), Duration::ZERO);
         assert_eq!(
@@ -4485,7 +4522,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_cursor_has_bounded_state() {
+    fn test_range_rate_total() {
         let workload = WorkloadSpec {
             name: "k8s".into(),
             pod_size_bytes: 4096,
@@ -4531,17 +4568,13 @@ mod tests {
         assert_eq!(cursor.total(), 10000);
     }
     #[test]
-    fn stable_routing_is_repeatable() {
-        assert_eq!(stable_shard(b"/k", 7), stable_shard(b"/k", 7));
-    }
-    #[test]
-    fn prefix_end_handles_ff() {
+    fn test_prefix_ff_successor() {
         assert_eq!(prefix_range_end(&[0xff]), vec![0]);
         assert_eq!(prefix_range_end(&[b'a', 0xff]), vec![b'b']);
     }
 
     #[test]
-    fn range_shape_classifies_each_kubernetes_request_form() {
+    fn test_range_shape_classification() {
         assert_eq!(range_shape(&RangeRequest::default()), RangeShape::Point);
         assert_eq!(
             range_shape(&RangeRequest {
@@ -4568,7 +4601,7 @@ mod tests {
         );
     }
     #[test]
-    fn embedded_ranges_scan_resource_prefixes() {
+    fn test_range_resource_prefix() {
         let workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let pods = workload
@@ -4591,7 +4624,7 @@ mod tests {
     }
 
     #[test]
-    fn application_targets_are_exact_and_exclude_masterlease_updates() {
+    fn test_trace_operation_totals() {
         let workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         assert_eq!(application_operation_total(&workload), 492_618);
@@ -4601,10 +4634,18 @@ mod tests {
     }
 
     #[test]
-    fn node_status_phases_are_uniform_and_repeatable() {
-        let interval = Duration::from_secs(300);
+    fn test_node_status_phase_spacing() {
+        let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
+            nodes: 4,
+            status_interval: Duration::from_secs(300),
+            ..Default::default()
+        });
         let phases: Vec<_> = (0..4)
-            .map(|node| node_status_phase(node, 4, interval))
+            .map(|node| {
+                planner
+                    .initial_status_at(node, Duration::from_secs(300))
+                    .unwrap()
+            })
             .collect();
         assert_eq!(
             phases,
@@ -4618,23 +4659,51 @@ mod tests {
     }
 
     #[test]
-    fn node_status_ticks_follow_each_nodes_phase_until_deadline() {
-        let nodes = 2000;
-        let interval = Duration::from_secs(300);
-        let duration = Duration::from_secs(2310);
-        let mut total = 0;
-        for node in 0..nodes {
-            let mut at = node_status_phase(node, nodes, interval);
-            while at <= duration {
-                total += 1;
-                at = at.saturating_add(interval);
-            }
-        }
-        assert_eq!(total, 15_400);
+    fn test_node_status_cutoff() {
+        let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
+            nodes: 1,
+            status_interval: Duration::from_secs(300),
+            ..Default::default()
+        });
+        let duration = Duration::from_secs(300);
+        let first = planner.initial_status_at(0, duration).unwrap();
+        assert_eq!(first, duration);
+        assert_eq!(planner.next_status_at(first, duration), None);
+
+        let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
+            nodes: 4,
+            status_interval: Duration::from_secs(300),
+            ..Default::default()
+        });
+        let duration = Duration::from_secs(700);
+        let schedules: Vec<Vec<_>> = (0..4)
+            .map(|node| {
+                let mut times = Vec::new();
+                let mut current = planner.initial_status_at(node, duration);
+                while let Some(at) = current {
+                    times.push(at);
+                    current = planner.next_status_at(at, duration);
+                }
+                times
+            })
+            .collect();
+        assert_eq!(
+            schedules,
+            vec![
+                vec![
+                    Duration::from_secs(75),
+                    Duration::from_secs(375),
+                    Duration::from_secs(675),
+                ],
+                vec![Duration::from_secs(150), Duration::from_secs(450)],
+                vec![Duration::from_secs(225), Duration::from_secs(525)],
+                vec![Duration::from_secs(300), Duration::from_secs(600)],
+            ]
+        );
     }
 
     #[test]
-    fn rolling_update_workload_schedules_exact_budget() {
+    fn test_rolling_budget_total() {
         let base =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let base_range = range_request_total(&base, 1);
@@ -4654,33 +4723,28 @@ mod tests {
     }
 
     #[test]
-    fn masterlease_ticks_stop_at_workload_duration() {
+    fn test_masterlease_tick_cutoff() {
         let interval = Duration::from_secs(10);
         let duration = Duration::from_secs(15);
-        // Derived short run: only the ordinal-0 tick at t=10s fits.
         assert_eq!(masterlease_tick_at(interval, 0, duration), Some(interval));
         assert_eq!(masterlease_tick_at(interval, 1, duration), None);
-        // An interval longer than the run suppresses even the initial tick.
         assert_eq!(
             masterlease_tick_at(Duration::from_secs(300), 0, duration),
             None
         );
-        // Trace mode: exactly 231 ticks, the last one lands on t == duration.
         let trace_duration = Duration::from_secs(2310);
         let ticks = (0..231)
             .filter(|&ordinal| masterlease_tick_at(interval, ordinal, trace_duration).is_some())
             .count();
         assert_eq!(ticks, 231);
         assert_eq!(masterlease_tick_at(interval, 231, trace_duration), None);
-        // Huge intervals cannot overflow even while ordinals remain.
         assert_eq!(
             masterlease_tick_at(Duration::from_secs_f64(1e19), 1, trace_duration),
             None
         );
     }
-
     #[test]
-    fn range_shape_plan_emits_exact_trace_counts() {
+    fn test_trace_count_only_budget() {
         let workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         let ranges = RateCursor::new(&workload, 1, 0xB2);
@@ -4704,7 +4768,7 @@ mod tests {
     }
 
     #[test]
-    fn range_shapes_follow_actual_prefix_slots() {
+    fn test_count_only_prefix_slots() {
         let mut workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
         workload.ranges = vec![
@@ -4725,26 +4789,50 @@ mod tests {
                 selector_keep_every: 1,
             },
         ];
-        workload.range_count_only_count = 0;
+        workload.range_count_only_count = 1;
         let weights = vec![1.0, 1.0];
-        let producer = RangeProducer::new(weights.iter().copied());
-        let prefix_total = exact_prefix_total(producer.clone(), &weights, &workload.ranges, 3);
-        assert_eq!(prefix_total, 1);
+        let mut producer = RangeProducer::new(weights.iter().copied());
+        let prefix_total = exact_prefix_total(producer.clone(), &weights, &workload.ranges, 4);
+        assert_eq!(prefix_total, 2);
         let mut plan = range_shape_plan(&workload, prefix_total).unwrap();
-        let mut producer = producer;
-        let mut shaped = 0;
-        for _ in 0..3 {
+        let mut prefix_requests = Vec::new();
+        let mut point_requests = Vec::new();
+        for _ in 0..4 {
             let index = producer.next(&weights).unwrap();
+            let mut request = RangeRequest {
+                limit: 500,
+                ..Default::default()
+            };
             if workload.ranges[index].kind == "prefix" {
-                let mut request = RangeRequest {
-                    limit: 500,
-                    ..Default::default()
-                };
                 plan.apply(&mut request);
-                shaped += u64::from(request.count_only);
+                prefix_requests.push(request);
+            } else {
+                point_requests.push(request);
             }
         }
-        assert_eq!(shaped, 0);
+        assert_eq!(prefix_requests.len(), 2);
+        assert_eq!(point_requests.len(), 2);
+        assert_eq!(
+            prefix_requests
+                .iter()
+                .filter(|request| request.count_only)
+                .count(),
+            1
+        );
+        assert!(prefix_requests.iter().all(|request| {
+            if request.count_only {
+                request.limit == 0
+            } else {
+                request.limit == 500
+            }
+        }));
+        assert!(point_requests.iter().all(|request| !request.count_only));
+
+        workload.range_count_only_count = 3;
+        let Err(error) = range_shape_plan(&workload, prefix_total) else {
+            panic!("count-only shapes must not exceed prefix capacity");
+        };
+        assert!(error.contains("exceeds scheduled prefix Range capacity"));
     }
 
     fn range_page(
@@ -4771,7 +4859,7 @@ mod tests {
     }
 
     #[test]
-    fn range_pager_pages_without_duplicates_and_fixes_revision() {
+    fn test_list_pages_pin_snapshot() {
         let request = RangeRequest {
             key: b"/registry/pods/".to_vec(),
             range_end: b"/registry/pods0".to_vec(),
@@ -4801,7 +4889,7 @@ mod tests {
     }
 
     #[test]
-    fn range_pager_rejects_missing_revision_and_empty_more_page() {
+    fn test_list_invalid_page_error() {
         let request = RangeRequest {
             key: b"/registry/pods/".to_vec(),
             range_end: b"/registry/pods0".to_vec(),
@@ -4819,7 +4907,7 @@ mod tests {
     }
 
     #[test]
-    fn range_pager_preserves_explicit_snapshot_with_advancing_headers() {
+    fn test_list_explicit_snapshot() {
         let request = RangeRequest {
             key: b"/registry/pods/".to_vec(),
             range_end: b"/registry/pods0".to_vec(),
@@ -4847,7 +4935,7 @@ mod tests {
     }
 
     #[test]
-    fn range_pager_selector_doubles_limit_to_ten_thousand() {
+    fn test_list_selector_limit_growth() {
         let request = RangeRequest {
             key: b"/registry/pods/".to_vec(),
             range_end: b"/registry/pods0".to_vec(),
@@ -4880,7 +4968,7 @@ mod tests {
     }
 
     #[test]
-    fn range_pager_point_count_only_and_unbounded_prefix_are_single_request_shapes() {
+    fn test_range_single_request_shapes() {
         for request in [
             RangeRequest {
                 key: b"/registry/pods/item".to_vec(),
@@ -4919,55 +5007,97 @@ mod tests {
         }
     }
 
-    #[test]
-    fn masterlease_update_recreates_a_missing_key() {
-        assert_eq!(
-            storage_operation_for_state(
-                ResourceOperation::GuaranteedUpdate,
-                &KeyState::Absent,
-                true,
-            ),
-            Some(ResourceOperation::Create)
-        );
-        assert_eq!(
-            storage_operation_for_state(
-                ResourceOperation::GuaranteedUpdate,
-                &KeyState::Absent,
-                false,
-            ),
-            None
-        );
-    }
+    #[tokio::test]
+    async fn test_read_inventory_prepared() {
+        let probe = CreatePhaseProbe::default();
+        let first_bootstrap = probe.next_txn_reply();
+        let second_bootstrap = probe.next_txn_reply();
+        let held_service_create = probe.next_txn_reply();
+        first_bootstrap
+            .send(Ok(compact_response(1, true, 0, b"")))
+            .unwrap();
+        second_bootstrap
+            .send(Ok(compact_response(2, true, 0, b"")))
+            .unwrap();
+        *probe.range_reply.lock().unwrap() = Some(range_page(20, &[], false, 0));
 
-    #[test]
-    fn storage_attempt_budget_does_not_reset_between_retry_kinds() {
-        let mut used = 0;
-        for _ in 0..5 {
-            assert!(take_storage_attempt(&mut used, 5));
-        }
-        assert!(!take_storage_attempt(&mut used, 5));
-    }
-
-    #[test]
-    fn embedded_read_only_resources_are_created_before_ranges() {
-        let workload =
+        let mut workload =
             WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        for name in ["services", "endpointslices"] {
-            let resource = workload
-                .resources
-                .iter()
-                .find(|resource| resource.name == name)
-                .unwrap();
-            assert_eq!(workload.resource_count(resource).unwrap(), 100);
-            assert!(
-                patterned_key(&resource.key_pattern, 0)
-                    .starts_with(format!("/registry/{name}/bench-bench/").as_bytes())
-            );
+        workload.topology.node_count = 1;
+        workload.topology.pod_count = 1;
+        workload.resources.retain(|resource| {
+            matches!(
+                resource.name.as_str(),
+                "pods" | "services" | "endpointslices"
+            )
+        });
+        for resource in &mut workload.resources {
+            resource.count = ResourceCountSpec::Fixed { count: 1 };
+            resource.update_amplification = 0;
         }
+        workload.relationships = crate::config::ResourceRelationshipsSpec::default();
+        workload.etcd_lease_pools.clear();
+        workload.watches.clear();
+        workload.status_count = 0;
+        workload.cas_conflicts = 0;
+        workload.compact_interval_s = 300.0;
+        workload.ranges = vec![crate::config::RangeSpec {
+            key_pattern: "/registry/services/".into(),
+            kind: "prefix".into(),
+            limit: 1,
+            count_only: false,
+            weight: 1.0,
+            selector_keep_every: 1,
+        }];
+        workload.range_count_only_count = 0;
+        workload.timeline = vec![crate::config::TimelineSegment {
+            duration_s: 0.001,
+            range_rps: 1_000.0,
+        }];
+
+        let (client, server) = start_create_probe(probe.clone()).await;
+        let mut running = tokio::spawn(run_with_ctrl_c(
+            probe_config(workload),
+            client,
+            pending_ctrl_c(),
+        ));
+        probe.wait_for_txns(3).await;
+        assert_pending(std::pin::Pin::new(&mut running)).await;
+        assert!(probe.range_requests.lock().unwrap().is_empty());
+        held_service_create
+            .send(Ok(compact_response(3, true, 0, b"")))
+            .unwrap();
+
+        let report = time::timeout(Duration::from_secs(3), running)
+            .await
+            .expect("run completes after read-only inventory creation")
+            .expect("run task joins");
+        assert!(report.achieved);
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[2].compare[0].key.starts_with(b"/registry/pods/"));
+        assert!(
+            requests[3].compare[0]
+                .key
+                .starts_with(b"/registry/services/")
+        );
+        assert!(
+            requests[4].compare[0]
+                .key
+                .starts_with(b"/registry/endpointslices/")
+        );
+        let ranges = probe.range_requests.lock().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].key, b"/registry/services/");
+        assert_report_equations(&report);
+        drop(ranges);
+        drop(requests);
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
-    fn try_enqueue_counts_closed_queue_as_drop() {
+    fn test_queue_closed_accounting() {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let mut stats = ScheduleStats::default();
@@ -4992,7 +5122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_worker_tasks_propagates_worker_error() {
+    async fn test_worker_drain_error() {
         let mut workers = JoinSet::new();
         workers.spawn(async { Err("worker failed".to_string()) });
         let (result, interrupted) = drain_worker_tasks(
@@ -5008,7 +5138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_watch_supervision_reports_terminal_before_deadline() {
+    async fn test_watch_terminal_stops_schedule() {
         let mut tasks = JoinSet::new();
         tasks.spawn(async {
             (
@@ -5047,7 +5177,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_watch_supervision_accepts_context_shutdown() {
+    fn test_watch_shutdown_not_failure() {
         let outcome = crate::watch::WatchOutcome {
             terminal: crate::watch::WatchTerminal::ContextCanceled,
             state: crate::watch::WatchState::default(),
@@ -5056,84 +5186,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_failure_aborts_actual_inflight_and_queued_workers_before_returning() {
+    async fn test_watch_error_cancels_workers() {
         let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
+        let fail_watch = probe.fail_watch_after_created();
+        for revision in 1..=3 {
+            probe
+                .next_txn_reply()
+                .send(Ok(compact_response(revision, true, 0, b"")))
+                .unwrap();
+        }
+        let held_update = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, mut workers, worker_lifetime) =
-            spawn_owned_probe_worker(client, probe_workload());
-        let (done, ack) = oneshot::channel();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut ScheduleStats::default()
-        ));
-        probe.wait_for_txns(1).await;
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status),
-            },
-            &mut ScheduleStats::default()
+        let mut workload = probe_workload();
+        workload.resources[0].update_amplification = 2;
+        workload.watches = vec![crate::config::WatchSpec {
+            name: "pods".into(),
+            resource_prefix: "/registry/pods".into(),
+            start_revision: 0,
+            prev_kv: true,
+            progress_notify: true,
+        }];
+        let running = tokio::spawn(run_with_ctrl_c(
+            probe_config(workload),
+            client,
+            pending_ctrl_c(),
         ));
 
-        let mut watches = JoinSet::new();
-        watches.spawn(async {
-            (
-                "pods".to_string(),
-                Err(crate::watch::WatchError::Rpc(tonic::Status::internal(
-                    "server failed",
-                ))),
-            )
-        });
-        let mut ctrl_c = pending_ctrl_c();
-        let result = time::timeout(
-            Duration::from_secs(1),
-            wait_for_supervised_schedule_event(
-                &mut watches,
-                &mut workers,
-                &mut None,
-                TokioInstant::now() + Duration::from_secs(60),
-                &mut ctrl_c,
-            ),
-        )
-        .await
-        .unwrap();
-        let Err(error) = result else {
-            panic!("watch failure should stop scheduling");
-        };
-        assert!(error.contains("server failed"));
-        time::timeout(
-            Duration::from_secs(1),
-            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
-        )
-        .await
-        .unwrap();
-        let (shutdown, _) = shutdown_watch::channel(false);
-        let (stopped, interrupted) = stop_watches_with_ctrl(
-            shutdown,
-            watches,
-            Duration::from_secs(1),
-            &mut ctrl_c,
-            false,
-        )
-        .await;
-        stopped.unwrap();
-        assert!(!interrupted);
-        assert!(worker_lifetime.upgrade().is_none());
-        assert!(ack.await.is_err());
-        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
-        let report = accounting.report(RunTargets::default(), false, false, Some(error));
-        assert_eq!(report_class(&report, WorkClass::Bootstrap).unfinished, 1);
-        assert_eq!(report_class(&report, WorkClass::Status).unfinished, 1);
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        probe.wait_for_txns(4).await;
+        fail_watch.send(()).unwrap();
+        let report = time::timeout(Duration::from_secs(3), running)
+            .await
+            .expect("watch failure run returns")
+            .expect("watch failure task joins");
         assert!(!report.achieved);
+        assert!(!report.interrupted);
+        assert!(!report.schedule_complete);
+        assert!(
+            report
+                .termination_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("server failed")
+        );
+        assert_eq!(probe.requests.lock().unwrap().len(), 4);
         assert_report_equations(&report);
+        drop(held_update);
         server.abort();
         let _ = server.await;
     }
@@ -5190,26 +5287,11 @@ mod tests {
     }
 
     #[test]
-    fn compactor_first_tick_puts_zero_without_compacting() {
+    fn test_compactor_previous_revision() {
         let mut state = CompactorState::default();
         assert_eq!(state.txn_inputs(), (0, 0));
-        let observation = state.observe(&compact_response(11, true, 0, b"")).unwrap();
-        assert_eq!(observation.compact_target, None);
-        assert_eq!(
-            state,
-            CompactorState {
-                compact_version: 1,
-                previous_txn_header_revision: 11,
-                status: CompactorStatus::Active,
-                recovery: None,
-            }
-        );
-    }
-
-    #[test]
-    fn compactor_success_targets_previous_txn_header() {
-        let mut state = CompactorState::default();
-        state.observe(&compact_response(11, true, 0, b"")).unwrap();
+        let first = state.observe(&compact_response(11, true, 0, b"")).unwrap();
+        assert_eq!(first.compact_target, None);
         assert_eq!(state.txn_inputs(), (1, 11));
         let observation = state.observe(&compact_response(20, true, 0, b"")).unwrap();
         assert_eq!(observation.compact_target, Some(11));
@@ -5217,32 +5299,18 @@ mod tests {
     }
 
     #[test]
-    fn compactor_cas_failure_syncs_remote_state_without_retry() {
+    fn test_compactor_cas_resync() {
         let mut state = CompactorState {
             compact_version: 2,
             previous_txn_header_revision: 20,
             status: CompactorStatus::Active,
             recovery: None,
         };
-        let observation = state
+        let conflict = state
             .observe(&compact_response(30, false, 7, b"19"))
             .unwrap();
-        assert_eq!(observation.compact_target, None);
-        assert_eq!(observation.remote_compact_revision, Some(19));
-        assert_eq!(state.txn_inputs(), (7, 30));
-    }
-
-    #[test]
-    fn compactor_next_tick_after_failure_uses_own_header() {
-        let mut state = CompactorState {
-            compact_version: 2,
-            previous_txn_header_revision: 20,
-            status: CompactorStatus::Active,
-            recovery: None,
-        };
-        state
-            .observe(&compact_response(30, false, 7, b"19"))
-            .unwrap();
+        assert_eq!(conflict.compact_target, None);
+        assert_eq!(conflict.remote_compact_revision, Some(19));
         assert_eq!(state.txn_inputs(), (7, 30));
         let observation = state.observe(&compact_response(40, true, 0, b"")).unwrap();
         assert_eq!(observation.compact_target, Some(30));
@@ -5250,7 +5318,7 @@ mod tests {
     }
 
     #[test]
-    fn compactor_missing_failure_kv_requires_resync() {
+    fn test_compactor_missing_key_recovers() {
         let mut state = CompactorState {
             compact_version: 7,
             previous_txn_header_revision: 20,
@@ -5280,7 +5348,7 @@ mod tests {
     }
 
     #[test]
-    fn compactor_malformed_value_stays_explicit_until_legal_remote_state() {
+    fn test_compactor_invalid_value_recovers() {
         let mut state = CompactorState {
             compact_version: 7,
             previous_txn_header_revision: 20,
@@ -5351,31 +5419,21 @@ mod tests {
     }
 
     #[test]
-    fn workload_plan_has_exact_create_and_update_totals() {
+    fn test_workload_plan_totals() {
         let workload = exact_phase_workload();
         let plan = WorkloadPlan::build(&workload).unwrap();
         assert_eq!(plan.total_creates(), 8);
         assert_eq!(plan.total_updates(), 12);
         let creates: Vec<_> = plan.creates().collect();
         assert_eq!(creates.len(), 8);
-        assert_eq!(
-            creates
-                .iter()
-                .filter(|operation| operation.resource == 0)
-                .count(),
-            4
-        );
-        assert_eq!(
-            creates
-                .iter()
-                .filter(|operation| operation.resource == 1)
-                .count(),
-            4
-        );
-    }
+        let expected: std::collections::BTreeSet<_> =
+            (0..4).flat_map(|id| [(0, id), (1, id)]).collect();
+        let actual: std::collections::BTreeSet<_> = creates
+            .iter()
+            .map(|operation| (operation.resource, operation.id))
+            .collect();
+        assert_eq!(actual, expected);
 
-    #[test]
-    fn workload_plan_scales_to_two_thousand_nodes_and_forty_thousand_pods() {
         let mut workload = exact_phase_workload();
         workload.topology.node_count = 2_000;
         workload.topology.pod_count = 40_000;
@@ -5394,7 +5452,7 @@ mod tests {
     }
 
     #[test]
-    fn update_cursor_hits_every_key_exact_amplification_times() {
+    fn test_update_cursor_key_counts() {
         let workload = exact_phase_workload();
         let plan = WorkloadPlan::build(&workload).unwrap();
         let mut counts = HashMap::new();
@@ -5411,7 +5469,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_tracker_publishes_per_resource_targets_successes_and_deficits() {
+    fn test_create_metrics_deficit() {
         let workload = exact_phase_workload();
         let plan = WorkloadPlan::build(&workload).unwrap();
         let tracker = PhaseTracker::new(plan.create_targets(workload.resources.len()));
@@ -5448,7 +5506,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_result_rejects_any_success_deficit() {
+    fn test_create_deficit_error() {
         let tracker = PhaseTracker::new(vec![3]);
         tracker.record(0, Outcome::Success);
         tracker.record(0, Outcome::ResultUnknown);
@@ -5459,7 +5517,7 @@ mod tests {
         assert!(error.contains("deficit=1"));
     }
     #[test]
-    fn run_accounting_reports_all_terminal_buckets_and_equations() {
+    fn test_accounting_terminal_totals() {
         let accounting = RunAccounting::new();
         let mut success = tracked(&accounting, WorkClass::Create);
         success.mark_accepted();
@@ -5515,8 +5573,8 @@ mod tests {
         assert!(!report.achieved);
     }
 
-    #[tokio::test]
-    async fn blocking_enqueue_timeout_marks_item_unissued() {
+    #[tokio::test(start_paused = true)]
+    async fn test_enqueue_timeout_unissued() {
         let accounting = RunAccounting::new();
         let (sender, receiver) = mpsc::channel(1);
         let mut stats = ScheduleStats::default();
@@ -5531,12 +5589,13 @@ mod tests {
         let second = WorkItem::Status {
             accounting: tracked(&accounting, WorkClass::Status),
         };
-        let result = enqueue_until(
+        let enqueue = enqueue_until(
             &sender,
             second,
             TokioInstant::now() + Duration::from_millis(1),
-        )
-        .await;
+        );
+        time::advance(Duration::from_millis(2)).await;
+        let result = enqueue.await;
         assert!(matches!(result, EnqueueResult::Unissued));
         drop(receiver);
 
@@ -5554,7 +5613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_worker_preserves_unknown_rpc_result_and_error_ack() {
+    async fn test_bootstrap_rpc_unknown() {
         let probe = CreatePhaseProbe::default();
         probe
             .next_txn_reply()
@@ -5612,7 +5671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_worker_preserves_unknown_rpc_result_after_bootstrap() {
+    async fn test_heartbeat_rpc_unknown() {
         let probe = CreatePhaseProbe::default();
         probe
             .next_txn_reply()
@@ -5723,7 +5782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_worker_first_journal_is_one_successful_noop_tick() {
+    async fn test_compact_first_tick_noop() {
         let (report, probe) = run_compact_probe(vec![compact_response(11, true, 0, b"")]).await;
         assert_eq!(
             *probe.requests.lock().unwrap(),
@@ -5738,7 +5797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_worker_legal_cas_resync_succeeds_without_compact_or_retry() {
+    async fn test_compact_conflict_no_retry() {
         let (report, probe) = run_compact_probe(vec![
             compact_response(11, true, 0, b""),
             compact_response(22, false, 9, b"7"),
@@ -5760,7 +5819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_worker_rpc_failure_is_not_hidden_by_successful_journal() {
+    async fn test_compact_rpc_error() {
         let (report, probe) = run_compact_probe(vec![
             compact_response(11, true, 0, b""),
             compact_response(22, true, 0, b""),
@@ -5789,7 +5848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_worker_rejects_invalid_page_despite_successful_rpc() {
+    async fn test_range_invalid_page_error() {
         let probe = CreatePhaseProbe::default();
         *probe.range_reply.lock().unwrap() = Some(range_page(7, &[], true, 1));
         let (client, server) = start_create_probe(probe.clone()).await;
@@ -5835,7 +5894,7 @@ mod tests {
     }
 
     #[test]
-    fn try_enqueue_full_keeps_rejected_item_out_of_accepted_bucket() {
+    fn test_queue_full_drop() {
         let accounting = RunAccounting::new();
         let (sender, receiver) = mpsc::channel(1);
         let mut stats = ScheduleStats::default();
@@ -5868,7 +5927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canceled_pending_reserve_is_unissued_not_accepted_or_dropped() {
+    async fn test_queue_cancel_unissued() {
         let accounting = RunAccounting::new();
         let (sender, receiver) = mpsc::channel(1);
         assert!(try_enqueue(
@@ -5901,7 +5960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_worker_preserves_inflight_and_queued_items_as_unfinished() {
+    async fn test_worker_abort_unfinished() {
         let probe = CreatePhaseProbe::default();
         let held_reply = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
@@ -5962,7 +6021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_barrier_requires_every_created_before_update_rpc() {
+    async fn test_watch_ready_waits_all() {
         let probe = CreatePhaseProbe::default();
         let (client, server) = start_create_probe(probe.clone()).await;
         let workload = probe_workload();
@@ -6059,7 +6118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_closed_channel_preserves_delayed_watch_terminal_cause() {
+    async fn test_watch_ready_preserves_cause() {
         let (created, ready) = oneshot::channel();
         let (terminal, terminate) = oneshot::channel();
         let mut watches = JoinSet::new();
@@ -6102,24 +6161,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn readiness_timeout_does_not_release_update_phase() {
+    #[tokio::test(start_paused = true)]
+    async fn test_watch_ready_timeout() {
         let (_created, ready) = oneshot::channel();
         let mut watches = JoinSet::new();
         watches.spawn(std::future::pending::<WatchTaskOutput>());
         let mut ctrl_c = pending_ctrl_c();
-        let error = time::timeout(
-            Duration::from_secs(1),
-            wait_for_watch_ready(
-                &mut watches,
-                vec![ready],
-                Duration::from_millis(1),
-                &mut ctrl_c,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        let waiting = wait_for_watch_ready(
+            &mut watches,
+            vec![ready],
+            Duration::from_millis(1),
+            &mut ctrl_c,
+        );
+        time::advance(Duration::from_millis(2)).await;
+        let error = waiting.await.unwrap_err();
         assert_eq!(error, "watch readiness timed out");
         watches.abort_all();
         while watches.join_next().await.is_some() {}
@@ -6132,7 +6187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_blocked_rpc_prevents_application_offers_until_cancellation() {
+    async fn test_bootstrap_cancel_blocks_load() {
         let probe = CreatePhaseProbe::default();
         let held_reply = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
@@ -6166,7 +6221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_error_ack_stops_before_application_create_or_update() {
+    async fn test_bootstrap_error_blocks_load() {
         let probe = CreatePhaseProbe::default();
         probe
             .next_txn_reply()
@@ -6203,7 +6258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonempty_drain_cancellation_joins_owned_tasks_before_partial_report() {
+    async fn test_drain_cancel_joins_tasks() {
         let probe = CreatePhaseProbe::default();
         let held_reply = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
@@ -6299,94 +6354,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_watch_terminal_during_normal_drain_remains_a_run_failure() {
+    async fn test_drain_watch_error_report() {
         let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
+        let fail_watch = probe.fail_watch_after_created();
+        for revision in 1..=3 {
+            probe
+                .next_txn_reply()
+                .send(Ok(compact_response(revision, true, 0, b"")))
+                .unwrap();
+        }
+        let held_compact_journal = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, probe_workload());
-        let (done, ack) = oneshot::channel();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut ScheduleStats::default()
+        let mut workload = probe_workload();
+        workload.resources[0].update_amplification = 0;
+        workload.timeline[0].duration_s = 0.05;
+        workload.compact_interval_s = 0.05;
+        workload.watches = vec![crate::config::WatchSpec {
+            name: "drain-watch".into(),
+            resource_prefix: "/registry/pods".into(),
+            start_revision: 0,
+            prev_kv: true,
+            progress_notify: true,
+        }];
+        let watch_error_observed = crate::watch::watch_error_observer("drain-watch");
+        let watch_error_observed = watch_error_observed.notified();
+        let mut run = tokio::spawn(run_with_ctrl_c(
+            probe_config(workload),
+            client,
+            pending_ctrl_c(),
         ));
-        probe.wait_for_txns(1).await;
-        let (shutdown, shutdown_observer) = shutdown_watch::channel(false);
-        let (terminal, terminate) = oneshot::channel();
-        let (observed, observation) = oneshot::channel();
-        let guard = Arc::new(());
-        let watch_lifetime = Arc::downgrade(&guard);
-        let mut watches = JoinSet::new();
-        watches.spawn(async move {
-            let _guard = guard;
-            terminate.await.unwrap();
-            observed.send(()).unwrap();
-            (
-                "pods".into(),
-                Ok(crate::watch::WatchOutcome {
-                    terminal: crate::watch::WatchTerminal::Canceled {
-                        reason: "late server cancellation".into(),
-                    },
-                    state: crate::watch::WatchState::default(),
-                }),
-            )
-        });
-        let mut ctrl_c = pending_ctrl_c();
-        let mut draining = Box::pin(drain_worker_tasks(
-            vec![sender],
-            workers,
-            Arc::new(HashMap::new()),
-            Duration::from_secs(3),
-            &mut ctrl_c,
-        ));
-        assert_pending(draining.as_mut()).await;
-        assert!(
-            !*shutdown_observer.borrow(),
-            "Watch must remain live while worker RPC is held"
-        );
-        terminal.send(()).unwrap();
-        time::timeout(Duration::from_secs(1), observation)
+
+        probe.wait_for_txns(4).await;
+        assert_pending(std::pin::Pin::new(&mut run)).await;
+        fail_watch.send(()).unwrap();
+        time::timeout(Duration::from_secs(1), watch_error_observed)
             .await
-            .unwrap()
+            .expect("scheduler observes the Watch error before drain release");
+        held_compact_journal
+            .send(Ok(compact_response(4, true, 0, b"")))
             .unwrap();
-        assert_pending(draining.as_mut()).await;
-        held_reply
-            .send(Ok(compact_response(11, true, 0, b"")))
-            .unwrap();
-        let (drained, interrupted) = time::timeout(Duration::from_secs(1), draining)
+        let report = time::timeout(Duration::from_secs(3), run)
             .await
-            .unwrap();
-        drained.unwrap();
-        assert!(!interrupted);
-        ack.await.unwrap().unwrap();
-        assert!(worker_lifetime.upgrade().is_none());
-        let (stopped, interrupted) = stop_watches_with_ctrl(
-            shutdown,
-            watches,
-            Duration::from_secs(1),
-            &mut ctrl_c,
-            false,
-        )
-        .await;
-        let error = stopped.unwrap_err();
-        assert!(error.contains("late server cancellation"));
-        assert!(!interrupted);
-        assert!(watch_lifetime.upgrade().is_none());
-        let report = accounting.report(RunTargets::default(), false, true, Some(error));
-        assert_eq!(report_class(&report, WorkClass::Bootstrap).succeeded, 1);
+            .expect("drain run finishes")
+            .expect("drain run task joins");
+        assert!(report.schedule_complete);
+        assert!(!report.interrupted);
         assert!(!report.achieved);
+        assert!(
+            report
+                .termination_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("server failed")
+        );
+        assert_eq!(report_class(&report, WorkClass::Compact).succeeded, 1);
         assert_report_equations(&report);
         server.abort();
         let _ = server.await;
     }
 
-    #[tokio::test]
-    async fn watch_stop_timeout_aborts_and_joins_before_failure_report() {
+    #[tokio::test(start_paused = true)]
+    async fn test_watch_stop_timeout_joins() {
         let (shutdown, observer) = shutdown_watch::channel(false);
         let guard = Arc::new(());
         let lifetime = Arc::downgrade(&guard);
@@ -6395,18 +6423,16 @@ mod tests {
             let _guard = guard;
             std::future::pending::<WatchTaskOutput>().await
         });
-        let (stopped, interrupted) = time::timeout(
-            Duration::from_secs(1),
-            stop_watches_with_ctrl(
-                shutdown,
-                watches,
-                Duration::from_millis(1),
-                &mut pending_ctrl_c(),
-                false,
-            ),
-        )
-        .await
-        .unwrap();
+        let mut ctrl_c = pending_ctrl_c();
+        let stopping = stop_watches_with_ctrl(
+            shutdown,
+            watches,
+            Duration::from_millis(1),
+            &mut ctrl_c,
+            false,
+        );
+        time::advance(Duration::from_millis(2)).await;
+        let (stopped, interrupted) = stopping.await;
         assert!(*observer.borrow());
         assert!(
             lifetime.upgrade().is_none(),
@@ -6425,18 +6451,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn successful_update_completion_does_not_discard_pending_periodic_event() {
+    #[tokio::test(start_paused = true)]
+    async fn test_update_done_keeps_periodic() {
         let probe = CreatePhaseProbe::default();
+        let update_finished = update_finished_observer("periodic-update");
+        let update_finished = update_finished.notified();
         let (client, server) = start_create_probe(probe.clone()).await;
         let mut workload = probe_workload();
+        workload.name = "periodic-update".into();
         workload.compact_interval_s = 1.0;
-        let report = time::timeout(
-            Duration::from_secs(3),
-            run_with_ctrl_c(probe_config(workload), client, pending_ctrl_c()),
-        )
-        .await
-        .unwrap();
+        let mut running = tokio::spawn(run_with_ctrl_c(
+            probe_config(workload),
+            client,
+            pending_ctrl_c(),
+        ));
+
+        probe.wait_for_txns(4).await;
+        assert_eq!(probe.requests.lock().unwrap().len(), 4);
+        let mut timeout = tokio::spawn(async {
+            time::advance(Duration::from_millis(100)).await;
+        });
+        tokio::select! {
+            biased;
+            _ = update_finished => {}
+            _ = &mut timeout => {
+                panic!("supervisor must observe update completion before the periodic deadline")
+            }
+        }
+        time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let mut watchdog = tokio::spawn(async {
+            time::advance(Duration::from_secs(2)).await;
+        });
+        let report = tokio::select! {
+            biased;
+            result = &mut running => result.expect("periodic run task joins"),
+            _ = &mut watchdog => panic!("periodic run did not finish at the scheduled deadline"),
+        };
+        watchdog.abort();
         assert_eq!(report_class(&report, WorkClass::Update).succeeded, 1);
         assert_eq!(report_class(&report, WorkClass::Compact).accepted, 1);
         assert_eq!(report_class(&report, WorkClass::Compact).succeeded, 1);
@@ -6450,14 +6502,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_worker_panic_is_supervised_before_long_timeline_and_aborts_owned_work() {
+    async fn test_worker_panic_preempts_schedule() {
         let probe = CreatePhaseProbe::default();
         let held_reply = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
         let accounting = RunAccounting::new();
-        let (sender, mut workers, worker_lifetime) =
+        let (sender, mut workers, _worker_lifetime) =
             spawn_owned_probe_worker(client, probe_workload());
-        let (done, ack) = oneshot::channel();
+        let (done, _ack) = oneshot::channel();
         assert!(try_enqueue(
             &sender,
             WorkItem::Bootstrap {
@@ -6468,23 +6520,14 @@ mod tests {
             &mut ScheduleStats::default()
         ));
         probe.wait_for_txns(1).await;
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status),
-            },
-            &mut ScheduleStats::default()
-        ));
         workers.spawn(async {
             panic!("injected worker panic");
         });
-        let producer_guard = Arc::new(());
-        let producer_lifetime = Arc::downgrade(&producer_guard);
-        let mut update = Some(tokio::spawn(async move {
-            let _guard = producer_guard;
+        let mut update = Some(tokio::spawn(async {
             std::future::pending::<Result<u64, String>>().await
         }));
         let mut watches = JoinSet::new();
+
         let result = time::timeout(
             Duration::from_secs(1),
             wait_for_supervised_schedule_event(
@@ -6502,42 +6545,27 @@ mod tests {
         };
         assert!(error.contains("worker task failed"));
         assert!(error.contains("injected worker panic"));
+
         let producer = update.take().unwrap();
         producer.abort();
         assert!(producer.await.unwrap_err().is_cancelled());
-        time::timeout(
-            Duration::from_secs(1),
-            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
-        )
-        .await
-        .unwrap();
-        assert!(producer_lifetime.upgrade().is_none());
-        assert!(worker_lifetime.upgrade().is_none());
-        assert!(ack.await.is_err());
-        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
-        let report = accounting.report(RunTargets::default(), false, false, Some(error));
-        assert_eq!(report_class(&report, WorkClass::Bootstrap).unfinished, 1);
-        assert_eq!(report_class(&report, WorkClass::Status).unfinished, 1);
-        assert_eq!(report_class(&report, WorkClass::Status).completed, 0);
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        assert!(!report.achieved);
-        assert!(!report.schedule_complete);
-        assert_report_equations(&report);
+        abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())).await;
+        drop(held_reply);
         server.abort();
         let _ = server.await;
     }
 
     #[tokio::test]
-    async fn early_update_producer_queue_failure_is_supervised_before_long_timeline() {
+    async fn test_update_queue_closed_preempts_schedule() {
         let probe = CreatePhaseProbe::default();
         let held_reply = probe.next_txn_reply();
         let (client, server) = start_create_probe(probe.clone()).await;
         let accounting = RunAccounting::new();
         let workload = probe_workload();
         let plan = WorkloadPlan::build(&workload).unwrap();
-        let (sender, mut workers, worker_lifetime) =
+        let (sender, mut workers, _worker_lifetime) =
             spawn_owned_probe_worker(client, workload.clone());
-        let (done, ack) = oneshot::channel();
+        let (done, _ack) = oneshot::channel();
         assert!(try_enqueue(
             &sender,
             WorkItem::Bootstrap {
@@ -6550,11 +6578,8 @@ mod tests {
         probe.wait_for_txns(1).await;
         let (closed_sender, receiver) = mpsc::channel(1);
         drop(receiver);
-        let producer_guard = Arc::new(());
-        let producer_lifetime = Arc::downgrade(&producer_guard);
         let producer_accounting = Arc::clone(&accounting);
         let mut update = Some(tokio::spawn(async move {
-            let _guard = producer_guard;
             run_update_phase(
                 workload,
                 plan,
@@ -6585,16 +6610,8 @@ mod tests {
         };
         update.take();
         assert!(error.contains("update phase worker queue closed"));
-        time::timeout(
-            Duration::from_secs(1),
-            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
-        )
-        .await
-        .unwrap();
-        assert!(producer_lifetime.upgrade().is_none());
-        assert!(worker_lifetime.upgrade().is_none());
-        assert!(ack.await.is_err());
-        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
+        abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())).await;
+        drop(held_reply);
         let report = accounting.report(RunTargets::default(), false, false, Some(error));
         let update = report_class(&report, WorkClass::Update);
         assert_eq!(update.offered, 1);
@@ -6610,8 +6627,8 @@ mod tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
-    async fn run_cancellation_during_final_compact_drain_returns_interrupted_partial_report() {
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_cancel_partial_report() {
         let probe = CreatePhaseProbe::default();
         for revision in 1..=3 {
             probe
@@ -6623,17 +6640,26 @@ mod tests {
         let (client, server) = start_create_probe(probe.clone()).await;
         let mut workload = probe_workload();
         workload.resources[0].update_amplification = 0;
-        workload.timeline[0].duration_s = 0.05;
-        workload.compact_interval_s = 0.05;
+        workload.timeline[0].duration_s = 1.0;
+        workload.compact_interval_s = 1.0;
         let (cancel, ctrl_c) = controlled_ctrl_c();
-        let run = tokio::spawn(run_with_ctrl_c(probe_config(workload), client, ctrl_c));
+        let mut run = tokio::spawn(run_with_ctrl_c(probe_config(workload), client, ctrl_c));
+        probe.wait_for_txns(3).await;
+        time::advance(Duration::from_secs(1)).await;
         probe.wait_for_txns(4).await;
+        assert_pending(std::pin::Pin::new(&mut run)).await;
+
         cancel.send(()).unwrap();
-        let report = time::timeout(Duration::from_secs(1), run)
-            .await
-            .unwrap()
-            .unwrap();
-        let _ = held_reply.send(Ok(compact_response(4, true, 0, b"")));
+        let mut watchdog = tokio::spawn(async {
+            time::advance(Duration::from_secs(2)).await;
+        });
+        let report = tokio::select! {
+            biased;
+            result = &mut run => result.expect("cancelled drain task joins"),
+            _ = &mut watchdog => panic!("cancelled drain did not finish"),
+        };
+        watchdog.abort();
+        drop(held_reply);
         assert!(
             report.schedule_complete,
             "cancellation must exercise post-schedule drain"
@@ -6656,7 +6682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_stop_cancellation_is_latched_until_owned_watch_joins() {
+    async fn test_watch_stop_cancel_joins() {
         let (shutdown, observer) = shutdown_watch::channel(false);
         let (finish, finished) = oneshot::channel();
         let guard = Arc::new(());

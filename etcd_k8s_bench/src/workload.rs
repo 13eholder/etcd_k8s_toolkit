@@ -490,55 +490,102 @@ mod tests {
     }
 
     #[test]
-    fn txn_shapes_use_mod_compare_and_point_failure_range() {
+    fn test_txn_protocol_shape() {
+        fn assert_compare(
+            compare: &Compare,
+            key: &[u8],
+            target: CompareTarget,
+            target_union: TargetUnion,
+        ) {
+            assert_eq!(compare.result, CompareResult::Equal as i32);
+            assert_eq!(compare.target, target as i32);
+            assert_eq!(compare.key, key);
+            assert_eq!(compare.target_union, Some(target_union));
+        }
+        fn assert_put(op: &RequestOp, key: &[u8], value: &[u8]) {
+            match op.request.as_ref() {
+                Some(request_op::Request::RequestPut(put)) => {
+                    assert_eq!(put.key, key);
+                    assert_eq!(put.value, value);
+                }
+                other => panic!("expected Put, got {other:?}"),
+            }
+        }
+        fn assert_point_range(op: &RequestOp, key: &[u8]) {
+            match op.request.as_ref() {
+                Some(request_op::Request::RequestRange(range)) => {
+                    assert_eq!(range.key, key);
+                    assert!(range.range_end.is_empty());
+                }
+                other => panic!("expected point Range, got {other:?}"),
+            }
+        }
+
         let create = build_create_txn(b"k", b"v");
-        assert_eq!(create.compare[0].target, CompareTarget::Mod as i32);
-        assert_eq!(
-            create.compare[0].target_union,
-            Some(TargetUnion::ModRevision(0))
+        assert_eq!(create.compare.len(), 1);
+        assert_compare(
+            &create.compare[0],
+            b"k",
+            CompareTarget::Mod,
+            TargetUnion::ModRevision(0),
         );
+        assert_eq!(create.success.len(), 1);
+        assert_put(&create.success[0], b"k", b"v");
         assert!(create.failure.is_empty());
 
         let update = build_update_txn(b"k", b"v", 7);
-        assert_eq!(
-            update.compare[0].target_union,
-            Some(TargetUnion::ModRevision(7))
+        assert_compare(
+            &update.compare[0],
+            b"k",
+            CompareTarget::Mod,
+            TargetUnion::ModRevision(7),
         );
+        assert_put(&update.success[0], b"k", b"v");
         assert_eq!(update.failure.len(), 1);
-        match update.failure[0].request.as_ref() {
-            Some(request_op::Request::RequestRange(range)) => {
-                assert_eq!(range.key, b"k");
-                assert!(range.range_end.is_empty());
-            }
-            other => panic!("unexpected failure op: {other:?}"),
-        }
+        assert_point_range(&update.failure[0], b"k");
+
         let delete = build_delete_txn(b"k", 7);
+        assert_compare(
+            &delete.compare[0],
+            b"k",
+            CompareTarget::Mod,
+            TargetUnion::ModRevision(7),
+        );
         assert_eq!(delete.success.len(), 1);
-        assert_eq!(delete.failure.len(), 1);
-        let compact = build_compact_revision_txn(b"123", 7);
-        assert_eq!(compact.compare[0].target, CompareTarget::Version as i32);
-        assert_eq!(
-            compact.compare[0].target_union,
-            Some(TargetUnion::Version(7))
-        );
-        assert_eq!(compact.failure.len(), 1);
-        let recovery_probe = build_compact_revision_txn(b"30", 0);
-        assert_eq!(
-            recovery_probe.compare[0].target_union,
-            Some(TargetUnion::Version(0))
-        );
-        assert_eq!(recovery_probe.success.len(), 1);
-        match recovery_probe.failure[0].request.as_ref() {
-            Some(request_op::Request::RequestRange(range)) => {
-                assert_eq!(range.key, b"compact_rev_key");
-                assert!(range.range_end.is_empty());
+        match delete.success[0].request.as_ref() {
+            Some(request_op::Request::RequestDeleteRange(delete)) => {
+                assert_eq!(delete.key, b"k");
+                assert!(delete.range_end.is_empty());
             }
-            other => panic!("unexpected recovery failure op: {other:?}"),
+            other => panic!("expected point DeleteRange, got {other:?}"),
         }
+        assert_eq!(delete.failure.len(), 1);
+        assert_point_range(&delete.failure[0], b"k");
+
+        let compact = build_compact_revision_txn(b"123", 7);
+        assert_compare(
+            &compact.compare[0],
+            b"compact_rev_key",
+            CompareTarget::Version,
+            TargetUnion::Version(7),
+        );
+        assert_put(&compact.success[0], b"compact_rev_key", b"123");
+        assert_eq!(compact.failure.len(), 1);
+        assert_point_range(&compact.failure[0], b"compact_rev_key");
+
+        let recovery_probe = build_compact_revision_txn(b"30", 0);
+        assert_compare(
+            &recovery_probe.compare[0],
+            b"compact_rev_key",
+            CompareTarget::Version,
+            TargetUnion::Version(0),
+        );
+        assert_put(&recovery_probe.success[0], b"compact_rev_key", b"30");
+        assert_point_range(&recovery_probe.failure[0], b"compact_rev_key");
     }
 
     #[test]
-    fn compact_conflict_exposes_server_version_and_value_for_resync() {
+    fn test_compact_conflict_fields() {
         let response = conflict(9, b"123", 4);
         assert_eq!(failure_version(&response), Some(4));
         assert_eq!(failure_value(&response), Some(&b"123"[..]));
@@ -547,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_kv_drives_next_attempt_revision_and_new_value() {
+    fn test_cas_conflict_retry() {
         let first = TxnAttempt::update(b"k", b"old", 3);
         let mut state = KeyState::Present { mod_revision: 3 };
         let applied = first.apply_response(&conflict(9, b"latest", 4), &mut state);
@@ -558,12 +605,13 @@ mod tests {
                 latest: KeyState::Present { mod_revision: 9 }
             }
         );
+        let started = Instant::now();
         let mut loop_state = CasLoop::new(
             first,
             CasRetryPolicy { max_attempts: 5 },
-            Instant::now() + Duration::from_secs(1),
+            started + Duration::from_secs(1),
         );
-        let decision = loop_state.observe(&conflict(9, b"latest", 4), Instant::now());
+        let decision = loop_state.observe(&conflict(9, b"latest", 4), started);
         assert!(matches!(
             &decision,
             CasDecision::Retry {
@@ -589,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn create_collision_does_not_retry() {
+    fn test_create_collision_no_retry() {
         let attempt = TxnAttempt::create(b"k", b"v");
         let mut loop_state = CasLoop::new(
             attempt,
@@ -608,26 +656,47 @@ mod tests {
     }
 
     #[test]
-    fn native_lease_attachment_is_limited_to_put_transactions() {
+    fn test_operation_lease_policy() {
         assert!(ResourceOperation::Create.uses_native_lease());
         assert!(ResourceOperation::GuaranteedUpdate.uses_native_lease());
         assert!(!ResourceOperation::ConditionalDelete.uses_native_lease());
     }
     #[test]
-    fn request_with_lease_attaches_id_only_to_put_success_ops() {
-        let create = TxnAttempt::create(b"k", b"v").request_with_lease(42);
-        match create.success[0].request.as_ref() {
-            Some(request_op::Request::RequestPut(put)) => assert_eq!(put.lease, 42),
-            other => panic!("expected Put, got {other:?}"),
+    fn test_txn_lease_attachment() {
+        for operation in [
+            TxnAttempt::create(b"k", b"v"),
+            TxnAttempt::update(b"k", b"v", 7),
+        ] {
+            let request = operation.request_with_lease(42);
+            match request.success[0].request.as_ref() {
+                Some(request_op::Request::RequestPut(put)) => assert_eq!(put.lease, 42),
+                other => panic!("expected Put, got {other:?}"),
+            }
+            let without_lease = operation.request_with_lease(0);
+            match without_lease.success[0].request.as_ref() {
+                Some(request_op::Request::RequestPut(put)) => assert_eq!(put.lease, 0),
+                other => panic!("expected Put, got {other:?}"),
+            }
         }
 
         let delete = TxnAttempt::delete(b"k", 7).request_with_lease(42);
+        assert_eq!(
+            delete.compare[0].target_union,
+            Some(TargetUnion::ModRevision(7))
+        );
         match delete.success[0].request.as_ref() {
             Some(request_op::Request::RequestDeleteRange(delete)) => {
                 assert!(delete.range_end.is_empty());
                 assert!(!delete.prev_kv);
             }
             other => panic!("expected DeleteRange, got {other:?}"),
+        }
+        match delete.failure[0].request.as_ref() {
+            Some(request_op::Request::RequestRange(range)) => {
+                assert_eq!(range.key, b"k");
+                assert!(range.range_end.is_empty());
+            }
+            other => panic!("expected point Range, got {other:?}"),
         }
     }
 }
