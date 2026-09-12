@@ -26,13 +26,6 @@ pub enum ResourceOperation {
     ConditionalDelete,
 }
 
-impl ResourceOperation {
-    /// Native etcd leases are attached to successful Put operations only.
-    pub const fn uses_native_lease(self) -> bool {
-        matches!(self, Self::Create | Self::GuaranteedUpdate)
-    }
-}
-
 /// The locally known revision state for one key.
 ///
 /// Values returned by a failed CAS remain local to that attempt. Keeping them
@@ -206,23 +199,6 @@ impl TxnAttempt {
         }
     }
 
-    /// Build the transaction and attach a TTL lease to its successful Put.
-    /// Lease attachment is intentionally limited to Put operations; CAS
-    /// compare/failure Range shape remains unchanged.
-    pub fn request_with_lease(&self, lease: i64) -> TxnRequest {
-        let mut request = self.request();
-        if lease != 0 {
-            if let Some(request_op::Request::RequestPut(put)) = request
-                .success
-                .first_mut()
-                .and_then(|op| op.request.as_mut())
-            {
-                put.lease = lease;
-            }
-        }
-        request
-    }
-
     /// Reconstruct the next request after a conflict.  This intentionally takes
     /// a value from the resource producer: blindly reusing the prior value is
     /// incorrect for status/renew-time updates.
@@ -339,7 +315,13 @@ impl CasLoop {
         }
     }
 
-    /// Apply one response.  A retry decision carries the conflict KV and the
+    /// Build the request for the current attempt without exposing mutable
+    /// retry state to the client adapter.
+    pub fn request(&self) -> TxnRequest {
+        self.current.request()
+    }
+
+    /// Apply one response. A retry decision carries the conflict KV and the
     /// next attempt number, but no request: the caller must regenerate value.
     pub fn observe(&mut self, response: &TxnResponse, now: Instant) -> CasDecision {
         let mut state = KeyState::Absent;
@@ -653,50 +635,5 @@ mod tests {
             loop_state.observe(&response, Instant::now()),
             CasDecision::CreateCollision { .. }
         ));
-    }
-
-    #[test]
-    fn test_operation_lease_policy() {
-        assert!(ResourceOperation::Create.uses_native_lease());
-        assert!(ResourceOperation::GuaranteedUpdate.uses_native_lease());
-        assert!(!ResourceOperation::ConditionalDelete.uses_native_lease());
-    }
-    #[test]
-    fn test_txn_lease_attachment() {
-        for operation in [
-            TxnAttempt::create(b"k", b"v"),
-            TxnAttempt::update(b"k", b"v", 7),
-        ] {
-            let request = operation.request_with_lease(42);
-            match request.success[0].request.as_ref() {
-                Some(request_op::Request::RequestPut(put)) => assert_eq!(put.lease, 42),
-                other => panic!("expected Put, got {other:?}"),
-            }
-            let without_lease = operation.request_with_lease(0);
-            match without_lease.success[0].request.as_ref() {
-                Some(request_op::Request::RequestPut(put)) => assert_eq!(put.lease, 0),
-                other => panic!("expected Put, got {other:?}"),
-            }
-        }
-
-        let delete = TxnAttempt::delete(b"k", 7).request_with_lease(42);
-        assert_eq!(
-            delete.compare[0].target_union,
-            Some(TargetUnion::ModRevision(7))
-        );
-        match delete.success[0].request.as_ref() {
-            Some(request_op::Request::RequestDeleteRange(delete)) => {
-                assert!(delete.range_end.is_empty());
-                assert!(!delete.prev_kv);
-            }
-            other => panic!("expected DeleteRange, got {other:?}"),
-        }
-        match delete.failure[0].request.as_ref() {
-            Some(request_op::Request::RequestRange(range)) => {
-                assert_eq!(range.key, b"k");
-                assert!(range.range_end.is_empty());
-            }
-            other => panic!("expected point Range, got {other:?}"),
-        }
     }
 }

@@ -1,9 +1,5 @@
 //! Watch stream construction, lifecycle state, and resumable event consumption.
-#[cfg(test)]
-use std::collections::HashMap;
 use std::pin::Pin;
-#[cfg(test)]
-use std::sync::{Arc, LazyLock, Mutex};
 
 use thiserror::Error;
 use tokio::sync::{oneshot, watch as shutdown_channel};
@@ -207,32 +203,6 @@ pub enum WatchError {
     Rpc(#[source] Status),
 }
 
-#[cfg(test)]
-static WATCH_ERROR_OBSERVERS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-pub(crate) fn watch_error_observer(name: &str) -> Arc<tokio::sync::Notify> {
-    WATCH_ERROR_OBSERVERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(name.to_string())
-        .or_default()
-        .clone()
-}
-
-#[cfg(test)]
-fn note_watch_error_observed(watch: &WorkloadName) {
-    let observer = WATCH_ERROR_OBSERVERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(watch.as_str())
-        .cloned();
-    if let Some(observer) = observer {
-        observer.notify_waiters();
-    }
-}
-
 /// Run one long-lived watch. Only transport disconnects are resumed; semantic
 /// cancellation and compaction are returned to the scheduler as terminal outcomes.
 /// `ready` is notified once by the first nonterminal Created response.
@@ -342,8 +312,6 @@ where
                         break;
                     }
                     Some(Err(status)) => {
-                        #[cfg(test)]
-                        note_watch_error_observed(&watch_name);
                         return Err(WatchError::Rpc(status));
                     }
                 }

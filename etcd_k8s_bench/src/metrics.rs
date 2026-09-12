@@ -22,10 +22,6 @@ pub const REQUEST_BYTES: &str = "etcd_k8s_bench_request_bytes";
 pub const TXN_TOTAL: &str = "etcd_k8s_bench_txn_total";
 pub const CAS_RETRIES_TOTAL: &str = "etcd_k8s_bench_cas_retries_total";
 pub const NODE_HEARTBEATS_TOTAL: &str = "etcd_k8s_bench_node_heartbeats_total";
-pub const LEASE_GET_TOTAL: &str = "etcd_k8s_bench_lease_get_total";
-pub const LEASE_ATTACHED_OBJECTS: &str = "etcd_k8s_bench_lease_attached_objects";
-pub const RESOURCE_OBJECTS: &str = "etcd_k8s_bench_resource_objects";
-pub const RESOURCE_UPDATES: &str = "etcd_k8s_bench_resource_updates";
 pub const DROPPED_TOTAL: &str = "etcd_k8s_bench_dropped_total";
 pub const INFO: &str = "etcd_k8s_bench_info";
 pub const WATCH_EVENTS_TOTAL: &str = "etcd_k8s_bench_watch_events_total";
@@ -60,10 +56,6 @@ pub const COMPACTOR_RECOVERIES_TOTAL: &str = "etcd_k8s_bench_compactor_recoverie
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceName(String);
 
-/// Labels which may safely be supplied by a lease-pool configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PoolName(String);
-
 /// A workload label used by the informational metric.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkloadName(String);
@@ -88,16 +80,6 @@ impl ResourceName {
     }
 }
 
-impl PoolName {
-    pub fn new(name: impl Into<String>) -> Result<Self, LabelError> {
-        validate_name(name.into()).map(Self)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl WorkloadName {
     pub fn new(name: impl Into<String>) -> Result<Self, LabelError> {
         validate_name(name.into()).map(Self)
@@ -109,14 +91,6 @@ impl WorkloadName {
 }
 
 impl TryFrom<&str> for ResourceName {
-    type Error = LabelError;
-
-    fn try_from(name: &str) -> Result<Self, Self::Error> {
-        Self::new(name)
-    }
-}
-
-impl TryFrom<&str> for PoolName {
     type Error = LabelError;
 
     fn try_from(name: &str) -> Result<Self, Self::Error> {
@@ -197,7 +171,6 @@ impl Operation {
 pub enum Rpc {
     Txn,
     Range,
-    LeaseGrant,
     Status,
     Compact,
 }
@@ -207,7 +180,6 @@ impl Rpc {
         match self {
             Self::Txn => "txn",
             Self::Range => "range",
-            Self::LeaseGrant => "lease_grant",
             Self::Status => "status",
             Self::Compact => "compact",
         }
@@ -268,7 +240,6 @@ impl TxnResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeartbeatKind {
-    Node,
     NodeStatus,
     NodeLease,
 }
@@ -276,7 +247,6 @@ pub enum HeartbeatKind {
 impl HeartbeatKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Node => "node",
             Self::NodeStatus => "node_status",
             Self::NodeLease => "node_lease",
         }
@@ -374,7 +344,6 @@ pub fn record_request_duration(rpc: Rpc, duration: Duration) {
     metrics::histogram!(REQUEST_DURATION_SECONDS, "rpc" => rpc.as_str())
         .record(duration.as_secs_f64());
 }
-
 /// Records time spent waiting in a scheduler queue. This histogram is
 /// deliberately separate from RPC duration so transport latency is not
 /// presented as end-to-end work-item latency.
@@ -411,7 +380,6 @@ pub fn record_txn(resource: &ResourceName, shape: TxnShape, result: TxnResult) {
     )
     .increment(1);
 }
-
 pub fn record_cas_retry(resource: &ResourceName, operation: Operation) {
     metrics::counter!(
         CAS_RETRIES_TOTAL,
@@ -429,45 +397,6 @@ pub fn record_node_heartbeat(kind: HeartbeatKind, outcome: Outcome) {
     )
     .increment(1);
 }
-
-/// Records one Kubernetes `GetLease` decision. `result` is a fixed low-cardinality
-/// outcome: `reuse`, `grant`, `error`, `timeout`, or `unknown`.
-pub fn record_lease_get(pool: &PoolName, result: &'static str) {
-    metrics::counter!(
-        LEASE_GET_TOTAL,
-        "pool" => pool.as_str().to_owned(),
-        "result" => result
-    )
-    .increment(1);
-}
-
-/// Publishes the local lease-manager attachment count for one pool.
-pub fn set_lease_attached_objects(pool: &PoolName, count: u64) {
-    metrics::gauge!(
-        LEASE_ATTACHED_OBJECTS,
-        "pool" => pool.as_str().to_owned()
-    )
-    .set(count as f64);
-}
-
-pub fn set_resource_objects(resource: &ResourceName, state: &'static str, count: u64) {
-    metrics::gauge!(
-        RESOURCE_OBJECTS,
-        "resource" => resource.as_str().to_owned(),
-        "state" => state
-    )
-    .set(count as f64);
-}
-
-pub fn set_resource_updates(resource: &ResourceName, state: &'static str, count: u64) {
-    metrics::gauge!(
-        RESOURCE_UPDATES,
-        "resource" => resource.as_str().to_owned(),
-        "state" => state
-    )
-    .set(count as f64);
-}
-
 pub fn record_dropped(reason: DropReason) {
     metrics::counter!(DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
@@ -595,7 +524,6 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let resource = ResourceName::new("pods").unwrap();
         let workload = WorkloadName::new("k8s").unwrap();
-        let pool = PoolName::new("events").unwrap();
         let watch_response = WatchResponse {
             events: vec![crate::pb::mvccpb::Event {
                 kv: Some(KeyValue {
@@ -633,10 +561,6 @@ mod tests {
             record_range_request(RangeShape::PagedPrefix, Outcome::Success);
             record_cas_retry(&resource, Operation::Update);
             record_node_heartbeat(HeartbeatKind::NodeLease, Outcome::Success);
-            record_lease_get(&pool, "reuse");
-            set_lease_attached_objects(&pool, 7);
-            set_resource_objects(&resource, "planned", 40_000);
-            set_resource_updates(&resource, "target", 400_000);
             record_dropped(DropReason::Backpressure);
             add_inflight(Rpc::Txn);
             remove_inflight(Rpc::Txn);
@@ -728,30 +652,6 @@ mod tests {
             NODE_HEARTBEATS_TOTAL,
             &[("kind", "node_lease"), ("outcome", "success")],
             1.0,
-        );
-        assert_metric(
-            &rendered,
-            LEASE_GET_TOTAL,
-            &[("pool", "events"), ("result", "reuse")],
-            1.0,
-        );
-        assert_metric(
-            &rendered,
-            LEASE_ATTACHED_OBJECTS,
-            &[("pool", "events")],
-            7.0,
-        );
-        assert_metric(
-            &rendered,
-            RESOURCE_OBJECTS,
-            &[("resource", "pods"), ("state", "planned")],
-            40_000.0,
-        );
-        assert_metric(
-            &rendered,
-            RESOURCE_UPDATES,
-            &[("resource", "pods"), ("state", "target")],
-            400_000.0,
         );
         assert_metric(&rendered, DROPPED_TOTAL, &[("reason", "backpressure")], 1.0);
         assert_metric(&rendered, INFLIGHT, &[("rpc", "txn")], 0.0);

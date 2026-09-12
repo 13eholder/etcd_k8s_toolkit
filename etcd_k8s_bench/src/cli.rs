@@ -1,12 +1,11 @@
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
 
-use crate::config::{ConfigError, Profile, ROLLING_UPDATE_NODE_COUNT, RuntimeConfig, WorkloadSpec};
-#[cfg(test)]
-use crate::config::{DEFAULT_NODE_COUNT, DEFAULT_POD_COUNT, DEFAULT_POD_SIZE_BYTES};
+use crate::config::{ConfigError, RunConfig, SyntheticConfig, SyntheticConfigOverrides};
+use crate::plan::{CompiledPlan, DEFAULT_SYNTHETIC_CONFIG};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:2379";
 
@@ -22,40 +21,73 @@ pub struct Cli {
 
 #[derive(Clone, Debug, clap::Subcommand)]
 pub enum Command {
+    /// Compile the synthetic workload plan without contacting etcd.
+    Plan(PlanArgs),
     /// Run the benchmark against a dedicated empty etcd endpoint.
     Run(RunArgs),
-    /// Generate a deterministic DaemonSet-update pressure profile, write it
-    /// to workloads/<name>.json, and exit without touching etcd.
-    #[command(name = "gen_profile")]
-    GenProfile(GenProfileArgs),
 }
 
-/// Base workload selection and overrides shared by both subcommands.
+/// Synthetic configuration source and overrides shared by `plan` and `run`.
 #[derive(Clone, Debug, clap::Args)]
 pub struct BaseArgs {
-    /// Workload JSON; mutually exclusive with an explicitly selected built-in profile.
+    /// Complete synthetic workload JSON.  When omitted, use the embedded
+    /// synthetic-k8s configuration.
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Built-in workload profile. Defaults to k8s when omitted.
-    #[arg(long, value_parser = parse_profile)]
-    pub profile: Option<Profile>,
-
-    /// Pod value size in bytes.
-    #[arg(long, value_parser = parse_positive_usize)]
-    pub pod_size: Option<usize>,
-
-    /// Number of Nodes (and NodeLeases when the selected workload enables them).
+    /// Number of Nodes.
     #[arg(long, value_parser = parse_positive_u64)]
     pub nodes: Option<u64>,
+
+    /// Total number of Pod keys.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub pods: Option<u64>,
+
+    /// Number of namespaces.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub namespaces: Option<u64>,
+
+    /// Pod value size in bytes.  Other resource value sizes are unchanged.
+    #[arg(long, value_parser = parse_size)]
+    pub pod_size: Option<usize>,
+
+    /// Synthetic key and periodic jitter seed. Zero is a valid deterministic seed.
+    #[arg(long, value_parser = parse_u64)]
+    pub seed: Option<u64>,
+
+    /// Logical application update rate.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub update_rps: Option<u64>,
+
+    /// Measurement duration (for example, 60s or 2500ms).
+    #[arg(long, value_parser = parse_duration)]
+    pub duration: Option<Duration>,
+
+    /// Number of gRPC workers.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub workers: Option<u64>,
+
+    /// Total bounded work queue capacity.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub queue_capacity: Option<u64>,
 
     /// Maximum gRPC send and receive message size (for example, 64MiB).
     #[arg(long, default_value = "64MiB", value_parser = parse_size)]
     pub max_message_size: usize,
 
-    /// Deterministic key and heartbeat jitter seed.
-    #[arg(long, default_value_t = 1)]
-    pub seed: u64,
+    /// Per-RPC timeout (for example, 5s or 250ms).
+    #[arg(long, value_parser = parse_duration)]
+    pub request_timeout: Option<Duration>,
+
+    /// Logical operation timeout (for example, 10s or 3m).
+    #[arg(long, value_parser = parse_duration)]
+    pub operation_timeout: Option<Duration>,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+pub struct PlanArgs {
+    #[command(flatten)]
+    pub base: BaseArgs,
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -67,165 +99,65 @@ pub struct RunArgs {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
 
-    /// Exact total number of Pod keys.
-    #[arg(long, value_parser = parse_positive_u64)]
-    pub pods: Option<u64>,
-
-    /// Number of gRPC workers.
-    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
-    pub workers: usize,
-
-    /// Total bounded work queue capacity.
-    #[arg(long, default_value_t = 4096, value_parser = parse_positive_usize)]
-    pub queue_capacity: usize,
-
-    /// Single RPC timeout (for example, 10s or 250ms).
-    #[arg(long, default_value = "10s", value_parser = parse_duration)]
-    pub request_timeout: Duration,
-
-    /// Resource operation deadline (for example, 3m).
-    #[arg(long, default_value = "3m", value_parser = parse_duration)]
-    pub operation_timeout: Duration,
-
     /// Prometheus exporter listen address.
     #[arg(long, default_value = "127.0.0.1:9898")]
     pub metrics_listen: SocketAddr,
 }
 
-#[derive(Clone, Debug, clap::Args)]
-pub struct GenProfileArgs {
-    #[command(flatten)]
-    pub base: BaseArgs,
-
-    /// Modeled Pods per batch; derives two DaemonSet updates per batch.
-    /// Does not execute rollout waves or recreate Pods.
-    #[arg(long, default_value_t = 500, value_parser = parse_positive_u64)]
-    pub batch_size: u64,
-
-    /// Application operation-budget rate used to derive timeline duration.
-    /// Includes creates and updates; not a guaranteed RPC throughput.
-    #[arg(long, default_value_t = 2000.0, value_parser = parse_positive_f64)]
-    pub txn_rps: f64,
-
-    /// Profile name; the workload is written to workloads/<name>.json.
-    #[arg(
-        long,
-        default_value = "rolling-update",
-        value_parser = parse_profile_name
-    )]
-    pub name: String,
-}
-
 impl BaseArgs {
-    /// Load the base workload selected by --config/--profile (default k8s).
-    fn base_workload(&self) -> Result<WorkloadSpec, ConfigError> {
-        match (&self.config, self.profile) {
-            (Some(_), Some(_)) => Err(ConfigError::Invalid(
-                "--config and --profile are mutually exclusive".into(),
-            )),
-            (Some(path), None) => WorkloadSpec::from_path(path),
-            (None, Some(Profile::K8sNoNodeLease)) => {
-                WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json"))
-            }
-            (None, Some(Profile::K8s)) | (None, None) => {
-                WorkloadSpec::from_json(include_str!("../workloads/k8s.json"))
-            }
-        }
-    }
-
-    /// Bake --pod-size/--nodes overrides into the workload.
-    fn apply_overrides(&self, workload: &mut WorkloadSpec) {
-        if let Some(pod_size) = self.pod_size {
-            workload.pod_size_bytes = pod_size;
-            if let Some(pods) = workload
-                .resources
-                .iter_mut()
-                .find(|resource| resource.name == "pods")
-            {
-                pods.value_size_bytes = pod_size;
-            }
-        }
-        if let Some(nodes) = self.nodes {
-            let previous = workload.topology.node_count;
-            workload.topology.node_count = nodes;
-            for group in &mut workload.relationships.daemon_set_groups {
-                if group.eligible_nodes_per_daemonset == previous {
-                    group.eligible_nodes_per_daemonset = nodes;
-                }
-            }
-        }
-    }
-}
-
-impl GenProfileArgs {
-    /// Generate the derived workload profile and write it to
-    /// `<CARGO_MANIFEST_DIR>/workloads/<name>.json`, returning the path.
-    /// Does not connect to etcd or install the metrics exporter.
-    pub fn generate(&self) -> Result<PathBuf, ConfigError> {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workloads");
-        self.generate_to(&dir)
-    }
-
-    fn generate_to(&self, dir: &Path) -> Result<PathBuf, ConfigError> {
-        let mut workload = self.base.base_workload()?;
-        let base_range_total = crate::scheduler::range_request_total(&workload, self.base.seed);
-        let base_app_total = crate::scheduler::application_operation_total(&workload);
-        let nodes = self.base.nodes.unwrap_or(ROLLING_UPDATE_NODE_COUNT);
-        workload = workload.rolling_update(
-            nodes,
-            self.batch_size,
-            self.txn_rps,
-            &self.name,
-            base_range_total,
-            base_app_total,
-        )?;
-        self.base.apply_overrides(&mut workload);
-        workload.validate(self.base.max_message_size)?;
-        write_profile(&workload, &self.name, dir)
-    }
-}
-
-impl RunArgs {
-    pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
-        let mut workload = self.base.base_workload()?;
-        self.base.apply_overrides(&mut workload);
-        if let Some(pods) = self.pods {
-            workload.topology.pod_count = pods;
-        }
-        if self.queue_capacity < self.workers {
-            return Err(ConfigError::Invalid(format!(
-                "queue_capacity ({}) must be at least workers ({})",
-                self.queue_capacity, self.workers
-            )));
-        }
-        workload.validate(self.base.max_message_size)?;
-
-        if self.endpoint.trim().is_empty() {
-            return Err(ConfigError::Invalid("endpoint must not be empty".into()));
-        }
-        if self.base.max_message_size == 0 {
-            return Err(ConfigError::Invalid(
-                "max_message_size must be greater than zero".into(),
-            ));
-        }
-
-        Ok(RuntimeConfig {
-            endpoint: self.endpoint.clone(),
-            pod_size: workload.pod_size_bytes,
-            nodes: workload.topology.node_count,
-            workload,
+    fn synthetic_overrides(&self) -> Result<SyntheticConfigOverrides, ConfigError> {
+        Ok(SyntheticConfigOverrides {
+            nodes: self.nodes,
+            pods: self.pods,
+            namespaces: self.namespaces,
+            pod_size_bytes: self
+                .pod_size
+                .map(|value| {
+                    u64::try_from(value)
+                        .map_err(|_| ConfigError::Invalid("pod_size does not fit in u64".into()))
+                })
+                .transpose()?,
+            seed: self.seed,
+            update_rps: self.update_rps,
+            duration_ms: self
+                .duration
+                .map(|value| duration_to_millis(value, "--duration"))
+                .transpose()?,
             workers: self.workers,
             queue_capacity: self.queue_capacity,
-            request_timeout: self.request_timeout,
-            operation_timeout: self.operation_timeout,
-            max_message_size: self.base.max_message_size,
-            metrics_listen: self.metrics_listen,
-            seed: self.base.seed,
+            request_timeout_ms: self
+                .request_timeout
+                .map(|value| duration_to_millis(value, "--request-timeout"))
+                .transpose()?,
+            operation_timeout_ms: self
+                .operation_timeout
+                .map(|value| duration_to_millis(value, "--operation-timeout"))
+                .transpose()?,
         })
     }
 
+    fn resolve_synthetic(&self) -> Result<SyntheticConfig, ConfigError> {
+        let overrides = self.synthetic_overrides()?;
+        SyntheticConfig::parse_with_overrides(
+            self.config.as_deref(),
+            DEFAULT_SYNTHETIC_CONFIG,
+            &overrides,
+        )
+    }
+
+    fn resolve_plan(&self) -> Result<CompiledPlan, ConfigError> {
+        let config = self.resolve_synthetic()?;
+        CompiledPlan::compile(config, self.max_message_size)
+    }
+}
+
+impl PlanArgs {
+    pub fn load(&self) -> Result<CompiledPlan, ConfigError> {
+        self.base.resolve_plan()
+    }
+
     #[cfg(test)]
-    pub fn load_from<I, T>(args: I) -> Result<RuntimeConfig, ConfigError>
+    pub fn load_from<I, T>(args: I) -> Result<CompiledPlan, ConfigError>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
@@ -233,102 +165,56 @@ impl RunArgs {
         let cli =
             Cli::try_parse_from(args).map_err(|error| ConfigError::Invalid(error.to_string()))?;
         match cli.command {
-            Command::Run(run) => run.load(),
-            Command::GenProfile(_) => Err(ConfigError::Invalid(
-                "load_from expects the run subcommand".into(),
+            Command::Plan(plan) => plan.load(),
+            Command::Run(_) => Err(ConfigError::Invalid(
+                "load_from expects the plan subcommand".into(),
             )),
         }
     }
 }
 
-fn parse_profile_name(value: &str) -> Result<String, String> {
-    // Lowercase alphanumerics, '-' and '_' only: valid both as a metrics
-    // label and as a file name (no path separators).
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-    {
-        Ok(value.to_string())
-    } else {
-        Err(format!(
-            "profile name {value:?} must be non-empty lowercase [a-z0-9_-]"
-        ))
+impl RunArgs {
+    /// Resolve the new synthetic run contract for the scheduler migration.
+    pub fn resolve(&self) -> Result<RunConfig, ConfigError> {
+        if self.endpoint.trim().is_empty() {
+            return Err(ConfigError::Invalid("endpoint must not be empty".into()));
+        }
+        Ok(RunConfig {
+            plan: self.base.resolve_plan()?,
+            endpoint: self.endpoint.clone(),
+            metrics_listen: self.metrics_listen,
+            max_message_size: self.base.max_message_size,
+        })
     }
 }
 
-/// Write the derived workload as pretty JSON, refusing to overwrite an
-/// existing profile (built-ins and earlier artifacts are protected).
-/// `create_new` makes the no-overwrite guarantee atomic: concurrent
-/// generations of the same name and pre-existing symlinks are both rejected.
-fn write_profile(spec: &WorkloadSpec, name: &str, dir: &Path) -> Result<PathBuf, ConfigError> {
-    std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-        path: dir.display().to_string(),
-        source,
-    })?;
-    let path = dir.join(format!("{name}.json"));
-    let json = serde_json::to_string_pretty(spec).map_err(ConfigError::Json)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                ConfigError::Invalid(format!(
-                    "profile {} already exists; choose another name or remove the file",
-                    path.display()
-                ))
-            } else {
-                ConfigError::Io {
-                    path: path.display().to_string(),
-                    source: error,
-                }
-            }
-        })?;
-    // On failure, remove the partial file so a retry with the same name works.
-    if let Err(error) = std::io::Write::write_all(&mut file, format!("{json}\n").as_bytes()) {
-        let _ = std::fs::remove_file(&path);
-        return Err(ConfigError::Io {
-            path: path.display().to_string(),
-            source: error,
-        });
+fn duration_to_millis(value: Duration, field: &str) -> Result<u64, ConfigError> {
+    if value.as_nanos() % 1_000_000 != 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must resolve to an integral number of milliseconds"
+        )));
     }
-    Ok(path)
+    let millis = u64::try_from(value.as_millis())
+        .map_err(|_| ConfigError::Invalid(format!("{field} is too large")))?;
+    if millis == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be at least 1ms"
+        )));
+    }
+    Ok(millis)
 }
 
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| format!("{value:?} is not a valid positive integer"))?;
-    (parsed > 0)
-        .then_some(parsed)
-        .ok_or_else(|| "value must be greater than zero".to_string())
-}
-fn parse_profile(value: &str) -> Result<Profile, String> {
-    match value {
-        "k8s" => Ok(Profile::K8s),
-        "k8s-no-node-lease" => Ok(Profile::K8sNoNodeLease),
-        _ => Err(format!(
-            "unknown profile {value:?}; expected k8s or k8s-no-node-lease"
-        )),
-    }
-}
-fn parse_positive_u64(value: &str) -> Result<u64, String> {
-    let parsed = value
+fn parse_u64(value: &str) -> Result<u64, String> {
+    value
         .parse::<u64>()
-        .map_err(|_| format!("{value:?} is not a valid positive integer"))?;
+        .map_err(|_| format!("{value:?} is not a valid unsigned integer"))
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let parsed = parse_u64(value)?;
     (parsed > 0)
         .then_some(parsed)
         .ok_or_else(|| "value must be greater than zero".to_string())
-}
-
-fn parse_positive_f64(value: &str) -> Result<f64, String> {
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|_| format!("{value:?} is not a valid number"))?;
-    (parsed.is_finite() && parsed > 0.0)
-        .then_some(parsed)
-        .ok_or_else(|| "value must be finite and greater than zero".to_string())
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -382,313 +268,211 @@ fn parse_size(value: &str) -> Result<usize, String> {
         .filter(|size| *size > 0)
         .ok_or_else(|| "size must be greater than zero and fit in usize".to_string())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Parse args as the `run` subcommand and build its RuntimeConfig.
-    fn run_config(args: &[&str]) -> Result<RuntimeConfig, ConfigError> {
+    fn plan_config(args: &[&str]) -> Result<CompiledPlan, ConfigError> {
+        let mut full = vec!["bench", "plan"];
+        full.extend_from_slice(args);
+        PlanArgs::load_from(full)
+    }
+
+    fn run_config(args: &[&str]) -> Result<RunConfig, ConfigError> {
         let mut full = vec!["bench", "run"];
         full.extend_from_slice(args);
-        RunArgs::load_from(full)
-    }
-
-    /// Parse args as the `gen_profile` subcommand.
-    fn gen_args(args: &[&str]) -> GenProfileArgs {
-        let mut full = vec!["bench", "gen_profile"];
-        full.extend_from_slice(args);
-        match Cli::try_parse_from(&full)
-            .expect("gen_profile arguments must parse")
-            .command
-        {
-            Command::GenProfile(args) => args,
-            Command::Run(_) => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn test_run_defaults_load() {
-        let config = run_config(&[]).unwrap();
-        assert_eq!(config.workload.name, "k8s");
-        assert!(config.workload.nodes.node_lease_enabled);
-        assert_eq!(config.pod_size, DEFAULT_POD_SIZE_BYTES);
-        assert_eq!(config.nodes, DEFAULT_NODE_COUNT);
-        assert_eq!(config.workload.topology.pod_count, DEFAULT_POD_COUNT);
-        assert_eq!(config.request_timeout, Duration::from_secs(10));
-    }
-    #[test]
-    fn test_profile_node_leases_disable() {
-        let config = run_config(&["--profile", "k8s-no-node-lease"]).unwrap();
-        assert_eq!(config.workload.name, "k8s_no_node_lease");
-        assert!(!config.workload.nodes.node_lease_enabled);
-    }
-    #[test]
-    fn test_profile_config_conflict() {
-        let error = run_config(&["--profile", "k8s", "--config", "custom.json"])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("mutually exclusive"));
-    }
-
-    #[test]
-    fn test_run_overrides_apply() {
-        let config = run_config(&["--pod-size", "8192", "--pods", "800", "--nodes", "7"]).unwrap();
-        assert_eq!(config.pod_size, 8192);
-        assert_eq!(config.nodes, 7);
-        assert_eq!(config.workload.pod_size_bytes, 8192);
-        assert_eq!(config.workload.topology.node_count, 7);
-        assert_eq!(config.workload.topology.pod_count, 800);
-        assert_eq!(
-            config
-                .workload
-                .resources
-                .iter()
-                .find(|r| r.name == "pods")
-                .unwrap()
-                .value_size_bytes,
-            8192
-        );
-    }
-
-    #[test]
-    fn test_nodes_zero_error() {
-        let error = run_config(&["--nodes", "0"]).unwrap_err().to_string();
-        assert!(error.contains("nodes"));
-    }
-
-    #[test]
-    fn test_nodes_option_only() {
-        let cli = Cli::try_parse_from(["bench", "run", "--nodes", "7"]).unwrap();
+        let cli =
+            Cli::try_parse_from(full).map_err(|error| ConfigError::Invalid(error.to_string()))?;
         match cli.command {
-            Command::Run(run) => assert_eq!(run.base.nodes, Some(7)),
-            Command::GenProfile(_) => unreachable!(),
-        }
-        assert!(Cli::try_parse_from(["bench", "run", "7"]).is_err());
-    }
-    #[test]
-    fn test_queue_workers_error() {
-        let error = run_config(&["--workers", "4", "--queue-capacity", "3"])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("queue_capacity"));
-        assert!(error.contains("workers"));
-    }
-
-    #[test]
-    fn test_run_unknown_flags_reject() {
-        // Derivation parameters belong to gen_profile; run has no such flags.
-        assert!(Cli::try_parse_from(["bench", "run", "--duration", "300s"]).is_err());
-        assert!(Cli::try_parse_from(["bench", "run", "--max-qps", "500"]).is_err());
-        assert!(Cli::try_parse_from(["bench", "run", "--name", "x"]).is_err());
-    }
-
-    #[test]
-    fn test_legacy_cli_reject() {
-        assert!(Cli::try_parse_from(["bench", "run", "--rate-scale", "2"]).is_err());
-        assert!(Cli::try_parse_from(["bench", "run", "--profile", "mock-k8"]).is_err());
-        assert!(Cli::try_parse_from(["bench", "run", "--profile", "real-k8"]).is_err());
-    }
-
-    #[test]
-    fn test_run_profile_duration() {
-        assert!(Cli::try_parse_from(["bench", "run", "--time-scale", "0.5"]).is_err());
-        let config = run_config(&[]).unwrap();
-        let expected = Duration::from_secs_f64(
-            config
-                .workload
-                .timeline
-                .iter()
-                .map(|segment| segment.duration_s)
-                .sum(),
-        );
-        assert_eq!(
-            crate::scheduler::Scheduler::new(&config).duration(),
-            expected
-        );
-    }
-
-    #[test]
-    fn test_gen_defaults_load() {
-        let args = gen_args(&[]);
-        assert_eq!(args.batch_size, 500);
-        assert_eq!(args.txn_rps, 2000.0);
-        assert_eq!(args.name, "rolling-update");
-
-        let dir = temp_dir("defaults");
-        let path = args.generate_to(&dir).unwrap();
-        let spec = WorkloadSpec::from_path(&path).unwrap();
-        assert_eq!(spec.name, "rolling-update");
-        assert_eq!(spec.topology.node_count, ROLLING_UPDATE_NODE_COUNT);
-        assert_eq!(spec.timeline.len(), 1);
-        // Budget 80041 at the default 2000 rps -> 40.0205s.
-        assert_eq!(spec.timeline[0].duration_s, 40.0205);
-        let app_total = crate::scheduler::application_operation_total(&spec);
-        assert_eq!(app_total, 8 * 10_000 + 1 + 2 * 20);
-        assert!(crate::scheduler::range_request_total(&spec, 1) > 0);
-    }
-
-    struct TempDir(PathBuf);
-
-    impl std::ops::Deref for TempDir {
-        type Target = Path;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
+            Command::Run(run) => run.resolve(),
+            Command::Plan(_) => unreachable!(),
         }
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    fn temporary_config(tag: &str) -> (PathBuf, impl Drop) {
+        struct Cleanup(PathBuf);
 
-    fn temp_dir(tag: &str) -> TempDir {
-        let dir = std::env::temp_dir().join(format!(
-            "etcd-k8s-bench-gen-test-{}-{tag}",
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "etcd-k8s-bench-cli-{}-{tag}.json",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
+        let _ = std::fs::remove_file(&path);
+        (path.clone(), Cleanup(path))
     }
 
     #[test]
-    fn test_gen_profile_load() {
-        let dir = temp_dir("write");
-        let args = gen_args(&[
+    fn test_plan_defaults_load() {
+        let plan = plan_config(&[]).unwrap();
+        assert_eq!(plan.config.name, "synthetic-k8s");
+        assert_eq!(plan.resource_counts.total(), 44_410);
+        assert_eq!(plan.config.load.duration_ms, 600_000);
+        assert_eq!(plan.config.load.update_rps, 10_000);
+        assert_eq!(plan.config.execution.workers, 128);
+        assert_eq!(plan.update_rounding_deficit, 0);
+        assert_eq!(plan.read_rounding_deficit, 0);
+    }
+
+    #[test]
+    fn test_cli_accepts_seed_zero() {
+        let plan = plan_config(&["--seed", "0"]).unwrap();
+        assert_eq!(plan.config.seed, 0);
+    }
+
+    #[test]
+    fn test_cli_override() {
+        let plan = plan_config(&[
             "--nodes",
-            "100",
-            "--batch-size",
-            "10",
-            "--txn-rps",
-            "500",
-            "--name",
-            "load-test",
-        ]);
-        let path = args.generate_to(&dir).unwrap();
-        assert_eq!(path, dir.join("load-test.json"));
-        let spec = WorkloadSpec::from_path(&path).unwrap();
-        assert_eq!(spec.name, "load-test");
-        assert_eq!(spec.topology.node_count, 100);
-        assert_eq!(spec.timeline.len(), 1);
-        // Budget 821 at 500 rps -> 1.642s.
-        assert_eq!(spec.timeline[0].duration_s, 1.642);
-        let pods = spec
-            .resources
-            .iter()
-            .find(|resource| resource.name == "pods")
-            .unwrap();
-        assert_eq!(spec.resource_count(pods).unwrap(), 100);
-        assert_eq!(pods.update_amplification, 4);
-        let total = crate::scheduler::application_operation_total(&spec);
-        assert_eq!(total, 8 * 100 + 1 + 2 * 10);
+            "20",
+            "--pods",
+            "1200",
+            "--namespaces",
+            "12",
+            "--pod-size",
+            "8192B",
+            "--seed",
+            "9",
+            "--update-rps",
+            "11",
+            "--duration",
+            "2s",
+            "--workers",
+            "4",
+            "--queue-capacity",
+            "8",
+            "--request-timeout",
+            "2s",
+            "--operation-timeout",
+            "3s",
+        ])
+        .unwrap();
+        assert_eq!(plan.config.topology.node_count, 20);
+        assert_eq!(plan.config.topology.pod_count, 1200);
+        assert_eq!(plan.config.topology.namespace_count, 12);
+        assert_eq!(plan.config.value_size_bytes.pods, 8192);
+        assert_eq!(plan.config.value_size_bytes.nodes, 4096);
+        assert_eq!(plan.config.seed, 9);
+        assert_eq!(plan.config.load.update_rps, 11);
+        assert_eq!(plan.config.load.duration_ms, 2_000);
+        assert_eq!(plan.config.execution.workers, 4);
+        assert_eq!(plan.config.execution.queue_capacity, 8);
+        assert_eq!(plan.config.execution.request_timeout_ms, 2_000);
+        assert_eq!(plan.config.execution.operation_timeout_ms, 3_000);
+        assert_eq!(plan.resource_counts.pods, 1_200);
+        assert_eq!(plan.resource_counts.deployments, 10);
     }
 
     #[test]
-    fn test_gen_short_duration_reject() {
-        let dir = temp_dir("subnanosecond");
-        let args = gen_args(&["--txn-rps", "1e15", "--name", "subnanosecond"]);
-        let error = args.generate_to(&dir).unwrap_err().to_string();
-        assert!(error.contains("timeline[0].duration_s"));
-        assert!(error.contains("nanosecond"));
-        assert!(!dir.join("subnanosecond.json").exists());
+    fn test_cli_override_precedes_validation() {
+        let mut config = SyntheticConfig::parse_json(DEFAULT_SYNTHETIC_CONFIG).unwrap();
+        config.topology.node_count = 0;
+        config.load.duration_ms = 0;
+        let json = serde_json::to_string(&config).unwrap();
+        let (path, _cleanup) = temporary_config("override-order");
+        std::fs::write(&path, json).unwrap();
+
+        let path_string = path.to_str().unwrap();
+        let plan =
+            plan_config(&["--config", path_string, "--nodes", "20", "--duration", "1s"]).unwrap();
+        assert_eq!(plan.config.topology.node_count, 20);
+        assert_eq!(plan.config.load.duration_ms, 1_000);
     }
 
     #[test]
-    fn test_gen_overrides_persist() {
-        let dir = temp_dir("overrides");
-        let args = gen_args(&["--nodes", "7", "--pod-size", "8192", "--name", "small"]);
-        let path = args.generate_to(&dir).unwrap();
-        let spec = WorkloadSpec::from_path(&path).unwrap();
-        assert_eq!(spec.topology.node_count, 7);
-        assert_eq!(spec.pod_size_bytes, 8192);
-        assert_eq!(
-            spec.resources
-                .iter()
-                .find(|resource| resource.name == "pods")
-                .unwrap()
-                .value_size_bytes,
-            8192
-        );
+    fn test_duration_requires_integral_milliseconds() {
+        let error = plan_config(&["--duration", "1.5ms"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integral number of milliseconds"));
     }
 
     #[test]
-    fn test_gen_pods_reject() {
-        assert!(
-            Cli::try_parse_from(["bench", "gen_profile", "--pods", "100", "--name", "invalid"])
-                .is_err()
-        );
+    fn test_run_and_plan_share_resolved_config() {
+        let args = [
+            "--nodes",
+            "20",
+            "--pods",
+            "1200",
+            "--namespaces",
+            "12",
+            "--pod-size",
+            "8192B",
+            "--seed",
+            "9",
+            "--update-rps",
+            "11",
+            "--duration",
+            "2s",
+            "--workers",
+            "4",
+            "--queue-capacity",
+            "8",
+            "--request-timeout",
+            "2s",
+            "--operation-timeout",
+            "3s",
+        ];
+        let plan = plan_config(&args).unwrap();
+        let mut run_args = vec![
+            "--endpoint",
+            "http://127.0.0.1:32379",
+            "--metrics-listen",
+            "127.0.0.1:39898",
+        ];
+        run_args.extend_from_slice(&args);
+        let run = run_config(&run_args).unwrap();
+        assert_eq!(run.plan.config, plan.config);
+        assert_eq!(run.endpoint, "http://127.0.0.1:32379");
+        assert_eq!(run.metrics_listen, "127.0.0.1:39898".parse().unwrap());
+        assert_eq!(run.max_message_size, 64 * 1024 * 1024);
     }
 
     #[test]
-    fn test_gen_existing_preserve() {
-        let dir = temp_dir("overwrite");
-        let args = gen_args(&["--nodes", "10", "--name", "dup"]);
-        let path = args.generate_to(&dir).unwrap();
-        let original = std::fs::read(&path).unwrap();
-        let error = args.generate_to(&dir).unwrap_err().to_string();
-        assert!(error.contains("already exists"));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
-    #[test]
-    fn test_gen_run_flags_reject() {
-        for (flag, value) in [
-            ("--endpoint", "http://127.0.0.1:2379"),
-            ("--workers", "1"),
-            ("--queue-capacity", "1"),
-            ("--request-timeout", "1s"),
-            ("--operation-timeout", "1s"),
-            ("--metrics-listen", "127.0.0.1:9898"),
-            ("--rate-scale", "1"),
-            ("--time-scale", "1"),
+    fn test_plan_writer_output_contract() {
+        let plan = plan_config(&["--nodes", "20", "--pods", "1200"]).unwrap();
+        let mut output = Vec::new();
+        plan.write_json(&mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 7);
+        for field in [
+            "schema_version",
+            "resolved_config",
+            "resource_counts",
+            "logical_plan",
+            "periodic_plan",
+            "pacing_tick_ms",
+            "estimated_measurement_memory_bytes",
         ] {
-            let full = ["bench", "gen_profile", flag, value];
-            let error = Cli::try_parse_from(full).unwrap_err();
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::UnknownArgument,
-                "gen_profile must reject {flag} as an unknown argument"
-            );
+            assert!(object.contains_key(field), "missing plan field {field}");
         }
-    }
-
-    #[test]
-    fn test_gen_run_roundtrip() {
-        let dir = temp_dir("roundtrip");
-        let args = gen_args(&["--nodes", "10", "--batch-size", "5", "--name", "roundtrip"]);
-        let path = args.generate_to(&dir).unwrap();
-        let config = run_config(&["--config", path.to_str().unwrap()]).unwrap();
-        assert_eq!(config.workload.name, "roundtrip");
-        assert_eq!(config.nodes, 10);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["resolved_config"]["name"], "synthetic-k8s");
         assert_eq!(
-            crate::scheduler::application_operation_total(&config.workload),
-            8 * 10 + 1 + 2 * 2
+            value["logical_plan"]["streams"].as_array().unwrap().len(),
+            14
         );
-        assert_eq!(
-            crate::scheduler::Scheduler::new(&config).duration(),
-            Duration::from_secs_f64(
-                config
-                    .workload
-                    .timeline
-                    .iter()
-                    .map(|segment| segment.duration_s)
-                    .sum(),
-            ),
+        assert_eq!(value["logical_plan"]["update_rounding_deficit"], 0);
+        assert_eq!(value["logical_plan"]["read_rounding_deficit"], 0);
+        assert_eq!(value["pacing_tick_ms"], 1);
+        assert!(
+            value["estimated_measurement_memory_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
         );
     }
 
     #[test]
-    fn test_gen_unsafe_name_reject() {
-        for bad in ["../evil", "Foo", "a/b", ""] {
-            let mut full = vec!["bench", "gen_profile", "--name"];
-            full.push(bad);
-            assert!(
-                Cli::try_parse_from(&full).is_err(),
-                "name {bad:?} must be rejected"
-            );
-        }
+    fn test_plan_rejects_run_only_flags() {
+        assert!(Cli::try_parse_from(["bench", "plan", "--endpoint", DEFAULT_ENDPOINT]).is_err());
+        assert!(
+            Cli::try_parse_from(["bench", "plan", "--metrics-listen", "127.0.0.1:9898"]).is_err()
+        );
     }
 }

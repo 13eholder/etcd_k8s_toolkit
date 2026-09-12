@@ -20,6 +20,7 @@ tokio-stream.workspace = true
 
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18.3"
+hdrhistogram.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

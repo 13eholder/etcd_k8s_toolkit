@@ -8,13 +8,11 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 use crate::pb::etcdserverpb::kv_client::KvClient;
-use crate::pb::etcdserverpb::lease_client::LeaseClient;
 use crate::pb::etcdserverpb::maintenance_client::MaintenanceClient;
 use crate::pb::etcdserverpb::watch_client::WatchClient as GeneratedWatchClient;
 use crate::pb::etcdserverpb::{
-    CompactionRequest, CompactionResponse, LeaseGrantRequest, LeaseGrantResponse, RangeRequest,
-    RangeResponse, StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest,
-    WatchResponse,
+    CompactionRequest, CompactionResponse, RangeRequest, RangeResponse, StatusRequest,
+    StatusResponse, TxnRequest, TxnResponse, WatchRequest, WatchResponse,
 };
 
 pub const REQUIRE_LEADER_METADATA: &str = "hasleader";
@@ -32,7 +30,6 @@ pub fn watch_request<S>(requests: S) -> Request<S> {
 #[derive(Clone)]
 pub struct ClientBundle {
     kv: KvClient<Channel>,
-    lease: LeaseClient<Channel>,
     maintenance: MaintenanceClient<Channel>,
     watch: GeneratedWatchClient<Channel>,
 }
@@ -54,7 +51,6 @@ pub enum RpcMethod {
     Range,
     Status,
     Txn,
-    LeaseGrant,
     Compact,
 }
 
@@ -62,7 +58,7 @@ impl RpcMethod {
     pub const fn mutability(self) -> RpcMutability {
         match self {
             Self::Range | Self::Status => RpcMutability::ReadOnly,
-            Self::Txn | Self::LeaseGrant | Self::Compact => RpcMutability::Mutable,
+            Self::Txn | Self::Compact => RpcMutability::Mutable,
         }
     }
 
@@ -150,9 +146,6 @@ impl ClientBundle {
         let kv = KvClient::new(channel.clone())
             .max_decoding_message_size(max_message_size)
             .max_encoding_message_size(max_message_size);
-        let lease = LeaseClient::new(channel.clone())
-            .max_decoding_message_size(max_message_size)
-            .max_encoding_message_size(max_message_size);
         let maintenance = MaintenanceClient::new(channel.clone())
             .max_decoding_message_size(max_message_size)
             .max_encoding_message_size(max_message_size);
@@ -161,10 +154,27 @@ impl ClientBundle {
             .max_encoding_message_size(max_message_size);
         Ok(Self {
             kv,
-            lease,
             maintenance,
             watch,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_channel(channel: Channel, max_message_size: usize) -> Self {
+        let kv = KvClient::new(channel.clone())
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
+        let maintenance = MaintenanceClient::new(channel.clone())
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
+        let watch = GeneratedWatchClient::new(channel)
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
+        Self {
+            kv,
+            maintenance,
+            watch,
+        }
     }
 
     /// Open the single bidirectional Watch RPC with Kubernetes' require-leader
@@ -224,17 +234,6 @@ impl ClientBundle {
         let mut client = self.kv.clone();
         Ok(client.compact(Request::new(request)).await?.into_inner())
     }
-
-    pub async fn lease_grant(
-        &self,
-        request: LeaseGrantRequest,
-    ) -> Result<LeaseGrantResponse, ClientError> {
-        let mut client = self.lease.clone();
-        Ok(client
-            .lease_grant(Request::new(request))
-            .await?
-            .into_inner())
-    }
 }
 
 #[cfg(test)]
@@ -286,7 +285,7 @@ mod tests {
                     "{method:?} must remain retryable for {code:?}"
                 );
             }
-            for method in [RpcMethod::Txn, RpcMethod::LeaseGrant, RpcMethod::Compact] {
+            for method in [RpcMethod::Txn, RpcMethod::Compact] {
                 assert_eq!(
                     error.retry_decision(method, RequestDisposition::Unknown),
                     RetryDecision::ResultUnknown,
@@ -303,7 +302,6 @@ mod tests {
             RpcMethod::Range,
             RpcMethod::Status,
             RpcMethod::Txn,
-            RpcMethod::LeaseGrant,
             RpcMethod::Compact,
         ] {
             assert_eq!(
@@ -318,7 +316,7 @@ mod tests {
     fn test_client_not_sent_classification() {
         let error = ClientError::Rpc(Status::unavailable("before send"));
         assert_eq!(
-            error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::NotSent),
+            error.retry_decision(RpcMethod::Txn, RequestDisposition::NotSent),
             RetryDecision::NotSent
         );
     }

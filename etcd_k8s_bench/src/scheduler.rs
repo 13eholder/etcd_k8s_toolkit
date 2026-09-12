@@ -1,504 +1,252 @@
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch as shutdown_watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch as shutdown_watch};
 use tokio::task::JoinSet;
 use tokio::time::{self, Instant as TokioInstant};
 
 use crate::client::{ClientBundle, RequestDisposition, RetryDecision, RpcMethod};
-#[cfg(test)]
-use crate::config::TopologySpec;
-use crate::config::{
-    EtcdLeasePoolSpec, ResourceBehavior, ResourceCountSpec, ResourceSpec, RuntimeConfig,
-    WorkloadSpec,
+use crate::config::RunConfig;
+use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind};
+use crate::measurement::{
+    LogicalStreamIdentity, MeasurementRecorder, MeasurementToken, OfferResult, PreparationStream,
+    TokenAction,
 };
-use crate::heartbeat::{HeartbeatItem, HeartbeatItemKind, NodeHeartbeatPlanner};
-use crate::lease::{LeaseEvent, LeasePool, LeasePoolConfig};
 use crate::metrics::{
-    self, DropReason, HeartbeatKind, Operation, Outcome, PoolName, RangeShape, ResourceName, Rpc,
-    TxnResult, TxnShape,
+    self, DropReason, HeartbeatKind, Operation, Outcome, RangeShape, ResourceName, Rpc, TxnResult,
+    TxnShape,
 };
-use crate::pb::etcdserverpb::{CompactionRequest, LeaseGrantRequest, RangeRequest, TxnResponse};
-use crate::report::{
-    AccountingInvariants, ApplicationTargets, RunReport, RunTargets, WorkItemReport,
-};
-use crate::watch::prefix_range_end;
+use crate::pb::etcdserverpb::{CompactionRequest, RangeRequest, TxnResponse};
+use crate::plan::{CompiledPlan, LogicalWorkClass, PeriodicEvent, PeriodicKind, ResourceKind};
+use crate::report::MeasurementReport;
 use crate::workload::{
     CasDecision, CasLoop, CasRetryPolicy, ExhaustedReason, KeyState, ResourceOperation, TxnAttempt,
     build_compact_revision_txn, failure_value, failure_version,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkClass {
-    Bootstrap,
-    Create,
-    Update,
-    Range,
-    MasterLease,
-    Heartbeat,
-    Status,
-    Compact,
-}
-
-impl WorkClass {
-    const ALL: [Self; 8] = [
-        Self::Bootstrap,
-        Self::Create,
-        Self::Update,
-        Self::Range,
-        Self::MasterLease,
-        Self::Heartbeat,
-        Self::Status,
-        Self::Compact,
-    ];
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Bootstrap => "bootstrap",
-            Self::Create => "create",
-            Self::Update => "update",
-            Self::Range => "range",
-            Self::MasterLease => "master_lease",
-            Self::Heartbeat => "heartbeat",
-            Self::Status => "status",
-            Self::Compact => "compact",
-        }
-    }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Bootstrap => 0,
-            Self::Create => 1,
-            Self::Update => 2,
-            Self::Range => 3,
-            Self::MasterLease => 4,
-            Self::Heartbeat => 5,
-            Self::Status => 6,
-            Self::Compact => 7,
-        }
-    }
-}
-
 const MAX_ERROR_CONTEXT: usize = 256;
 
-#[cfg(test)]
-static UPDATE_FINISHED_OBSERVERS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(test)]
-fn update_finished_observer(name: &str) -> Arc<tokio::sync::Notify> {
-    UPDATE_FINISHED_OBSERVERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(name.to_string())
-        .or_default()
-        .clone()
+/// Result of one scheduler invocation. A missing measurement is intentional
+/// for setup/preparation failures: no synthetic report claims a window that
+/// never started.
+#[derive(Debug, Serialize)]
+pub struct RunResult {
+    pub status: RunStatus,
+    pub error: Option<String>,
+    pub measurement: Option<MeasurementReport>,
 }
 
-#[cfg(test)]
-fn note_update_finished(workload: &str) {
-    let observer = UPDATE_FINISHED_OBSERVERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(workload)
-        .cloned();
-    if let Some(observer) = observer {
-        observer.notify_waiters();
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    Completed,
+    Interrupted,
+    Failed,
 }
 
-#[derive(Debug)]
-struct ClassAccounting {
-    offered: AtomicU64,
-    accepted: AtomicU64,
-    succeeded: AtomicU64,
-    failed: AtomicU64,
-    result_unknown: AtomicU64,
-    dropped_full: AtomicU64,
-    dropped_closed: AtomicU64,
-    unfinished: AtomicU64,
-    unissued: AtomicU64,
-    first_error: std::sync::Mutex<Option<String>>,
-}
-
-impl ClassAccounting {
-    fn new() -> Self {
+impl RunResult {
+    fn failed(error: impl Into<String>) -> Self {
         Self {
-            offered: AtomicU64::new(0),
-            accepted: AtomicU64::new(0),
-            succeeded: AtomicU64::new(0),
-            failed: AtomicU64::new(0),
-            result_unknown: AtomicU64::new(0),
-            dropped_full: AtomicU64::new(0),
-            dropped_closed: AtomicU64::new(0),
-            unfinished: AtomicU64::new(0),
-            unissued: AtomicU64::new(0),
-            first_error: std::sync::Mutex::new(None),
+            status: RunStatus::Failed,
+            error: Some(bound_error(error.into())),
+            measurement: None,
+        }
+    }
+
+    fn interrupted(error: Option<String>, measurement: Option<MeasurementReport>) -> Self {
+        Self {
+            status: RunStatus::Interrupted,
+            error: error.map(bound_error),
+            measurement,
+        }
+    }
+
+    fn completed(measurement: MeasurementReport) -> Self {
+        Self {
+            status: RunStatus::Completed,
+            error: None,
+            measurement: Some(measurement),
         }
     }
 }
 
-#[derive(Debug)]
-struct RunAccounting {
-    classes: [ClassAccounting; 8],
+fn bound_error(error: String) -> String {
+    error.chars().take(MAX_ERROR_CONTEXT).collect()
 }
 
-impl RunAccounting {
-    fn new() -> Arc<Self> {
+#[derive(Debug)]
+struct PreparationTracker {
+    remaining: AtomicU64,
+    first_error: StdMutex<Option<String>>,
+    notify: Notify,
+}
+
+impl PreparationTracker {
+    fn new(total: u64) -> Arc<Self> {
         Arc::new(Self {
-            classes: std::array::from_fn(|_| ClassAccounting::new()),
+            remaining: AtomicU64::new(total),
+            first_error: StdMutex::new(None),
+            notify: Notify::new(),
         })
     }
 
-    fn offer(self: &Arc<Self>, class: WorkClass) -> AccountingToken {
-        self.class(class)
-            .offered
-            .fetch_add(1, AtomicOrdering::Relaxed);
-        AccountingToken {
-            accounting: Arc::clone(self),
-            class,
-            state: TokenState::Offered,
-            accepted_at: None,
-            phase: None,
-        }
-    }
-
-    fn class(&self, class: WorkClass) -> &ClassAccounting {
-        &self.classes[class.index()]
-    }
-
-    fn note_error(&self, class: WorkClass, message: impl Into<String>) {
-        let mut slot = self
-            .class(class)
-            .first_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot.is_some() {
-            return;
-        }
-        let message = message.into();
-        *slot = Some(message.chars().take(MAX_ERROR_CONTEXT).collect());
-    }
-
-    fn report(
-        &self,
-        targets: RunTargets,
-        interrupted: bool,
-        schedule_complete: bool,
-        termination_error: Option<String>,
-    ) -> RunReport {
-        let mut work_items = Vec::with_capacity(WorkClass::ALL.len());
-        let mut invariants = AccountingInvariants {
-            offered_equals_accepted_plus_dropped_plus_unissued: true,
-            accepted_equals_completed_plus_unfinished: true,
-            accepted_equals_succeeded_plus_failed_plus_unfinished: true,
-            result_unknown_subset_failed: true,
-        };
-        for class in WorkClass::ALL {
-            let counters = self.class(class);
-            let offered = counters.offered.load(AtomicOrdering::Acquire);
-            let accepted = counters.accepted.load(AtomicOrdering::Acquire);
-            let succeeded = counters.succeeded.load(AtomicOrdering::Acquire);
-            let failed = counters.failed.load(AtomicOrdering::Acquire);
-            let completed = succeeded.saturating_add(failed);
-            let result_unknown = counters.result_unknown.load(AtomicOrdering::Acquire);
-            let dropped_full = counters.dropped_full.load(AtomicOrdering::Acquire);
-            let dropped_closed = counters.dropped_closed.load(AtomicOrdering::Acquire);
-            let dropped = dropped_full.saturating_add(dropped_closed);
-            let unfinished = counters.unfinished.load(AtomicOrdering::Acquire);
-            let unissued = counters.unissued.load(AtomicOrdering::Acquire);
-            let offered_valid =
-                offered == accepted.saturating_add(dropped).saturating_add(unissued);
-            let accepted_valid = accepted == completed.saturating_add(unfinished);
-            let accepted_expanded_valid =
-                accepted == succeeded.saturating_add(failed).saturating_add(unfinished);
-            let unknown_valid = result_unknown <= failed;
-            invariants.offered_equals_accepted_plus_dropped_plus_unissued &= offered_valid;
-            invariants.accepted_equals_completed_plus_unfinished &= accepted_valid;
-            invariants.accepted_equals_succeeded_plus_failed_plus_unfinished &=
-                accepted_expanded_valid;
-            invariants.result_unknown_subset_failed &= unknown_valid;
-            let target = match class {
-                WorkClass::Bootstrap => Some(targets.bootstrap),
-                WorkClass::Create => Some(targets.application.creates),
-                WorkClass::Update => Some(targets.application.updates),
-                WorkClass::Range => Some(targets.range_requests),
-                WorkClass::MasterLease
-                | WorkClass::Heartbeat
-                | WorkClass::Status
-                | WorkClass::Compact => None,
-            };
-            let target_deficit = target.map(|target| target.saturating_sub(succeeded));
-            let first_error = counters
-                .first_error
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            work_items.push(WorkItemReport {
-                work_class: class.as_str().to_string(),
-                target,
-                offered,
-                accepted,
-                completed,
-                succeeded,
-                failed,
-                result_unknown,
-                dropped,
-                dropped_full,
-                dropped_closed,
-                unfinished,
-                unissued,
-                target_deficit,
-                first_error,
-            });
-        }
-        let invariants_valid = invariants.offered_equals_accepted_plus_dropped_plus_unissued
-            && invariants.accepted_equals_completed_plus_unfinished
-            && invariants.accepted_equals_succeeded_plus_failed_plus_unfinished
-            && invariants.result_unknown_subset_failed;
-        let targets_met = work_items.iter().all(|item| {
-            item.target
-                .is_none_or(|target| item.succeeded >= target && item.target_deficit == Some(0))
-        });
-        let no_bad_results = work_items.iter().all(|item| {
-            item.failed == 0 && item.dropped == 0 && item.unfinished == 0 && item.unissued == 0
-        });
-        RunReport {
-            achieved: schedule_complete
-                && !interrupted
-                && termination_error.is_none()
-                && invariants_valid
-                && targets_met
-                && no_bad_results,
-            interrupted,
-            schedule_complete,
-            scope: "scheduler",
-            termination_error: termination_error
-                .map(|error| error.chars().take(MAX_ERROR_CONTEXT).collect::<String>()),
-            targets,
-            work_items,
-            accounting_invariants: invariants,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TokenState {
-    Offered,
-    Accepted,
-    Terminal,
-}
-
-#[derive(Debug)]
-struct AccountingToken {
-    accounting: Arc<RunAccounting>,
-    class: WorkClass,
-    state: TokenState,
-    accepted_at: Option<Instant>,
-    phase: Option<(Arc<PhaseTracker>, usize)>,
-}
-
-impl AccountingToken {
-    fn mark_accepted(&mut self) {
-        if !matches!(self.state, TokenState::Offered) {
-            return;
-        }
-        self.state = TokenState::Accepted;
-        self.accepted_at = Some(Instant::now());
-        self.accounting
-            .class(self.class)
-            .accepted
-            .fetch_add(1, AtomicOrdering::Release);
-    }
-
-    fn record_dequeue(&mut self) {
-        if !matches!(self.state, TokenState::Accepted) {
-            return;
-        }
-        if let Some(accepted_at) = self.accepted_at.take() {
-            metrics::record_queue_wait(self.class.as_str(), accepted_at.elapsed());
-        }
-    }
-
-    fn mark_complete(&mut self, outcome: Outcome) {
-        if !matches!(self.state, TokenState::Accepted) {
-            return;
-        }
-        let counters = self.accounting.class(self.class);
-        if outcome == Outcome::Success {
-            counters.succeeded.fetch_add(1, AtomicOrdering::Release);
-        } else {
-            counters.failed.fetch_add(1, AtomicOrdering::Release);
-            if outcome == Outcome::ResultUnknown {
-                counters
-                    .result_unknown
-                    .fetch_add(1, AtomicOrdering::Release);
+    fn complete(&self, outcome: Outcome) {
+        if outcome != Outcome::Success {
+            let mut error = self.first_error.lock().unwrap();
+            if error.is_none() {
+                *error = Some(format!("preparation outcome: {}", outcome.as_str()));
             }
         }
-        if let Some((tracker, resource)) = &self.phase {
-            tracker.record(*resource, outcome);
+        if self.remaining.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            self.notify.notify_waiters();
         }
-        self.state = TokenState::Terminal;
     }
 
-    fn mark_dropped(&mut self, reason: DropReason) {
-        if !matches!(self.state, TokenState::Offered) {
-            return;
-        }
-        match reason {
-            DropReason::Backpressure => {
-                self.accounting
-                    .class(self.class)
-                    .dropped_full
-                    .fetch_add(1, AtomicOrdering::Release);
+    async fn wait(&self, deadline: TokioInstant) -> Result<(), String> {
+        loop {
+            // Register before checking the predicate. `notify_waiters` does
+            // not retain a permit for a future created after the wakeup.
+            let notified = self.notify.notified();
+            if TokioInstant::now() >= deadline {
+                return Err("preparation deadline exceeded".into());
             }
-            DropReason::QueueClosed => {
-                self.accounting
-                    .class(self.class)
-                    .dropped_closed
-                    .fetch_add(1, AtomicOrdering::Release);
+            if self.remaining.load(AtomicOrdering::Acquire) == 0 {
+                return self.first_error.lock().unwrap().clone().map_or(Ok(()), Err);
+            }
+            if time::timeout_at(deadline, notified).await.is_err() {
+                return Err("preparation deadline exceeded".into());
             }
         }
-        self.state = TokenState::Terminal;
     }
-
-    fn mark_unissued(&mut self) {
-        if !matches!(self.state, TokenState::Offered) {
-            return;
-        }
-        self.accounting
-            .class(self.class)
-            .unissued
-            .fetch_add(1, AtomicOrdering::Release);
-        self.state = TokenState::Terminal;
-    }
-
-    fn mark_unfinished(&mut self) {
-        if !matches!(self.state, TokenState::Accepted) {
-            return;
-        }
-        self.accounting
-            .class(self.class)
-            .unfinished
-            .fetch_add(1, AtomicOrdering::Release);
-        if let Some((tracker, resource)) = &self.phase {
-            tracker.record_unfinished(*resource);
-        }
-        self.state = TokenState::Terminal;
-    }
-}
-
-impl Drop for AccountingToken {
-    fn drop(&mut self) {
-        match self.state {
-            TokenState::Offered => self.mark_unissued(),
-            TokenState::Accepted => self.mark_unfinished(),
-            TokenState::Terminal => {}
-        }
-    }
-}
-
-fn tracked(accounting: &Arc<RunAccounting>, class: WorkClass) -> AccountingToken {
-    accounting.offer(class)
-}
-
-fn tracked_phase(
-    accounting: &Arc<RunAccounting>,
-    class: WorkClass,
-    completion: Arc<PhaseTracker>,
-    resource: usize,
-) -> AccountingToken {
-    let mut token = accounting.offer(class);
-    token.phase = Some((completion, resource));
-    token
 }
 
 #[derive(Debug)]
 enum WorkItem {
     Txn {
-        resource: usize,
+        resource: ResourceKind,
         key: Vec<u8>,
         operation: ResourceOperation,
         value: Vec<u8>,
-        pool: Option<String>,
-        accounting: AccountingToken,
+        token: MeasurementToken,
+        preparation: Option<Arc<PreparationTracker>>,
     },
     Range {
         request: RangeRequest,
-        selector_keep_every: u64,
-        target: u64,
-        accounting: AccountingToken,
+        selector: RangeSelector,
+        token: MeasurementToken,
     },
     Heartbeat {
         item: HeartbeatItem,
-        accounting: AccountingToken,
-    },
-    Bootstrap {
-        item: HeartbeatItem,
-        done: oneshot::Sender<Result<(), String>>,
-        accounting: AccountingToken,
+        resource: ResourceKind,
+        token: MeasurementToken,
     },
     Status {
-        accounting: AccountingToken,
+        token: MeasurementToken,
     },
     CompactTick {
-        accounting: AccountingToken,
+        token: MeasurementToken,
     },
 }
 
 impl WorkItem {
-    fn mark_accepted(&mut self) {
+    fn token(&self) -> &MeasurementToken {
         match self {
-            Self::Txn { accounting, .. }
-            | Self::Range { accounting, .. }
-            | Self::Heartbeat { accounting, .. }
-            | Self::Bootstrap { accounting, .. }
-            | Self::Status { accounting }
-            | Self::CompactTick { accounting } => accounting.mark_accepted(),
+            Self::Txn { token, .. }
+            | Self::Range { token, .. }
+            | Self::Heartbeat { token, .. }
+            | Self::Status { token }
+            | Self::CompactTick { token } => token,
         }
     }
 
-    fn record_dequeue(&mut self) {
-        match self {
-            Self::Txn { accounting, .. }
-            | Self::Range { accounting, .. }
-            | Self::Heartbeat { accounting, .. }
-            | Self::Bootstrap { accounting, .. }
-            | Self::Status { accounting }
-            | Self::CompactTick { accounting } => accounting.record_dequeue(),
-        }
+    fn accept(&self) -> Result<TokenAction, String> {
+        self.token().accept().map_err(|error| error.to_string())
     }
 
-    fn mark_dropped(&mut self, reason: DropReason) {
-        match self {
-            Self::Txn { accounting, .. }
-            | Self::Range { accounting, .. }
-            | Self::Heartbeat { accounting, .. }
-            | Self::Bootstrap { accounting, .. }
-            | Self::Status { accounting }
-            | Self::CompactTick { accounting } => accounting.mark_dropped(reason),
-        }
+    fn accept_for_tick(&self, tick_end_ns: u64) -> Result<TokenAction, String> {
+        self.token()
+            .accept_for_tick(tick_end_ns)
+            .map_err(|error| error.to_string())
     }
 
-    fn mark_unissued(&mut self) {
+    fn started(&self) -> Result<(), String> {
+        self.token()
+            .started()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn terminal(&self, outcome: Outcome) -> Result<(), String> {
+        self.token()
+            .terminal(outcome)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn terminal_with_error(
+        &self,
+        outcome: Outcome,
+        code: u64,
+        message: &str,
+    ) -> Result<(), String> {
+        self.token()
+            .terminal_with_error(outcome, code, message)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn drop_for(&self, reason: DropReason) -> Result<(), String> {
+        self.token()
+            .drop_for(reason)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn preparation(&self) -> Option<&Arc<PreparationTracker>> {
         match self {
-            Self::Txn { accounting, .. }
-            | Self::Range { accounting, .. }
-            | Self::Heartbeat { accounting, .. }
-            | Self::Bootstrap { accounting, .. }
-            | Self::Status { accounting }
-            | Self::CompactTick { accounting } => accounting.mark_unissued(),
+            Self::Txn { preparation, .. } => preparation.as_ref(),
+            _ => None,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchOutcome {
+    Accepted,
+    Dropped,
+    Missed,
+    MissedToken,
+    Stopped,
+}
+
+enum OfferedMeasurement {
+    Token(MeasurementToken),
+    MissedSchedule,
+    NotOfferedAfterStop,
+}
+
+#[derive(Debug)]
+struct DispatchState {
+    next_ordinals: Vec<u64>,
+    periodic_cursor: usize,
+    next_tick: u64,
+}
+
+impl DispatchState {
+    fn new(plan: &CompiledPlan) -> Self {
+        Self {
+            next_ordinals: vec![0; plan.logical_streams.len()],
+            periodic_cursor: 0,
+            next_tick: 0,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompactorStatus {
     Active,
@@ -676,562 +424,6 @@ impl CompactorState {
         })
     }
 }
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ScheduleStats {
-    pub scheduled: u64,
-    pub dropped: u64,
-}
-
-pub struct Scheduler {
-    workload: WorkloadSpec,
-    nodes: usize,
-    seed: u64,
-}
-impl Scheduler {
-    pub fn new(config: &RuntimeConfig) -> Self {
-        Self {
-            workload: config.workload.clone(),
-            nodes: config.nodes as usize,
-            seed: config.seed,
-        }
-    }
-
-    pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(
-            self.workload
-                .timeline
-                .iter()
-                .map(|s| s.duration_s)
-                .sum::<f64>(),
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Source {
-    Range,
-    MasterLease {
-        resource: usize,
-        id: u64,
-        ordinal: u64,
-    },
-    NodeLease(usize),
-    NodeStatus {
-        node: usize,
-        tick: u64,
-    },
-    Status(u64),
-    Compact(u64),
-    PhaseEnd,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Scheduled {
-    at: Duration,
-    rank: u8,
-    sequence: u64,
-    source: Source,
-}
-impl Ord for Scheduled {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .at
-            .cmp(&self.at)
-            .then_with(|| other.rank.cmp(&self.rank))
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-impl PartialOrd for Scheduled {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-struct RateSegment {
-    offset: Duration,
-    duration: Duration,
-    count: u64,
-    emitted: u64,
-}
-struct RateCursor {
-    segments: Vec<RateSegment>,
-    index: usize,
-    ordinal: u64,
-}
-impl RateCursor {
-    fn new(workload: &WorkloadSpec, seed: u64, tag: u64) -> Self {
-        let mut offset = Duration::ZERO;
-        let mut segments = Vec::with_capacity(workload.timeline.len());
-        for (index, segment) in workload.timeline.iter().enumerate() {
-            let duration = Duration::from_secs_f64(segment.duration_s);
-            let rate = segment.range_rps;
-            let expected = rate.max(0.0) * duration.as_secs_f64();
-            let base = expected.floor() as u64;
-            let count = base
-                + u64::from(expected.fract() + deterministic_unit(seed ^ tag, index as u64) >= 1.0);
-            segments.push(RateSegment {
-                offset,
-                duration,
-                count,
-                emitted: 0,
-            });
-            offset = offset.saturating_add(duration);
-        }
-        Self {
-            segments,
-            index: 0,
-            ordinal: 0,
-        }
-    }
-
-    fn next(&mut self) -> Option<(Duration, u64)> {
-        loop {
-            let segment = self.segments.get_mut(self.index)?;
-            if segment.emitted < segment.count {
-                segment.emitted += 1;
-                self.ordinal = self.ordinal.wrapping_add(1);
-                let at = segment.offset.saturating_add(
-                    segment
-                        .duration
-                        .mul_f64(segment.emitted as f64 / segment.count as f64),
-                );
-                return Some((at, self.ordinal - 1));
-            }
-            self.index += 1;
-        }
-    }
-
-    fn total(&self) -> u64 {
-        self.segments.iter().map(|s| s.count).sum()
-    }
-}
-
-pub(crate) fn application_operation_total(workload: &WorkloadSpec) -> u64 {
-    workload
-        .resources
-        .iter()
-        .filter(|resource| resource.behavior != ResourceBehavior::MasterLease)
-        .try_fold(0u64, |total, resource| {
-            let count = workload
-                .resource_count(resource)
-                .expect("workload resource counts were validated");
-            let updates = count
-                .checked_mul(resource.update_amplification)
-                .expect("workload update target was validated");
-            total
-                .checked_add(count)
-                .and_then(|value| value.checked_add(updates))
-        })
-        .expect("workload application target was validated")
-}
-
-/// Total number of independent Range requests the scheduler will emit for
-/// this workload's actual timeline, using the same per-segment deterministic
-/// rounding as the runtime cursor.
-pub(crate) fn range_request_total(workload: &WorkloadSpec, seed: u64) -> u64 {
-    RateCursor::new(workload, seed, 0xB2).total()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PlannedOperation {
-    resource: usize,
-    id: u64,
-}
-
-#[derive(Clone, Debug)]
-struct PlannedResource {
-    resource: usize,
-    count: u64,
-    update_amplification: u64,
-}
-
-#[derive(Clone, Debug)]
-struct WorkloadPlan {
-    resources: Vec<PlannedResource>,
-    total_creates: u64,
-    total_updates: u64,
-}
-
-impl WorkloadPlan {
-    fn build(workload: &WorkloadSpec) -> Result<Self, String> {
-        let mut resources = Vec::with_capacity(workload.resources.len());
-        let mut total_creates = 0u64;
-        let mut total_updates = 0u64;
-        for (resource, spec) in workload.resources.iter().enumerate() {
-            let count = workload
-                .resource_count(spec)
-                .map_err(|error| error.to_string())?;
-            let updates = count
-                .checked_mul(spec.update_amplification)
-                .ok_or_else(|| format!("resource {:?} update target overflows u64", spec.name))?;
-            total_creates = total_creates
-                .checked_add(count)
-                .ok_or_else(|| "total create target overflows u64".to_string())?;
-            total_updates = total_updates
-                .checked_add(updates)
-                .ok_or_else(|| "total update target overflows u64".to_string())?;
-            resources.push(PlannedResource {
-                resource,
-                count,
-                update_amplification: spec.update_amplification,
-            });
-        }
-        Ok(Self {
-            resources,
-            total_creates,
-            total_updates,
-        })
-    }
-
-    fn total_creates(&self) -> u64 {
-        self.total_creates
-    }
-
-    fn total_updates(&self) -> u64 {
-        self.total_updates
-    }
-
-    fn create_targets(&self, resource_count: usize) -> Vec<u64> {
-        let mut targets = vec![0; resource_count];
-        for resource in &self.resources {
-            targets[resource.resource] = resource.count;
-        }
-        targets
-    }
-
-    fn update_targets(&self, resource_count: usize) -> Vec<u64> {
-        let mut targets = vec![0; resource_count];
-        for resource in &self.resources {
-            targets[resource.resource] = resource
-                .count
-                .checked_mul(resource.update_amplification)
-                .expect("workload update target was validated");
-        }
-        targets
-    }
-
-    fn creates(&self) -> CreateCursor<'_> {
-        CreateCursor {
-            resources: &self.resources,
-            resource_index: 0,
-            id: 0,
-        }
-    }
-}
-
-struct CreateCursor<'a> {
-    resources: &'a [PlannedResource],
-    resource_index: usize,
-    id: u64,
-}
-
-impl Iterator for CreateCursor<'_> {
-    type Item = PlannedOperation;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let resource = self.resources.get(self.resource_index)?;
-            if self.id < resource.count {
-                let operation = PlannedOperation {
-                    resource: resource.resource,
-                    id: self.id,
-                };
-                self.id += 1;
-                return Some(operation);
-            }
-            self.resource_index += 1;
-            self.id = 0;
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct UpdateResource {
-    resource: usize,
-    count: u64,
-    remaining: u64,
-    weight: u64,
-    emitted: u64,
-    deficit: i128,
-    start_id: u64,
-}
-
-struct UpdateCursor {
-    resources: Vec<UpdateResource>,
-    total: u64,
-    remaining: u64,
-}
-
-impl UpdateCursor {
-    fn new(plan: &WorkloadPlan, seed: u64) -> Self {
-        let resources: Vec<_> = plan
-            .resources
-            .iter()
-            .filter(|resource| resource.update_amplification > 0)
-            .map(|resource| {
-                let target = resource
-                    .count
-                    .checked_mul(resource.update_amplification)
-                    .expect("workload update target was validated");
-                UpdateResource {
-                    resource: resource.resource,
-                    count: resource.count,
-                    weight: target,
-                    remaining: target,
-                    emitted: 0,
-                    deficit: 0,
-                    start_id: splitmix(seed ^ resource.resource as u64) % resource.count,
-                }
-            })
-            .collect();
-        Self {
-            resources,
-            total: plan.total_updates,
-            remaining: plan.total_updates,
-        }
-    }
-}
-
-impl Iterator for UpdateCursor {
-    type Item = PlannedOperation;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let mut best = None;
-        for (index, resource) in self.resources.iter_mut().enumerate() {
-            if resource.remaining == 0 {
-                continue;
-            }
-            resource.deficit += resource.weight as i128;
-            if best.is_none_or(|(_, deficit)| resource.deficit > deficit) {
-                best = Some((index, resource.deficit));
-            }
-        }
-        let (index, _) = best?;
-        let resource = &mut self.resources[index];
-        resource.deficit -= self.total as i128;
-        let id = ((resource.start_id as u128 + resource.emitted as u128) % resource.count as u128)
-            as u64;
-        resource.emitted += 1;
-        resource.remaining -= 1;
-        self.remaining -= 1;
-        Some(PlannedOperation {
-            resource: resource.resource,
-            id,
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-enum PhaseKind {
-    Create,
-    Update,
-}
-
-#[derive(Debug)]
-struct PhaseTracker {
-    target: u64,
-    targets: Vec<u64>,
-    completed: AtomicU64,
-    succeeded: AtomicU64,
-    failed: AtomicU64,
-    result_unknown: AtomicU64,
-    unfinished: AtomicU64,
-    succeeded_by_resource: Vec<AtomicU64>,
-    failed_by_resource: Vec<AtomicU64>,
-    notify: Notify,
-}
-
-impl PhaseTracker {
-    fn new(targets: Vec<u64>) -> Self {
-        let target = targets
-            .iter()
-            .try_fold(0u64, |total, target| total.checked_add(*target))
-            .expect("phase targets were validated");
-        let succeeded_by_resource = targets.iter().map(|_| AtomicU64::new(0)).collect();
-        let failed_by_resource = targets.iter().map(|_| AtomicU64::new(0)).collect();
-        Self {
-            target,
-            targets,
-            completed: AtomicU64::new(0),
-            succeeded: AtomicU64::new(0),
-            failed: AtomicU64::new(0),
-            result_unknown: AtomicU64::new(0),
-            unfinished: AtomicU64::new(0),
-            succeeded_by_resource,
-            failed_by_resource,
-            notify: Notify::new(),
-        }
-    }
-
-    fn record(&self, resource: usize, outcome: Outcome) {
-        if outcome == Outcome::Success {
-            self.succeeded.fetch_add(1, AtomicOrdering::Relaxed);
-            if let Some(succeeded) = self.succeeded_by_resource.get(resource) {
-                succeeded.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-        } else {
-            self.failed.fetch_add(1, AtomicOrdering::Relaxed);
-            if outcome == Outcome::ResultUnknown {
-                self.result_unknown.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if let Some(failed) = self.failed_by_resource.get(resource) {
-                failed.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-        }
-        self.record_terminal();
-    }
-
-    fn record_unfinished(&self, resource: usize) {
-        self.unfinished.fetch_add(1, AtomicOrdering::Relaxed);
-        self.record_terminal();
-        if let Some(failed) = self.failed_by_resource.get(resource) {
-            failed.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-    }
-
-    fn record_terminal(&self) {
-        let completed = self.completed.fetch_add(1, AtomicOrdering::Release) + 1;
-        if completed >= self.target {
-            self.notify.notify_waiters();
-        }
-    }
-
-    fn result(&self, phase: &str) -> Result<(), String> {
-        let completed = self.completed.load(AtomicOrdering::Acquire);
-        let succeeded = self.succeeded.load(AtomicOrdering::Acquire);
-        let deficit = self.target.saturating_sub(succeeded);
-        if completed == self.target && deficit == 0 {
-            Ok(())
-        } else {
-            Err(self.status(phase, completed, succeeded, deficit))
-        }
-    }
-
-    fn deadline_error(&self, phase: &str) -> String {
-        let completed = self.completed.load(AtomicOrdering::Acquire);
-        let succeeded = self.succeeded.load(AtomicOrdering::Acquire);
-        let deficit = self.target.saturating_sub(succeeded);
-        format!(
-            "{phase} phase deadline exceeded: {}",
-            self.status(phase, completed, succeeded, deficit)
-        )
-    }
-
-    fn status(&self, phase: &str, completed: u64, succeeded: u64, deficit: u64) -> String {
-        format!(
-            "{phase} phase incomplete: target={}, completed={completed}, succeeded={succeeded}, deficit={deficit}",
-            self.target
-        )
-    }
-
-    fn publish(&self, workload: &WorkloadSpec, kind: PhaseKind) {
-        for (resource, target) in self.targets.iter().copied().enumerate() {
-            let Some(spec) = workload.resources.get(resource) else {
-                continue;
-            };
-            let label = ResourceName::try_from(spec.name.as_str())
-                .expect("workload resource labels were validated");
-            let succeeded = self.succeeded_by_resource[resource].load(AtomicOrdering::Acquire);
-            let failed = self.failed_by_resource[resource].load(AtomicOrdering::Acquire);
-            let deficit = target.saturating_sub(succeeded);
-            match kind {
-                PhaseKind::Create => {
-                    metrics::set_resource_objects(&label, "planned", target);
-                    metrics::set_resource_objects(&label, "succeeded", succeeded);
-                    metrics::set_resource_objects(&label, "failed", failed);
-                    metrics::set_resource_objects(&label, "deficit", deficit);
-                }
-                PhaseKind::Update => {
-                    metrics::set_resource_updates(&label, "target", target);
-                    metrics::set_resource_updates(&label, "succeeded", succeeded);
-                    metrics::set_resource_updates(&label, "failed", failed);
-                    metrics::set_resource_updates(&label, "deficit", deficit);
-                }
-            }
-        }
-    }
-
-    async fn wait_until(&self, phase: &str, deadline: TokioInstant) -> Result<(), String> {
-        loop {
-            let notified = self.notify.notified();
-            if self.completed.load(AtomicOrdering::Acquire) >= self.target {
-                return self.result(phase);
-            }
-            if time::timeout_at(deadline, notified).await.is_err() {
-                return Err(self.deadline_error(phase));
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RangeProducer {
-    deficits: Vec<f64>,
-    total: f64,
-}
-impl RangeProducer {
-    fn new(weights: impl Iterator<Item = f64>) -> Self {
-        let deficits: Vec<f64> = weights.collect();
-        Self {
-            total: deficits.iter().sum(),
-            deficits,
-        }
-    }
-
-    fn next(&mut self, weights: &[f64]) -> Option<usize> {
-        if self.deficits.is_empty() || self.total <= 0.0 {
-            return None;
-        }
-        for (d, w) in self.deficits.iter_mut().zip(weights) {
-            *d += *w;
-        }
-        let index = self
-            .deficits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-            .map(|(i, _)| i)?;
-        self.deficits[index] -= self.total;
-        Some(index)
-    }
-}
-
-pub(crate) struct RangeShapePlan {
-    prefix_total: u64,
-    seen: u64,
-    count_only: u64,
-}
-
-impl RangeShapePlan {
-    fn new(prefix_total: u64, count_only: u64) -> Self {
-        Self {
-            prefix_total,
-            seen: 0,
-            count_only,
-        }
-    }
-
-    fn takes(slot: u64, target: u64, total: u64) -> bool {
-        if total == 0 {
-            return false;
-        }
-        let before = slot as u128 * target as u128 / total as u128;
-        let after = (slot + 1) as u128 * target as u128 / total as u128;
-        after > before
-    }
-
-    fn apply(&mut self, request: &mut RangeRequest) {
-        let slot = self.seen;
-        self.seen = self.seen.saturating_add(1);
-        if !Self::takes(slot, self.count_only, self.prefix_total) {
-            return;
-        }
-        request.count_only = true;
-        request.limit = 0;
-    }
-}
 /// Explicit selector policy used by the Range pager. One means all candidates
 /// match; larger values deterministically discard every Nth candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1254,18 +446,6 @@ impl RangeSelector {
     fn target(self) -> Option<u64> {
         match self {
             Self::All { target } | Self::DropEvery { target, .. } => target,
-        }
-    }
-}
-
-fn configured_range_selector(selector_keep_every: u64, target: u64) -> RangeSelector {
-    let target = (target > 0).then_some(target);
-    if selector_keep_every <= 1 {
-        RangeSelector::All { target }
-    } else {
-        RangeSelector::DropEvery {
-            every: usize::try_from(selector_keep_every).unwrap_or(usize::MAX),
-            target,
         }
     }
 }
@@ -1320,11 +500,20 @@ impl RangePager {
     const MAX_LIMIT: i64 = 10_000;
 
     fn new(mut request: RangeRequest, selector: RangeSelector) -> Self {
-        // Only bounded prefix LISTs use the internal 500-page pager.  An
-        // unbounded prefix (`limit=0`) preserves its one-shot wire shape.
+        // Only bounded prefix LISTs use the internal pager. An unbounded
+        // prefix (`limit=0`) preserves its one-shot wire shape.
         let paged = !request.count_only && !request.range_end.is_empty() && request.limit > 0;
+        let target = selector.target().or_else(|| {
+            if request.limit > 0 {
+                u64::try_from(request.limit).ok()
+            } else {
+                None
+            }
+        });
         let page_limit = if paged {
-            Self::INITIAL_LIMIT
+            target
+                .and_then(|limit| i64::try_from(limit).ok())
+                .map_or(Self::INITIAL_LIMIT, |limit| Self::INITIAL_LIMIT.min(limit))
         } else {
             request.limit
         };
@@ -1341,7 +530,7 @@ impl RangePager {
             last_key: Vec::new(),
             selected: 0,
             discarded: 0,
-            target: selector.target(),
+            target,
         }
     }
 
@@ -1407,9 +596,17 @@ impl RangePager {
             .last()
             .map(|kv| kv.key.clone())
             .ok_or_else(|| "Range response has more=true but no KVs".to_string())?;
+        let mut next_limit = self.page_limit;
         if selected_in_page < response.kvs.len() {
-            self.page_limit = self.page_limit.saturating_mul(2).min(Self::MAX_LIMIT);
+            next_limit = next_limit.saturating_mul(2).min(Self::MAX_LIMIT);
         }
+        if let Some(target) = self.target {
+            let remaining = target.saturating_sub(self.selected);
+            let remaining =
+                i64::try_from(remaining).map_or(Self::MAX_LIMIT, |remaining| remaining.max(1));
+            next_limit = next_limit.min(remaining);
+        }
+        self.page_limit = next_limit;
         self.request.key = {
             let mut key = last_key;
             key.push(0);
@@ -1525,115 +722,6 @@ async fn execute_range(
     }
 }
 
-fn exact_prefix_total(
-    mut producer: RangeProducer,
-    weights: &[f64],
-    ranges: &[crate::config::RangeSpec],
-    scheduled_ranges: u64,
-) -> u64 {
-    (0..scheduled_ranges)
-        .filter_map(|_| producer.next(weights))
-        .filter(|index| ranges[*index].kind == "prefix")
-        .count() as u64
-}
-
-/// Exact number of prefix-kind requests among `range_total` scheduled Range
-/// requests, using the same deterministic producer sequence as the runtime.
-/// Monotone in `range_total` (longer schedules extend the same sequence).
-pub(crate) fn exact_prefix_capacity(workload: &WorkloadSpec, range_total: u64) -> u64 {
-    let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
-    let producer = RangeProducer::new(weights.iter().copied());
-    exact_prefix_total(producer, &weights, &workload.ranges, range_total)
-}
-
-/// Masterlease tick time for `ordinal`, bounded by workload duration so
-/// periodic traffic never outlives the run. Computes the prospective time
-/// without overflowing even for huge intervals or ordinals.
-fn masterlease_tick_at(interval: Duration, ordinal: u64, duration: Duration) -> Option<Duration> {
-    let secs = interval.as_secs_f64() * (ordinal + 1) as f64;
-    if !secs.is_finite() || secs > duration.as_secs_f64() {
-        return None;
-    }
-    Some(Duration::from_secs_f64(secs))
-}
-
-pub(crate) fn range_shape_plan(
-    workload: &WorkloadSpec,
-    prefix_total: u64,
-) -> Result<RangeShapePlan, String> {
-    let count_only = workload.range_count_only_count;
-    if count_only > prefix_total {
-        return Err(format!(
-            "Range shape count ({count_only}) exceeds scheduled prefix Range capacity ({prefix_total})",
-        ));
-    }
-    Ok(RangeShapePlan::new(prefix_total, count_only))
-}
-fn splitmix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-fn deterministic_unit(seed: u64, index: u64) -> f64 {
-    const MANTISSA_BITS: u32 = 53;
-    (splitmix(seed ^ index) >> (64 - MANTISSA_BITS)) as f64 / (1u64 << MANTISSA_BITS) as f64
-}
-
-fn stable_shard(key: &[u8], workers: usize) -> usize {
-    if workers == 0 {
-        0
-    } else {
-        key.iter()
-            .fold(0u64, |hash, byte| splitmix(hash ^ *byte as u64)) as usize
-            % workers
-    }
-}
-fn patterned_key(pattern: &str, id: u64) -> Vec<u8> {
-    pattern
-        .replace("{ns}", "bench")
-        .replace("{id}", &format!("{id:05}"))
-        .into_bytes()
-}
-fn resource_key(resource: &ResourceSpec, id: u64) -> Vec<u8> {
-    patterned_key(&resource.key_pattern, id)
-}
-fn patterned_value(size: usize, id: u64, n: u64) -> Vec<u8> {
-    let mut value = vec![0; size];
-    let marker = splitmix(id ^ n);
-    for (i, byte) in value.iter_mut().enumerate() {
-        *byte = marker.rotate_left((i % 63) as u32) as u8;
-    }
-    value
-}
-fn resource_value(resource: &ResourceSpec, id: u64, n: u64) -> Vec<u8> {
-    patterned_value(resource.value_size_bytes, id, n)
-}
-fn range_request(spec: &crate::config::RangeSpec, n: u64) -> RangeRequest {
-    let key = spec
-        .key_pattern
-        .replace("{ns}", "bench")
-        .replace("{id}", &format!("{:05}", n % 1000))
-        .into_bytes();
-    RangeRequest {
-        key: key.clone(),
-        range_end: if spec.kind == "prefix" {
-            prefix_range_end(&key)
-        } else {
-            Vec::new()
-        },
-        limit: spec.limit as i64,
-        count_only: spec.count_only,
-        serializable: false,
-        keys_only: false,
-        ..Default::default()
-    }
-}
-struct SharedPool {
-    name: PoolName,
-    pool: Mutex<LeasePool>,
-}
-
 type WatchTaskOutput = (
     String,
     Result<crate::watch::WatchOutcome, crate::watch::WatchError>,
@@ -1678,16 +766,18 @@ fn watch_failure(
 async fn wait_for_watch_ready(
     tasks: &mut JoinSet<WatchTaskOutput>,
     ready_receivers: Vec<oneshot::Receiver<()>>,
-    timeout: Duration,
+    deadline: TokioInstant,
     ctrl_c: &mut CtrlCFuture,
 ) -> Result<(), String> {
     if ready_receivers.is_empty() {
         return Ok(());
     }
-    let deadline = TokioInstant::now() + timeout;
     for mut ready in ready_receivers {
         let mut readiness_closed = false;
         loop {
+            if TokioInstant::now() >= deadline {
+                return Err("watch readiness timed out".into());
+            }
             tokio::select! {
                 biased;
                 _ = ctrl_c.as_mut() => {
@@ -1707,7 +797,8 @@ async fn wait_for_watch_ready(
                 }
                 ready_result = &mut ready, if !readiness_closed => {
                     match ready_result {
-                        Ok(()) => break,
+                        Ok(()) if TokioInstant::now() < deadline => break,
+                        Ok(()) => return Err("watch readiness timed out".into()),
                         Err(_) if tasks.is_empty() => {
                             return Err("watch terminated before Created readiness".into());
                         }
@@ -1720,1224 +811,19 @@ async fn wait_for_watch_ready(
             }
         }
     }
+    if TokioInstant::now() >= deadline {
+        return Err("watch readiness timed out".into());
+    }
     Ok(())
 }
 
-fn push_bounded_error(errors: &mut Vec<String>, error: String) {
-    if errors.len() < 8 {
-        errors.push(error.chars().take(MAX_ERROR_CONTEXT).collect());
-    }
-}
-
 type CtrlCFuture = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
-
-enum SupervisedScheduleControl {
-    Deadline,
-    Interrupted,
-    UpdateFinished(Result<u64, String>),
-}
-
-async fn wait_for_supervised_schedule_event(
-    watch_tasks: &mut JoinSet<WatchTaskOutput>,
-    worker_tasks: &mut JoinSet<Result<(), String>>,
-    update_task: &mut Option<tokio::task::JoinHandle<Result<u64, String>>>,
-    deadline: TokioInstant,
-    ctrl_c: &mut CtrlCFuture,
-) -> Result<SupervisedScheduleControl, String> {
-    tokio::select! {
-        biased;
-        _ = ctrl_c.as_mut() => Ok(SupervisedScheduleControl::Interrupted),
-        watch_result = watch_tasks.join_next(), if !watch_tasks.is_empty() => {
-            match watch_result {
-                Some(Ok((name, result))) => {
-                    match watch_failure(&name, result) {
-                        Some(error) => Err(error),
-                        None => Err(format!("watch {name} terminated unexpectedly")),
-                    }
-                }
-                Some(Err(error)) => Err(format!("watch task failed: {error}")),
-                None => Err("all watch tasks terminated unexpectedly".to_string()),
-            }
-        }
-        worker_result = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
-            match worker_result {
-                Some(Ok(Ok(()))) => Err("worker exited unexpectedly".to_string()),
-                Some(Ok(Err(error))) => Err(format!("worker failed: {error}")),
-                Some(Err(error)) => Err(format!("worker task failed: {error}")),
-                None => Err("all worker tasks terminated unexpectedly".to_string()),
-            }
-        }
-        update_result = async { update_task.as_mut().expect("guarded update task").await }, if update_task.is_some() => {
-            let result = match update_result {
-                Ok(result) => result,
-                Err(error) => Err(format!("update phase task failed: {error}")),
-            };
-            Ok(SupervisedScheduleControl::UpdateFinished(result))
-        }
-        _ = time::sleep_until(deadline) => Ok(SupervisedScheduleControl::Deadline),
-    }
-}
-enum EnqueueResult {
-    Accepted,
-    Closed,
-    Unissued,
-}
-
-async fn enqueue_until(
-    sender: &mpsc::Sender<WorkItem>,
-    mut item: WorkItem,
-    deadline: TokioInstant,
-) -> EnqueueResult {
-    match time::timeout_at(deadline, sender.reserve()).await {
-        Ok(Ok(permit)) => {
-            item.mark_accepted();
-            permit.send(item);
-            EnqueueResult::Accepted
-        }
-        Ok(Err(_)) => {
-            item.mark_dropped(DropReason::QueueClosed);
-            metrics::record_dropped(DropReason::QueueClosed);
-            EnqueueResult::Closed
-        }
-        Err(_) => {
-            item.mark_unissued();
-            EnqueueResult::Unissued
-        }
-    }
-}
-
-async fn run_create_phase(
-    workload: &WorkloadSpec,
-    plan: &WorkloadPlan,
-    senders: &[mpsc::Sender<WorkItem>],
-    workers: usize,
-    timeout: Duration,
-    accounting: &Arc<RunAccounting>,
-) -> Result<u64, String> {
-    let tracker = Arc::new(PhaseTracker::new(
-        plan.create_targets(workload.resources.len()),
-    ));
-    debug_assert_eq!(tracker.target, plan.total_creates());
-    let deadline = TokioInstant::now() + timeout;
-    let result: Result<u64, String> = async {
-        let mut scheduled = 0u64;
-        for operation in plan.creates() {
-            let spec = &workload.resources[operation.resource];
-            let key = resource_key(spec, operation.id);
-            let label = ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
-            let item = WorkItem::Txn {
-                resource: operation.resource,
-                key: key.clone(),
-                operation: ResourceOperation::Create,
-                value: resource_value(spec, operation.id, 0),
-                pool: spec.lease_pool.clone(),
-                accounting: tracked_phase(
-                    accounting,
-                    if spec.behavior == ResourceBehavior::MasterLease {
-                        WorkClass::MasterLease
-                    } else {
-                        WorkClass::Create
-                    },
-                    Arc::clone(&tracker),
-                    operation.resource,
-                ),
-            };
-            metrics::record_scheduled(Operation::Create, &label);
-            match enqueue_until(&senders[stable_shard(&key, workers)], item, deadline).await {
-                EnqueueResult::Accepted => scheduled += 1,
-                EnqueueResult::Closed => return Err("create phase worker queue closed".to_string()),
-                EnqueueResult::Unissued => return Err(tracker.deadline_error("create")),
-            }
-        }
-        tracker.wait_until("create", deadline).await?;
-        Ok(scheduled)
-    }
-    .await;
-    tracker.publish(workload, PhaseKind::Create);
-    result
-}
-
-const UPDATE_DISPATCH_FRACTION: f64 = 0.95;
-
-fn update_dispatch_at(duration: Duration, ordinal: u64, total: u64) -> Duration {
-    debug_assert!(total > 0);
-    debug_assert!(ordinal < total);
-    duration.mul_f64(UPDATE_DISPATCH_FRACTION * ordinal as f64 / total as f64)
-}
-
-async fn run_update_phase(
-    workload: WorkloadSpec,
-    plan: WorkloadPlan,
-    senders: Vec<mpsc::Sender<WorkItem>>,
-    workers: usize,
-    seed: u64,
-    started: TokioInstant,
-    duration: Duration,
-    accounting: Arc<RunAccounting>,
-) -> Result<u64, String> {
-    let total = plan.total_updates();
-    let tracker = Arc::new(PhaseTracker::new(
-        plan.update_targets(workload.resources.len()),
-    ));
-    let deadline = started + duration;
-    let result: Result<u64, String> = async {
-        let mut scheduled = 0u64;
-        for (ordinal, operation) in UpdateCursor::new(&plan, seed).enumerate() {
-            let at = started + update_dispatch_at(duration, ordinal as u64, total);
-            time::sleep_until(at).await;
-            let spec = &workload.resources[operation.resource];
-            let key = resource_key(spec, operation.id);
-            let label = ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string())?;
-            let item = WorkItem::Txn {
-                resource: operation.resource,
-                key: key.clone(),
-                operation: ResourceOperation::GuaranteedUpdate,
-                value: resource_value(spec, operation.id, ordinal as u64 + 1),
-                pool: spec.lease_pool.clone(),
-                accounting: tracked_phase(
-                    &accounting,
-                    if spec.behavior == ResourceBehavior::MasterLease {
-                        WorkClass::MasterLease
-                    } else {
-                        WorkClass::Update
-                    },
-                    Arc::clone(&tracker),
-                    operation.resource,
-                ),
-            };
-            metrics::record_scheduled(Operation::Update, &label);
-            match enqueue_until(&senders[stable_shard(&key, workers)], item, deadline).await {
-                EnqueueResult::Accepted => scheduled += 1,
-                EnqueueResult::Closed => return Err("update phase worker queue closed".to_string()),
-                EnqueueResult::Unissued => return Err(tracker.deadline_error("update")),
-            }
-        }
-        tracker.wait_until("update", deadline).await?;
-        Ok(scheduled)
-    }
-    .await;
-    tracker.publish(&workload, PhaseKind::Update);
-    result
-}
-
-fn try_enqueue(
-    sender: &mpsc::Sender<WorkItem>,
-    mut item: WorkItem,
-    stats: &mut ScheduleStats,
-) -> bool {
-    match sender.try_reserve() {
-        Ok(permit) => {
-            item.mark_accepted();
-            permit.send(item);
-            true
-        }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            item.mark_dropped(DropReason::Backpressure);
-            stats.dropped += 1;
-            metrics::record_dropped(DropReason::Backpressure);
-            false
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            item.mark_dropped(DropReason::QueueClosed);
-            stats.dropped += 1;
-            metrics::record_dropped(DropReason::QueueClosed);
-            false
-        }
-    }
-}
-
-fn application_targets(workload: &WorkloadSpec, plan: &WorkloadPlan) -> ApplicationTargets {
-    let mut targets = ApplicationTargets::default();
-    for resource in &plan.resources {
-        if workload.resources[resource.resource].behavior == ResourceBehavior::MasterLease {
-            continue;
-        }
-        targets.creates = targets.creates.saturating_add(resource.count);
-        targets.updates = targets
-            .updates
-            .saturating_add(resource.count.saturating_mul(resource.update_amplification));
-    }
-    targets
-}
-
-fn combine_errors(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (first, None) | (None, first) => first,
-    }
-}
-
-pub async fn run(config: RuntimeConfig, client: ClientBundle) -> RunReport {
-    run_with_ctrl_c(config, client, Box::pin(tokio::signal::ctrl_c())).await
-}
-
-async fn run_with_ctrl_c(
-    config: RuntimeConfig,
-    client: ClientBundle,
-    mut ctrl_c: CtrlCFuture,
-) -> RunReport {
-    let accounting = RunAccounting::new();
-    if config.queue_capacity < config.workers {
-        return accounting.report(
-            RunTargets::default(),
-            false,
-            false,
-            Some(format!(
-                "queue_capacity ({}) must be at least workers ({})",
-                config.queue_capacity, config.workers
-            )),
-        );
-    }
-    let scheduler = Scheduler::new(&config);
-    let plan = match WorkloadPlan::build(&scheduler.workload) {
-        Ok(plan) => plan,
-        Err(error) => return accounting.report(RunTargets::default(), false, false, Some(error)),
-    };
-    let targets = RunTargets {
-        bootstrap: scheduler.nodes as u64
-            * if scheduler.workload.nodes.node_lease_enabled {
-                3
-            } else {
-                2
-            },
-        application: application_targets(&scheduler.workload, &plan),
-        range_requests: range_request_total(&scheduler.workload, scheduler.seed),
-    };
-    let queue_capacity = config.queue_capacity.max(1);
-    let workers_count = config.workers.max(1);
-    let mut senders = Vec::with_capacity(workers_count);
-    let mut worker_tasks = JoinSet::new();
-    let latest_revision = Arc::new(AtomicI64::new(0));
-    let cas_conflicts = Arc::new(AtomicU64::new(config.workload.cas_conflicts));
-    let lease_epoch = TokioInstant::now();
-    let mut stats = ScheduleStats::default();
-    let pools: Arc<HashMap<String, Arc<SharedPool>>> = Arc::new(
-        config
-            .workload
-            .etcd_lease_pools
-            .iter()
-            .map(|spec| {
-                let pool = lease_pool(spec);
-                let name = PoolName::new(spec.name.clone()).expect("validated lease pool label");
-                (
-                    spec.name.clone(),
-                    Arc::new(SharedPool {
-                        name,
-                        pool: Mutex::new(pool),
-                    }),
-                )
-            })
-            .collect(),
-    );
-    let base_capacity = queue_capacity / workers_count;
-    let extra_capacity = queue_capacity % workers_count;
-    for worker_index in 0..workers_count {
-        let capacity = base_capacity + if worker_index < extra_capacity { 1 } else { 0 };
-        let (tx, rx) = mpsc::channel(capacity.max(1));
-        senders.push(tx);
-        worker_tasks.spawn(worker_loop(
-            rx,
-            client.clone(),
-            config.workload.clone(),
-            config.operation_timeout,
-            pools.clone(),
-            latest_revision.clone(),
-            lease_epoch,
-            cas_conflicts.clone(),
-        ));
-    }
-
-    let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
-        nodes: scheduler.nodes,
-        lease_interval: Duration::from_secs_f64(scheduler.workload.nodes.lease_interval_s),
-        lease_jitter: scheduler.workload.nodes.lease_jitter,
-        status_interval: Duration::from_secs_f64(scheduler.workload.nodes.status_interval_s),
-        seed: scheduler.seed,
-        node_lease_enabled: scheduler.workload.nodes.node_lease_enabled,
-    });
-    let mut bootstrap_interrupted = false;
-    let mut bootstrap_acks = Vec::with_capacity(scheduler.nodes.saturating_mul(3));
-    'bootstrap_send: for heartbeat in planner.bootstrap() {
-        let shard = stable_shard(heartbeat.key.as_bytes(), workers_count);
-        let (done_tx, done_rx) = oneshot::channel();
-        let resource = if matches!(heartbeat.kind, HeartbeatItemKind::NodeLeaseCreate) {
-            ResourceName::new("node_leases")
-        } else {
-            ResourceName::new("nodes")
-        }
-        .expect("validated heartbeat metric label");
-        let operation = if matches!(
-            heartbeat.kind,
-            HeartbeatItemKind::NodeCreate | HeartbeatItemKind::NodeLeaseCreate
-        ) {
-            Operation::Create
-        } else {
-            Operation::Update
-        };
-        let mut item = WorkItem::Bootstrap {
-            item: heartbeat,
-            done: done_tx,
-            accounting: tracked(&accounting, WorkClass::Bootstrap),
-        };
-        metrics::record_scheduled(operation, &resource);
-        stats.scheduled = stats.scheduled.saturating_add(1);
-        let send_result = {
-            let result = tokio::select! {
-                _ = &mut ctrl_c => {
-                    item.mark_unissued();
-                    bootstrap_interrupted = true;
-                    None
-                }
-                result = senders[shard].reserve() => Some(result),
-            };
-            match result {
-                Some(Ok(permit)) => {
-                    item.mark_accepted();
-                    permit.send(item);
-                    bootstrap_acks.push(done_rx);
-                    Ok(())
-                }
-                Some(Err(_)) => {
-                    item.mark_dropped(DropReason::QueueClosed);
-                    metrics::record_dropped(DropReason::QueueClosed);
-                    Err(())
-                }
-                None => break 'bootstrap_send,
-            }
-        };
-        if send_result.is_err() {
-            abort_worker_tasks(senders, worker_tasks, pools).await;
-            return accounting.report(
-                targets,
-                false,
-                false,
-                Some("bootstrap worker queue closed".to_string()),
-            );
-        }
-    }
-    if !bootstrap_interrupted {
-        'bootstrap_ack: for done_rx in bootstrap_acks {
-            let result = tokio::select! {
-                _ = &mut ctrl_c => {
-                    bootstrap_interrupted = true;
-                    break 'bootstrap_ack;
-                }
-                result = done_rx => result,
-            };
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    abort_worker_tasks(senders, worker_tasks, pools).await;
-                    return accounting.report(
-                        targets,
-                        false,
-                        false,
-                        Some(format!("bootstrap: {error}")),
-                    );
-                }
-                Err(_) => {
-                    abort_worker_tasks(senders, worker_tasks, pools).await;
-                    return accounting.report(
-                        targets,
-                        false,
-                        false,
-                        Some("bootstrap worker closed".to_string()),
-                    );
-                }
-            }
-        }
-    }
-    if !bootstrap_allows_main_load(bootstrap_interrupted) {
-        abort_worker_tasks(senders, worker_tasks, pools).await;
-        return accounting.report(targets, true, false, None);
-    }
-
-    let create_result = tokio::select! {
-        _ = &mut ctrl_c => None,
-        result = run_create_phase(
-            &scheduler.workload,
-            &plan,
-            &senders,
-            workers_count,
-            config.operation_timeout,
-            &accounting,
-        ) => Some(result),
-    };
-    match create_result {
-        Some(Ok(scheduled)) => stats.scheduled = stats.scheduled.saturating_add(scheduled),
-        Some(Err(error)) => {
-            abort_worker_tasks(senders, worker_tasks, pools).await;
-            return accounting.report(targets, false, false, Some(error));
-        }
-        None => {
-            abort_worker_tasks(senders, worker_tasks, pools).await;
-            return accounting.report(targets, true, false, None);
-        }
-    }
-
-    let (watch_shutdown, mut watch_tasks, ready_receivers) =
-        spawn_watches(&client, &scheduler.workload.watches);
-    if let Err(error) = wait_for_watch_ready(
-        &mut watch_tasks,
-        ready_receivers,
-        config.operation_timeout,
-        &mut ctrl_c,
-    )
-    .await
-    {
-        let interrupted = error.starts_with("interrupted while waiting");
-        abort_worker_tasks(senders, worker_tasks, pools).await;
-        let (stop_result, interrupted) = stop_watches_with_ctrl(
-            watch_shutdown,
-            watch_tasks,
-            config.operation_timeout,
-            &mut ctrl_c,
-            interrupted,
-        )
-        .await;
-        return accounting.report(
-            targets,
-            interrupted,
-            false,
-            combine_errors(Some(error), stop_result.err()),
-        );
-    }
-
-    let duration = scheduler.duration();
-    let started = TokioInstant::now();
-    let update_task = tokio::spawn(run_update_phase(
-        scheduler.workload.clone(),
-        plan,
-        senders.clone(),
-        workers_count,
-        scheduler.seed,
-        started,
-        duration,
-        Arc::clone(&accounting),
-    ));
-    let mut ranges = RateCursor::new(&scheduler.workload, scheduler.seed, 0xB2);
-    let mut range_producer = RangeProducer::new(scheduler.workload.ranges.iter().map(|r| r.weight));
-    let weights: Vec<f64> = scheduler.workload.ranges.iter().map(|r| r.weight).collect();
-    let prefix_total = exact_prefix_total(
-        range_producer.clone(),
-        &weights,
-        &scheduler.workload.ranges,
-        ranges.total(),
-    );
-    let mut range_shapes = match range_shape_plan(&scheduler.workload, prefix_total) {
-        Ok(plan) => plan,
-        Err(error) => {
-            update_task.abort();
-            let _ = update_task.await;
-            abort_worker_tasks(senders, worker_tasks, pools).await;
-            let (stop_result, interrupted) = stop_watches_with_ctrl(
-                watch_shutdown,
-                watch_tasks,
-                config.operation_timeout,
-                &mut ctrl_c,
-                false,
-            )
-            .await;
-            return accounting.report(
-                targets,
-                interrupted,
-                false,
-                combine_errors(Some(error), stop_result.err()),
-            );
-        }
-    };
-    let mut update_task = Some(update_task);
-    let mut heap = BinaryHeap::new();
-    let mut sequence = 0u64;
-    let push = |at: Duration,
-                rank: u8,
-                source: Source,
-                heap: &mut BinaryHeap<Scheduled>,
-                sequence: &mut u64| {
-        heap.push(Scheduled {
-            at,
-            rank,
-            sequence: *sequence,
-            source,
-        });
-        *sequence = sequence.wrapping_add(1);
-    };
-    if let Some((at, _)) = ranges.next() {
-        push(at, 2, Source::Range, &mut heap, &mut sequence);
-    }
-    if scheduler.workload.nodes.node_lease_enabled {
-        for node in 0..scheduler.nodes {
-            if let Some(lease_at) = planner.next_lease_at(Duration::ZERO, node, 0, duration) {
-                push(
-                    lease_at,
-                    0,
-                    Source::NodeLease(node),
-                    &mut heap,
-                    &mut sequence,
-                );
-            }
-        }
-    }
-    for node in 0..scheduler.nodes {
-        if let Some(status_at) = planner.initial_status_at(node, duration) {
-            push(
-                status_at,
-                0,
-                Source::NodeStatus { node, tick: 0 },
-                &mut heap,
-                &mut sequence,
-            );
-        }
-    }
-    let master_lease_interval = Duration::from_secs_f64(scheduler.workload.master_lease_interval_s);
-    for (resource, spec) in scheduler.workload.resources.iter().enumerate() {
-        if spec.behavior == ResourceBehavior::MasterLease {
-            let count = scheduler
-                .workload
-                .resource_count(spec)
-                .expect("validated masterlease count");
-            if let Some(at) = masterlease_tick_at(master_lease_interval, 0, duration) {
-                for id in 0..count {
-                    push(
-                        at,
-                        0,
-                        Source::MasterLease {
-                            resource,
-                            id,
-                            ordinal: 0,
-                        },
-                        &mut heap,
-                        &mut sequence,
-                    );
-                }
-            }
-        }
-    }
-    let status_total = scheduler.workload.status_count.saturating_sub(1);
-    if status_total > 0 {
-        push(
-            duration.mul_f64(1.0 / status_total as f64),
-            3,
-            Source::Status(1),
-            &mut heap,
-            &mut sequence,
-        );
-    }
-    let compact_interval = Duration::from_secs_f64(scheduler.workload.compact_interval_s);
-    if compact_interval <= duration {
-        push(
-            compact_interval,
-            4,
-            Source::Compact(0),
-            &mut heap,
-            &mut sequence,
-        );
-    }
-    push(duration, 5, Source::PhaseEnd, &mut heap, &mut sequence);
-
-    let mut interrupted = false;
-    let mut schedule_error = None;
-    while let Some(event) = heap.peek().copied() {
-        let deadline = started + event.at;
-        let control = match wait_for_supervised_schedule_event(
-            &mut watch_tasks,
-            &mut worker_tasks,
-            &mut update_task,
-            deadline,
-            &mut ctrl_c,
-        )
-        .await
-        {
-            Ok(control) => control,
-            Err(error) => {
-                schedule_error = Some(error);
-                break;
-            }
-        };
-        match control {
-            SupervisedScheduleControl::Deadline => {
-                heap.pop();
-            }
-            SupervisedScheduleControl::Interrupted => {
-                interrupted = true;
-                break;
-            }
-            SupervisedScheduleControl::UpdateFinished(result) => {
-                update_task.take();
-                #[cfg(test)]
-                note_update_finished(&scheduler.workload.name);
-                if let Err(error) = result {
-                    schedule_error = Some(error);
-                    break;
-                }
-                // A completed producer must not consume the pending timed event.
-                continue;
-            }
-        }
-        match event.source {
-            Source::PhaseEnd => {}
-            Source::Range => {
-                if let Some((at, _)) = ranges.next() {
-                    push(at, 2, Source::Range, &mut heap, &mut sequence);
-                }
-                if let Some(index) = range_producer.next(&weights) {
-                    let mut request =
-                        range_request(&scheduler.workload.ranges[index], event.sequence);
-                    if scheduler.workload.ranges[index].kind == "prefix" {
-                        range_shapes.apply(&mut request);
-                    }
-                    let label = ResourceName::new("range").expect("static metric label");
-                    metrics::record_scheduled(Operation::Read, &label);
-                    stats.scheduled = stats.scheduled.saturating_add(1);
-                    try_enqueue(
-                        &senders[stable_shard(&request.key, workers_count)],
-                        WorkItem::Range {
-                            request,
-                            selector_keep_every: scheduler.workload.ranges[index]
-                                .selector_keep_every,
-                            target: scheduler.workload.ranges[index].limit,
-                            accounting: tracked(&accounting, WorkClass::Range),
-                        },
-                        &mut stats,
-                    );
-                }
-            }
-            Source::MasterLease {
-                resource,
-                id,
-                ordinal,
-            } => {
-                let spec = &scheduler.workload.resources[resource];
-                let operation = ResourceOperation::GuaranteedUpdate;
-                let key = resource_key(spec, id);
-                let label = ResourceName::try_from(spec.name.as_str()).map_err(|e| e.to_string());
-                let Ok(label) = label else {
-                    schedule_error = Some("masterlease metric label is invalid".to_string());
-                    break;
-                };
-                metrics::record_scheduled(operation_metric(operation), &label);
-                stats.scheduled = stats.scheduled.saturating_add(1);
-                try_enqueue(
-                    &senders[stable_shard(&key, workers_count)],
-                    WorkItem::Txn {
-                        resource,
-                        key: key.clone(),
-                        operation,
-                        value: resource_value(spec, id, ordinal),
-                        pool: spec.lease_pool.clone(),
-                        accounting: tracked(&accounting, WorkClass::MasterLease),
-                    },
-                    &mut stats,
-                );
-                if let Some(at) = masterlease_tick_at(master_lease_interval, ordinal + 1, duration)
-                {
-                    push(
-                        at,
-                        0,
-                        Source::MasterLease {
-                            resource,
-                            id,
-                            ordinal: ordinal + 1,
-                        },
-                        &mut heap,
-                        &mut sequence,
-                    );
-                }
-            }
-            Source::NodeLease(node) => {
-                let item = HeartbeatItem {
-                    node,
-                    kind: HeartbeatItemKind::NodeLeaseRenew,
-                    key: format!("/registry/leases/kube-node-lease/node-{node:04}"),
-                    at: event.at,
-                };
-                let key = item.key.clone();
-                let label = ResourceName::new("node_leases").expect("static metric label");
-                metrics::record_scheduled(Operation::Update, &label);
-                stats.scheduled = stats.scheduled.saturating_add(1);
-                try_enqueue(
-                    &senders[stable_shard(key.as_bytes(), workers_count)],
-                    WorkItem::Heartbeat {
-                        item,
-                        accounting: tracked(&accounting, WorkClass::Heartbeat),
-                    },
-                    &mut stats,
-                );
-                if let Some(next) = planner.next_lease_at(event.at, node, event.sequence, duration)
-                {
-                    push(next, 0, Source::NodeLease(node), &mut heap, &mut sequence);
-                }
-            }
-            Source::NodeStatus { node, tick } => {
-                let item = HeartbeatItem {
-                    node,
-                    kind: HeartbeatItemKind::NodeStatus,
-                    key: format!("/registry/minions/node-{node:04}"),
-                    at: event.at,
-                };
-                let key = item.key.clone();
-                let label = ResourceName::new("nodes").expect("static metric label");
-                metrics::record_scheduled(Operation::Update, &label);
-                stats.scheduled = stats.scheduled.saturating_add(1);
-                try_enqueue(
-                    &senders[stable_shard(key.as_bytes(), workers_count)],
-                    WorkItem::Heartbeat {
-                        item,
-                        accounting: tracked(&accounting, WorkClass::Heartbeat),
-                    },
-                    &mut stats,
-                );
-                if let Some(next_at) = planner.next_status_at(event.at, duration) {
-                    push(
-                        next_at,
-                        0,
-                        Source::NodeStatus {
-                            node,
-                            tick: tick + 1,
-                        },
-                        &mut heap,
-                        &mut sequence,
-                    );
-                }
-            }
-            Source::Status(index) => {
-                if index <= status_total {
-                    let label = ResourceName::new("status").expect("static metric label");
-                    metrics::record_scheduled(Operation::Read, &label);
-                    stats.scheduled = stats.scheduled.saturating_add(1);
-                    let shard = index as usize % workers_count;
-                    try_enqueue(
-                        &senders[shard],
-                        WorkItem::Status {
-                            accounting: tracked(&accounting, WorkClass::Status),
-                        },
-                        &mut stats,
-                    );
-                    if index < status_total {
-                        push(
-                            duration.mul_f64((index + 1) as f64 / status_total as f64),
-                            3,
-                            Source::Status(index + 1),
-                            &mut heap,
-                            &mut sequence,
-                        );
-                    }
-                }
-            }
-            Source::Compact(tick) => {
-                let compact_key =
-                    ResourceName::new("compact_rev_key").expect("static metric label");
-                metrics::record_scheduled(
-                    if tick == 0 {
-                        Operation::Create
-                    } else {
-                        Operation::Update
-                    },
-                    &compact_key,
-                );
-                stats.scheduled = stats.scheduled.saturating_add(1);
-                try_enqueue(
-                    &senders[stable_shard(b"compact_rev_key", workers_count)],
-                    WorkItem::CompactTick {
-                        accounting: tracked(&accounting, WorkClass::Compact),
-                    },
-                    &mut stats,
-                );
-                let next = event.at.saturating_add(compact_interval);
-                if next <= duration {
-                    push(next, 4, Source::Compact(tick + 1), &mut heap, &mut sequence);
-                }
-            }
-        }
-    }
-
-    let schedule_complete = !interrupted && schedule_error.is_none() && heap.is_empty();
-    let join_deadline = TokioInstant::now() + config.operation_timeout;
-    while !interrupted && schedule_error.is_none() && update_task.is_some() {
-        match wait_for_supervised_schedule_event(
-            &mut watch_tasks,
-            &mut worker_tasks,
-            &mut update_task,
-            join_deadline,
-            &mut ctrl_c,
-        )
-        .await
-        {
-            Ok(SupervisedScheduleControl::UpdateFinished(result)) => {
-                update_task.take();
-                schedule_error = result.err();
-            }
-            Ok(SupervisedScheduleControl::Interrupted) => interrupted = true,
-            Ok(SupervisedScheduleControl::Deadline) => {
-                schedule_error = Some("update phase join timed out".to_string());
-            }
-            Err(error) => schedule_error = Some(error),
-        }
-    }
-    if interrupted || schedule_error.is_some() {
-        if let Some(task) = update_task.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        abort_worker_tasks(senders, worker_tasks, pools).await;
-        let (stop_result, interrupted) = stop_watches_with_ctrl(
-            watch_shutdown,
-            watch_tasks,
-            config.operation_timeout,
-            &mut ctrl_c,
-            interrupted,
-        )
-        .await;
-        return accounting.report(
-            targets,
-            interrupted,
-            schedule_complete,
-            combine_errors(schedule_error, stop_result.err()),
-        );
-    }
-
-    // Keep watches live while accepted work drains; both teardown stages
-    // continue observing the same cancellation future used during dispatch.
-    let (drain_result, interrupted) = drain_worker_tasks(
-        senders,
-        worker_tasks,
-        pools,
-        config.operation_timeout,
-        &mut ctrl_c,
-    )
-    .await;
-    let (stop_result, interrupted) = stop_watches_with_ctrl(
-        watch_shutdown,
-        watch_tasks,
-        config.operation_timeout,
-        &mut ctrl_c,
-        interrupted,
-    )
-    .await;
-    accounting.report(
-        targets,
-        interrupted,
-        schedule_complete,
-        combine_errors(drain_result.err(), stop_result.err()),
-    )
-}
-fn bootstrap_allows_main_load(interrupted: bool) -> bool {
-    !interrupted
-}
 
 fn update_revision(latest_revision: &AtomicI64, revision: i64) {
     let previous = latest_revision.fetch_max(revision, AtomicOrdering::Relaxed);
     metrics::set_revision(previous.max(revision));
 }
 
-async fn abort_worker_tasks(
-    senders: Vec<mpsc::Sender<WorkItem>>,
-    mut worker_tasks: JoinSet<Result<(), String>>,
-    pools: Arc<HashMap<String, Arc<SharedPool>>>,
-) {
-    drop(senders);
-    worker_tasks.abort_all();
-    while worker_tasks.join_next().await.is_some() {}
-    drop(pools);
-}
-
-async fn drain_worker_tasks(
-    senders: Vec<mpsc::Sender<WorkItem>>,
-    mut worker_tasks: JoinSet<Result<(), String>>,
-    pools: Arc<HashMap<String, Arc<SharedPool>>>,
-    timeout: Duration,
-    ctrl_c: &mut CtrlCFuture,
-) -> (Result<(), String>, bool) {
-    drop(senders);
-    let deadline = TokioInstant::now() + timeout;
-    let mut errors = Vec::new();
-    let mut interrupted = false;
-    while !worker_tasks.is_empty() {
-        if interrupted {
-            worker_tasks.abort_all();
-            while worker_tasks.join_next().await.is_some() {}
-            break;
-        }
-        tokio::select! {
-            biased;
-            _ = ctrl_c.as_mut() => {
-                interrupted = true;
-            }
-            result = worker_tasks.join_next() => {
-                match result {
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => {
-                        push_bounded_error(&mut errors, format!("worker failed: {error}"));
-                    }
-                    Some(Err(error)) => {
-                        push_bounded_error(&mut errors, format!("worker task failed: {error}"));
-                    }
-                    None => break,
-                }
-            }
-            _ = time::sleep_until(deadline) => {
-                worker_tasks.abort_all();
-                while worker_tasks.join_next().await.is_some() {}
-                push_bounded_error(&mut errors, "worker drain timed out".to_string());
-                break;
-            }
-        }
-    }
-    drop(pools);
-    let result = if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    };
-    (result, interrupted)
-}
-
-async fn stop_watches_with_ctrl(
-    shutdown: shutdown_watch::Sender<bool>,
-    mut tasks: JoinSet<WatchTaskOutput>,
-    timeout: Duration,
-    ctrl_c: &mut CtrlCFuture,
-    mut interrupted: bool,
-) -> (Result<(), String>, bool) {
-    let _ = shutdown.send(true);
-    let deadline = TokioInstant::now() + timeout;
-    let mut errors = Vec::new();
-    while !tasks.is_empty() {
-        tokio::select! {
-            biased;
-            _ = ctrl_c.as_mut(), if !interrupted => interrupted = true,
-            result = tasks.join_next() => {
-                match result {
-                    Some(Ok((name, result))) => {
-                        if let Some(error) = watch_failure(&name, result) {
-                            push_bounded_error(&mut errors, error);
-                        }
-                    }
-                    Some(Err(error)) => push_bounded_error(
-                        &mut errors,
-                        format!("watch task failed during shutdown: {error}"),
-                    ),
-                    None => break,
-                }
-            }
-            _ = time::sleep_until(deadline) => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                push_bounded_error(&mut errors, "watch shutdown timed out".to_string());
-                break;
-            }
-        }
-    }
-    let result = if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    };
-    (result, interrupted)
-}
-
-fn lease_pool(spec: &EtcdLeasePoolSpec) -> LeasePool {
-    LeasePool::new(LeasePoolConfig {
-        // WorkloadSpec::validate rejects non-integral/overflowing values.
-        object_ttl: Duration::from_secs(spec.object_ttl_s),
-        reuse_window: Duration::from_secs(spec.reuse_s),
-        max_objects: spec.max_objects,
-    })
-}
-async fn worker_loop(
-    mut receiver: mpsc::Receiver<WorkItem>,
-    client: ClientBundle,
-    workload: WorkloadSpec,
-    timeout: Duration,
-    pools: Arc<HashMap<String, Arc<SharedPool>>>,
-    latest_revision: Arc<AtomicI64>,
-    lease_epoch: TokioInstant,
-    cas_conflicts: Arc<AtomicU64>,
-) -> Result<(), String> {
-    let mut states = HashMap::new();
-    let mut compactor = CompactorState::default();
-    while let Some(mut item) = receiver.recv().await {
-        item.record_dequeue();
-        match item {
-            WorkItem::Txn {
-                resource,
-                key,
-                operation,
-                value,
-                pool,
-                mut accounting,
-            } => {
-                let spec = workload.resources.get(resource).ok_or_else(|| {
-                    let error = format!("unknown resource index {resource}");
-                    accounting
-                        .accounting
-                        .note_error(accounting.class, error.clone());
-                    error
-                })?;
-                let label = ResourceName::try_from(spec.name.as_str()).map_err(|error| {
-                    accounting
-                        .accounting
-                        .note_error(accounting.class, error.to_string());
-                    error.to_string()
-                })?;
-                let operation_started = Instant::now();
-                let lease_pool = if operation.uses_native_lease() {
-                    pool.as_deref()
-                        .and_then(|name| pools.get(name))
-                        .map(|pool| pool.as_ref())
-                } else {
-                    None
-                };
-                let remaining_timeout = timeout.saturating_sub(operation_started.elapsed());
-                let inject_conflict = operation == ResourceOperation::GuaranteedUpdate
-                    && cas_conflicts
-                        .fetch_update(
-                            AtomicOrdering::Relaxed,
-                            AtomicOrdering::Relaxed,
-                            |remaining| remaining.checked_sub(1),
-                        )
-                        .is_ok();
-                let outcome = execute_txn(
-                    &client,
-                    &label,
-                    &mut states,
-                    key,
-                    value,
-                    operation,
-                    inject_conflict,
-                    CasRetryPolicy::until_deadline(),
-                    spec.behavior == ResourceBehavior::MasterLease,
-                    remaining_timeout,
-                    lease_pool,
-                    lease_epoch,
-                    latest_revision.clone(),
-                )
-                .await;
-                if outcome != Outcome::Success {
-                    accounting.accounting.note_error(
-                        accounting.class,
-                        format!("transaction outcome: {}", outcome.as_str()),
-                    );
-                }
-                accounting.mark_complete(outcome);
-            }
-            WorkItem::Range {
-                request,
-                selector_keep_every,
-                target,
-                mut accounting,
-            } => {
-                let selector = configured_range_selector(selector_keep_every, target);
-                let label = ResourceName::new("range").unwrap();
-                let outcome = match execute_range(
-                    &client,
-                    request,
-                    selector,
-                    timeout,
-                    latest_revision.clone(),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        metrics::record_range_result(
-                            result.pages,
-                            result.snapshot_revision,
-                            result.server_count,
-                            &result.last_key,
-                            result.selected,
-                            result.discarded,
-                        );
-                        Outcome::Success
-                    }
-                    Err(error) => {
-                        accounting
-                            .accounting
-                            .note_error(WorkClass::Range, error.message.clone());
-                        error.outcome
-                    }
-                };
-                metrics::record_operation(Operation::Read, &label, outcome);
-                accounting.mark_complete(outcome);
-            }
-            WorkItem::Bootstrap {
-                item,
-                done,
-                mut accounting,
-            } => {
-                let outcome = execute_heartbeat(
-                    &client,
-                    &mut states,
-                    item,
-                    timeout,
-                    workload.nodes.status_retry_limit,
-                    workload.nodes.lease_retry_limit,
-                    latest_revision.clone(),
-                )
-                .await;
-                if outcome != Outcome::Success {
-                    accounting.accounting.note_error(
-                        WorkClass::Bootstrap,
-                        format!("heartbeat outcome: {}", outcome.as_str()),
-                    );
-                }
-                accounting.mark_complete(outcome);
-                let result = if outcome == Outcome::Success {
-                    Ok(())
-                } else {
-                    Err(format!("heartbeat failed: {}", outcome.as_str()))
-                };
-                let _ = done.send(result);
-            }
-            WorkItem::Heartbeat {
-                item,
-                mut accounting,
-            } => {
-                let outcome = execute_heartbeat(
-                    &client,
-                    &mut states,
-                    item,
-                    timeout,
-                    workload.nodes.status_retry_limit,
-                    workload.nodes.lease_retry_limit,
-                    latest_revision.clone(),
-                )
-                .await;
-                if outcome != Outcome::Success {
-                    accounting.accounting.note_error(
-                        WorkClass::Heartbeat,
-                        format!("heartbeat outcome: {}", outcome.as_str()),
-                    );
-                }
-                accounting.mark_complete(outcome);
-            }
-            WorkItem::Status { mut accounting } => {
-                let label = ResourceName::new("status").unwrap();
-                let outcome = execute_status(&client, timeout, latest_revision.clone()).await;
-                if outcome != Outcome::Success {
-                    accounting.accounting.note_error(
-                        WorkClass::Status,
-                        format!("status outcome: {}", outcome.as_str()),
-                    );
-                }
-                metrics::record_operation(Operation::Read, &label, outcome);
-                accounting.mark_complete(outcome);
-            }
-            WorkItem::CompactTick { mut accounting } => {
-                let outcome =
-                    execute_compact_tick(&client, &mut compactor, timeout, latest_revision.clone())
-                        .await;
-                if outcome != Outcome::Success {
-                    accounting.accounting.note_error(
-                        WorkClass::Compact,
-                        format!("compact tick outcome: {}", outcome.as_str()),
-                    );
-                }
-                accounting.mark_complete(outcome);
-            }
-        }
-    }
-    Ok(())
-}
 async fn execute_status(
     client: &ClientBundle,
     timeout: Duration,
@@ -3133,103 +1019,6 @@ async fn execute_compact_tick(
     metrics::record_operation(Operation::Compact, &compact, outcome);
     outcome
 }
-async fn acquire_lease(
-    shared: &SharedPool,
-    client: &ClientBundle,
-    started: TokioInstant,
-    timeout: Duration,
-    latest_revision: Arc<AtomicI64>,
-) -> Result<i64, Outcome> {
-    let now = started.elapsed();
-    let deadline = Instant::now() + timeout;
-    // The upstream lease manager serializes cache decisions and Grant while
-    // holding its mutex; retain that single-flight lifecycle per pool.
-    let mut pool = shared.pool.lock().await;
-    match pool.acquire_at(now) {
-        LeaseEvent::Reuse { lease_id } if lease_id != 0 => {
-            metrics::record_lease_get(&shared.name, "reuse");
-            metrics::set_lease_attached_objects(&shared.name, pool.attached_objects());
-            Ok(lease_id)
-        }
-        LeaseEvent::Reuse { .. } => {
-            metrics::record_lease_get(&shared.name, "error");
-            Err(Outcome::GrpcError)
-        }
-        LeaseEvent::Grant { ttl } => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                metrics::record_lease_get(&shared.name, "timeout");
-                metrics::record_request(Rpc::LeaseGrant, Outcome::Timeout);
-                return Err(Outcome::Timeout);
-            }
-            let ttl_seconds = match i64::try_from(ttl.as_secs()) {
-                Ok(ttl_seconds) => ttl_seconds,
-                Err(_) => {
-                    metrics::record_lease_get(&shared.name, "error");
-                    metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
-                    return Err(Outcome::GrpcError);
-                }
-            };
-            let start = Instant::now();
-            metrics::add_inflight(Rpc::LeaseGrant);
-            let response = time::timeout(
-                remaining,
-                client.lease_grant(LeaseGrantRequest {
-                    ttl: ttl_seconds,
-                    id: 0,
-                }),
-            )
-            .await;
-            metrics::remove_inflight(Rpc::LeaseGrant);
-            metrics::record_request_duration(Rpc::LeaseGrant, start.elapsed());
-            metrics::record_request_bytes(&ResourceName::new("lease").unwrap(), 16);
-            match response {
-                Ok(Ok(response)) if response.id != 0 => {
-                    pool.record_grant(response.id, now);
-                    metrics::record_lease_get(&shared.name, "grant");
-                    metrics::set_lease_attached_objects(&shared.name, 1);
-                    metrics::record_request(Rpc::LeaseGrant, Outcome::Success);
-                    if let Some(header) = response.header {
-                        update_revision(&latest_revision, header.revision);
-                    }
-                    Ok(response.id)
-                }
-                Ok(Ok(_)) => {
-                    metrics::record_lease_get(&shared.name, "error");
-                    metrics::record_request(Rpc::LeaseGrant, Outcome::GrpcError);
-                    Err(Outcome::GrpcError)
-                }
-                Ok(Err(error)) => {
-                    let decision =
-                        error.retry_decision(RpcMethod::LeaseGrant, RequestDisposition::Unknown);
-                    let outcome = match decision {
-                        RetryDecision::ResultUnknown => Outcome::ResultUnknown,
-                        RetryDecision::NotSent | RetryDecision::Retry | RetryDecision::Stop => {
-                            Outcome::GrpcError
-                        }
-                    };
-                    metrics::record_lease_get(
-                        &shared.name,
-                        if outcome == Outcome::ResultUnknown {
-                            "unknown"
-                        } else {
-                            "error"
-                        },
-                    );
-                    metrics::record_request(Rpc::LeaseGrant, outcome);
-                    Err(outcome)
-                }
-                // A local deadline can race with a server-side grant. The
-                // lease id is therefore unknown; never submit another grant.
-                Err(_) => {
-                    metrics::record_lease_get(&shared.name, "unknown");
-                    metrics::record_request(Rpc::LeaseGrant, Outcome::ResultUnknown);
-                    Err(Outcome::ResultUnknown)
-                }
-            }
-        }
-    }
-}
 fn operation_metric(op: ResourceOperation) -> Operation {
     match op {
         ResourceOperation::Create => Operation::Create,
@@ -3266,6 +1055,1009 @@ fn take_storage_attempt(used: &mut u32, limit: u32) -> bool {
     true
 }
 
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = value;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn stable_shard(key: &[u8], workers: usize) -> usize {
+    if workers == 0 {
+        return 0;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    (splitmix64(hash) as usize) % workers
+}
+
+fn stream_identity(stream: &crate::plan::LogicalStreamPlan) -> LogicalStreamIdentity {
+    LogicalStreamIdentity::Application {
+        work_class: stream.work_class,
+        resource: stream.resource,
+    }
+}
+
+fn periodic_identity(kind: PeriodicKind) -> LogicalStreamIdentity {
+    LogicalStreamIdentity::Periodic { kind }
+}
+
+fn resource_name(kind: ResourceKind) -> ResourceName {
+    ResourceName::new(kind.as_str()).expect("fixed resource names are valid metric labels")
+}
+
+fn run_duration(plan: &CompiledPlan) -> Duration {
+    Duration::from_millis(plan.config.load.duration_ms)
+}
+
+fn operation_timeout(plan: &CompiledPlan) -> Duration {
+    Duration::from_millis(plan.config.execution.operation_timeout_ms)
+}
+
+fn request_timeout(plan: &CompiledPlan) -> Duration {
+    Duration::from_millis(plan.config.execution.request_timeout_ms)
+}
+
+fn preparation_timeout(plan: &CompiledPlan) -> Duration {
+    Duration::from_millis(plan.config.execution.preparation_timeout_ms)
+}
+
+fn drain_timeout(plan: &CompiledPlan) -> Duration {
+    Duration::from_millis(plan.config.execution.drain_timeout_ms)
+}
+
+fn watch_teardown_timeout(plan: &CompiledPlan) -> Duration {
+    Duration::from_millis(plan.config.execution.watch_teardown_timeout_ms)
+}
+
+fn nanos(duration: Duration) -> Result<u64, String> {
+    u64::try_from(duration.as_nanos()).map_err(|_| "duration exceeds u64 nanoseconds".into())
+}
+
+fn planned_at(stream: &crate::plan::LogicalStreamPlan, elapsed_ns: u64) -> Result<u64, String> {
+    stream
+        .rate
+        .planned(Duration::from_nanos(elapsed_ns))
+        .map_err(|error| error.to_string())
+}
+
+fn record_missed(
+    recorder: &MeasurementRecorder,
+    identity: LogicalStreamIdentity,
+    count: u64,
+) -> Result<(), String> {
+    if count == 0 {
+        return Ok(());
+    }
+    recorder
+        .record_missed_schedule_before_cutoff(identity, count)
+        .map_err(|error| error.to_string())
+}
+
+fn record_not_offered(
+    recorder: &MeasurementRecorder,
+    identity: LogicalStreamIdentity,
+    count: u64,
+) -> Result<(), String> {
+    if count == 0 {
+        return Ok(());
+    }
+    recorder
+        .record_not_offered_after_stop(identity, count)
+        .map_err(|error| error.to_string())
+}
+fn resource_count(plan: &CompiledPlan, kind: ResourceKind) -> u64 {
+    match kind {
+        ResourceKind::Pods => plan.resource_counts.pods,
+        ResourceKind::Nodes => plan.resource_counts.nodes,
+        ResourceKind::NodeLeases => plan.resource_counts.node_leases,
+        ResourceKind::Deployments => plan.resource_counts.deployments,
+        ResourceKind::ReplicaSets => plan.resource_counts.replicasets,
+        ResourceKind::DaemonSets => plan.resource_counts.daemonsets,
+    }
+}
+
+fn preparation_total(plan: &CompiledPlan) -> u64 {
+    plan.resource_counts
+        .total()
+        .saturating_add(plan.resource_counts.nodes)
+}
+
+async fn enqueue_preparation_item(
+    sender: &mpsc::Sender<WorkItem>,
+    item: WorkItem,
+    deadline: TokioInstant,
+    ctrl_c: &mut CtrlCFuture,
+) -> Result<(), String> {
+    let permit = tokio::select! {
+        biased;
+        _ = ctrl_c.as_mut() => return Err("interrupted during preparation".into()),
+        result = time::timeout_at(deadline, sender.reserve()) => {
+            match result {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => return Err("preparation worker queue closed".into()),
+                Err(_) => return Err("preparation enqueue deadline exceeded".into()),
+            }
+        }
+    };
+    if item.accept()? != TokenAction::Applied {
+        return Err("preparation admission was not applied".into());
+    }
+    permit.send(item);
+    Ok(())
+}
+
+async fn run_preparation(
+    plan: Arc<CompiledPlan>,
+    recorder: &MeasurementRecorder,
+    senders: &[mpsc::Sender<WorkItem>],
+    deadline: TokioInstant,
+    ctrl_c: &mut CtrlCFuture,
+) -> Result<(), String> {
+    let tracker = PreparationTracker::new(preparation_total(&plan));
+    for kind in ResourceKind::ALL {
+        let stream = PreparationStream::Create(kind);
+        let count = resource_count(&plan, kind);
+        for ordinal in 0..count {
+            let token = match recorder
+                .offer_preparation(stream)
+                .map_err(|error| error.to_string())?
+            {
+                OfferResult::Token(token) => token,
+                OfferResult::MissedSchedule
+                | OfferResult::NotOfferedAfterStop
+                | OfferResult::WrongPhase => {
+                    return Err("preparation recorder rejected create token".into());
+                }
+            };
+            let key = plan.resource(kind).key(ordinal);
+            let value = plan.resource(kind).value(ordinal, 0);
+            let item = WorkItem::Txn {
+                resource: kind,
+                key: key.clone(),
+                operation: ResourceOperation::Create,
+                value,
+                token,
+                preparation: Some(tracker.clone()),
+            };
+            let shard = stable_shard(&key, senders.len());
+            metrics::record_scheduled(Operation::Create, &resource_name(kind));
+            if let Err(error) =
+                enqueue_preparation_item(&senders[shard], item, deadline, ctrl_c).await
+            {
+                return Err(error);
+            }
+        }
+    }
+
+    // NodeReady is an ordinary update against each Node key. It is deliberately
+    // queued only after every create has been offered, preserving a deterministic
+    // same-shard create-before-ready order without a native lease barrier.
+    for ordinal in 0..plan.resource_counts.nodes {
+        let token = match recorder
+            .offer_preparation(PreparationStream::NodeReady)
+            .map_err(|error| error.to_string())?
+        {
+            OfferResult::Token(token) => token,
+            OfferResult::MissedSchedule
+            | OfferResult::NotOfferedAfterStop
+            | OfferResult::WrongPhase => {
+                return Err("preparation recorder rejected NodeReady token".into());
+            }
+        };
+        let key = plan.resource(ResourceKind::Nodes).key(ordinal);
+        let value = plan.resource(ResourceKind::Nodes).value(ordinal, 1);
+        let item = WorkItem::Txn {
+            resource: ResourceKind::Nodes,
+            key: key.clone(),
+            operation: ResourceOperation::GuaranteedUpdate,
+            value,
+            token,
+            preparation: Some(tracker.clone()),
+        };
+        let shard = stable_shard(&key, senders.len());
+        metrics::record_scheduled(Operation::Update, &resource_name(ResourceKind::Nodes));
+        if let Err(error) = enqueue_preparation_item(&senders[shard], item, deadline, ctrl_c).await
+        {
+            return Err(error);
+        }
+    }
+
+    tracker.wait(deadline).await
+}
+fn spawn_workers(
+    plan: Arc<CompiledPlan>,
+    client: &ClientBundle,
+) -> (Vec<mpsc::Sender<WorkItem>>, JoinSet<Result<(), String>>) {
+    let workers = usize::try_from(plan.config.execution.workers)
+        .expect("validated worker count must fit usize");
+    let capacity = usize::try_from(plan.config.execution.queue_capacity)
+        .expect("validated queue capacity must fit usize");
+    let base = capacity / workers;
+    let remainder = capacity % workers;
+    let mut senders = Vec::with_capacity(workers);
+    let mut tasks = JoinSet::new();
+    let operation_timeout = operation_timeout(&plan);
+    let latest_revision = Arc::new(AtomicI64::new(0));
+    for index in 0..workers {
+        let queue_capacity = base + usize::from(index < remainder);
+        let (sender, receiver) = mpsc::channel(queue_capacity.max(1));
+        senders.push(sender);
+        let worker_plan = plan.clone();
+        let worker_client = client.clone();
+        let worker_revision = latest_revision.clone();
+        tasks.spawn(async move {
+            worker_loop(
+                receiver,
+                worker_client,
+                worker_plan,
+                operation_timeout,
+                worker_revision,
+            )
+            .await
+        });
+    }
+    (senders, tasks)
+}
+
+async fn abort_workers(
+    senders: Vec<mpsc::Sender<WorkItem>>,
+    mut tasks: JoinSet<Result<(), String>>,
+) {
+    drop(senders);
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn drain_workers(
+    senders: Vec<mpsc::Sender<WorkItem>>,
+    mut tasks: JoinSet<Result<(), String>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    drop(senders);
+    let deadline = TokioInstant::now() + timeout;
+    let mut first_error = None;
+    loop {
+        let joined = match time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                tasks.abort_all();
+                while let Some(joined) = tasks.join_next().await {
+                    if let Err(error) = joined {
+                        if !error.is_cancelled() && first_error.is_none() {
+                            first_error = Some(format!("worker task failed: {error}"));
+                        }
+                    }
+                }
+                return Err(first_error.map_or_else(
+                    || "worker drain deadline exceeded".to_string(),
+                    |error| format!("worker drain deadline exceeded: {error}"),
+                ));
+            }
+        };
+        let Some(joined) = joined else {
+            break;
+        };
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+            Ok(Err(_)) => {}
+            Err(error) if !error.is_cancelled() && first_error.is_none() => {
+                first_error = Some(format!("worker task failed: {error}"));
+            }
+            Err(_) => {}
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn stop_watches(
+    shutdown: shutdown_watch::Sender<bool>,
+    mut tasks: JoinSet<WatchTaskOutput>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let _ = shutdown.send(true);
+    let deadline = TokioInstant::now() + timeout;
+    let mut first_error = None;
+    loop {
+        let joined = match time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                tasks.abort_all();
+                while let Some(joined) = tasks.join_next().await {
+                    if let Err(error) = joined {
+                        if !error.is_cancelled() && first_error.is_none() {
+                            first_error = Some(format!("watch task failed: {error}"));
+                        }
+                    }
+                }
+                return Err(first_error.map_or_else(
+                    || "watch teardown deadline exceeded".to_string(),
+                    |error| format!("watch teardown deadline exceeded: {error}"),
+                ));
+            }
+        };
+        let Some(joined) = joined else {
+            break;
+        };
+        if let Err(error) = joined {
+            if !error.is_cancelled() && first_error.is_none() {
+                first_error = Some(format!("watch task failed: {error}"));
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+fn offer_measurement(
+    recorder: &MeasurementRecorder,
+    identity: LogicalStreamIdentity,
+) -> Result<OfferedMeasurement, String> {
+    match recorder
+        .offer(identity)
+        .map_err(|error| error.to_string())?
+    {
+        OfferResult::Token(token) => Ok(OfferedMeasurement::Token(token)),
+        OfferResult::MissedSchedule => Ok(OfferedMeasurement::MissedSchedule),
+        OfferResult::NotOfferedAfterStop => Ok(OfferedMeasurement::NotOfferedAfterStop),
+        OfferResult::WrongPhase => Err(format!(
+            "measurement offer for {} occurred outside measurement phase",
+            identity.as_str()
+        )),
+    }
+}
+
+fn dispatch_application_item(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    stream: &crate::plan::LogicalStreamPlan,
+    ordinal: u64,
+    sender: &mpsc::Sender<WorkItem>,
+    tick_deadline: TokioInstant,
+    _cutoff_deadline: TokioInstant,
+    tick_end_ns: u64,
+) -> Result<DispatchOutcome, String> {
+    let identity = stream_identity(stream);
+    if TokioInstant::now() >= tick_deadline {
+        return Ok(DispatchOutcome::Missed);
+    }
+    let token = match offer_measurement(recorder, identity)? {
+        OfferedMeasurement::Token(token) => token,
+        OfferedMeasurement::MissedSchedule => return Ok(DispatchOutcome::MissedToken),
+        OfferedMeasurement::NotOfferedAfterStop => return Ok(DispatchOutcome::Stopped),
+    };
+    let item = match stream.work_class {
+        LogicalWorkClass::Update => {
+            let key = plan.resource_key(stream.resource, ordinal, plan.config.seed);
+            let value = plan.resource_value(stream.resource, ordinal, plan.config.seed, ordinal);
+            WorkItem::Txn {
+                resource: stream.resource,
+                key,
+                operation: ResourceOperation::GuaranteedUpdate,
+                value,
+                token,
+                preparation: None,
+            }
+        }
+        LogicalWorkClass::PointGet => WorkItem::Range {
+            request: plan.point_get_request(stream.resource, ordinal, plan.config.seed),
+            selector: RangeSelector::All { target: None },
+            token,
+        },
+        LogicalWorkClass::BoundedList => WorkItem::Range {
+            request: plan
+                .list_request(stream.resource, ordinal, plan.config.seed)
+                .map_err(|error| error.to_string())?,
+            selector: RangeSelector::All {
+                target: Some(plan.config.load.list_limit),
+            },
+            token,
+        },
+    };
+    let operation = match stream.work_class {
+        LogicalWorkClass::Update => Operation::Update,
+        LogicalWorkClass::PointGet | LogicalWorkClass::BoundedList => Operation::Read,
+    };
+    metrics::record_scheduled(operation, &resource_name(stream.resource));
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(())) => {
+            item.drop_for(DropReason::Backpressure)?;
+            return Ok(DispatchOutcome::Dropped);
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            item.drop_for(DropReason::QueueClosed)?;
+            return Err("measurement worker queue closed".into());
+        }
+    };
+    match item.accept_for_tick(tick_end_ns)? {
+        TokenAction::Applied => {
+            permit.send(item);
+            Ok(DispatchOutcome::Accepted)
+        }
+        TokenAction::RejectedAfterTick => Ok(DispatchOutcome::MissedToken),
+        TokenAction::RejectedAfterCutoff => Ok(DispatchOutcome::MissedToken),
+        TokenAction::RejectedAfterStop => Ok(DispatchOutcome::Stopped),
+        TokenAction::AlreadyFinalized => Err("measurement token finalized before admission".into()),
+    }
+}
+
+fn dispatch_periodic_item(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    event: &PeriodicEvent,
+    sender: &mpsc::Sender<WorkItem>,
+    tick_deadline: TokioInstant,
+    _cutoff_deadline: TokioInstant,
+    tick_end_ns: u64,
+) -> Result<DispatchOutcome, String> {
+    let identity = periodic_identity(event.kind);
+    if TokioInstant::now() >= tick_deadline {
+        return Ok(DispatchOutcome::Missed);
+    }
+    let token = match offer_measurement(recorder, identity)? {
+        OfferedMeasurement::Token(token) => token,
+        OfferedMeasurement::MissedSchedule => return Ok(DispatchOutcome::MissedToken),
+        OfferedMeasurement::NotOfferedAfterStop => return Ok(DispatchOutcome::Stopped),
+    };
+    let item = match event.kind {
+        PeriodicKind::NodeLease | PeriodicKind::NodeStatus => {
+            let heartbeat = plan
+                .heartbeat_item(event)
+                .ok_or_else(|| "node periodic event has no heartbeat mapping".to_string())?;
+            let resource = match event.kind {
+                PeriodicKind::NodeLease => ResourceKind::NodeLeases,
+                PeriodicKind::NodeStatus => ResourceKind::Nodes,
+                PeriodicKind::Status | PeriodicKind::Compact => unreachable!(),
+            };
+            WorkItem::Heartbeat {
+                item: heartbeat,
+                resource,
+                token,
+            }
+        }
+        PeriodicKind::Status => WorkItem::Status { token },
+        PeriodicKind::Compact => WorkItem::CompactTick { token },
+    };
+    let (operation, resource) = match event.kind {
+        PeriodicKind::NodeLease => (Operation::Update, ResourceKind::NodeLeases),
+        PeriodicKind::NodeStatus => (Operation::Update, ResourceKind::Nodes),
+        PeriodicKind::Status => (Operation::Read, ResourceKind::Nodes),
+        PeriodicKind::Compact => (Operation::Compact, ResourceKind::Nodes),
+    };
+    metrics::record_scheduled(operation, &resource_name(resource));
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(())) => {
+            item.drop_for(DropReason::Backpressure)?;
+            return Ok(DispatchOutcome::Dropped);
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            item.drop_for(DropReason::QueueClosed)?;
+            return Err("measurement worker queue closed".into());
+        }
+    };
+    match item.accept_for_tick(tick_end_ns)? {
+        TokenAction::Applied => {
+            permit.send(item);
+            Ok(DispatchOutcome::Accepted)
+        }
+        TokenAction::RejectedAfterTick => Ok(DispatchOutcome::MissedToken),
+        TokenAction::RejectedAfterCutoff => Ok(DispatchOutcome::MissedToken),
+        TokenAction::RejectedAfterStop => Ok(DispatchOutcome::Stopped),
+        TokenAction::AlreadyFinalized => Err("measurement token finalized before admission".into()),
+    }
+}
+
+fn skip_application_before(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    state: &mut DispatchState,
+    start_ns: u64,
+) -> Result<(), String> {
+    for (index, stream) in plan.logical_streams.iter().enumerate() {
+        let target = planned_at(stream, start_ns)?;
+        if target > state.next_ordinals[index] {
+            record_missed(
+                recorder,
+                stream_identity(stream),
+                target - state.next_ordinals[index],
+            )?;
+            state.next_ordinals[index] = target;
+        }
+    }
+    Ok(())
+}
+
+fn periodic_event_lower_bound(plan: &CompiledPlan, at_ns: u64) -> usize {
+    let mut low = 0;
+    let mut high = plan.periodic_events.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if plan.periodic_events[middle].at_ns < at_ns {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn periodic_index_lower_bound(index: &[usize], position: usize) -> usize {
+    let mut low = 0;
+    let mut high = index.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if index[middle] < position {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn periodic_counts_between(
+    plan: &CompiledPlan,
+    start: usize,
+    end: usize,
+) -> Result<[u64; 4], String> {
+    let mut counts = [0; 4];
+    for kind in [
+        PeriodicKind::NodeLease,
+        PeriodicKind::NodeStatus,
+        PeriodicKind::Status,
+        PeriodicKind::Compact,
+    ] {
+        let index = &plan.periodic_indexes[kind.index()];
+        let first = periodic_index_lower_bound(index, start);
+        let last = periodic_index_lower_bound(index, end);
+        counts[kind.index()] =
+            u64::try_from(last.saturating_sub(first)).map_err(|_| "periodic count exceeds u64")?;
+    }
+    Ok(counts)
+}
+
+fn mark_periodic_range(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    state: &mut DispatchState,
+    end: usize,
+    missed: bool,
+) -> Result<(), String> {
+    let start = state.periodic_cursor.min(end);
+    if start == end {
+        state.periodic_cursor = end;
+        return Ok(());
+    }
+    let counts = periodic_counts_between(plan, start, end)?;
+    for kind in [
+        PeriodicKind::NodeLease,
+        PeriodicKind::NodeStatus,
+        PeriodicKind::Status,
+        PeriodicKind::Compact,
+    ] {
+        let count = counts[kind.index()];
+        if count == 0 {
+            continue;
+        }
+        if missed {
+            record_missed(recorder, periodic_identity(kind), count)?;
+        } else {
+            record_not_offered(recorder, periodic_identity(kind), count)?;
+        }
+    }
+    state.periodic_cursor = end;
+    Ok(())
+}
+
+fn mark_application_range(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    state: &mut DispatchState,
+    targets: &[u64],
+    missed: bool,
+) -> Result<(), String> {
+    for (index, stream) in plan.logical_streams.iter().enumerate() {
+        let remaining = targets[index].saturating_sub(state.next_ordinals[index]);
+        if remaining == 0 {
+            continue;
+        }
+        if missed {
+            record_missed(recorder, stream_identity(stream), remaining)?;
+        } else {
+            record_not_offered(recorder, stream_identity(stream), remaining)?;
+        }
+        state.next_ordinals[index] = targets[index];
+    }
+    Ok(())
+}
+
+fn dispatch_tick(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    senders: &[mpsc::Sender<WorkItem>],
+    state: &mut DispatchState,
+    tick_start_ns: u64,
+    tick_end_ns: u64,
+    tick_deadline: TokioInstant,
+    _cutoff_deadline: TokioInstant,
+) -> Result<(), String> {
+    let mut targets = Vec::with_capacity(plan.logical_streams.len());
+    for (index, stream) in plan.logical_streams.iter().enumerate() {
+        let start = planned_at(stream, tick_start_ns)?;
+        let end = planned_at(stream, tick_end_ns)?;
+        if state.next_ordinals[index] < start {
+            record_missed(
+                recorder,
+                stream_identity(stream),
+                start - state.next_ordinals[index],
+            )?;
+            state.next_ordinals[index] = start;
+        }
+        targets.push(end);
+    }
+
+    let periodic_start = periodic_event_lower_bound(plan, tick_start_ns);
+    if state.periodic_cursor < periodic_start {
+        mark_periodic_range(plan, recorder, state, periodic_start, true)?;
+    }
+    let periodic_end = periodic_event_lower_bound(plan, tick_end_ns);
+
+    loop {
+        if TokioInstant::now() >= tick_deadline {
+            mark_application_range(plan, recorder, state, &targets, true)?;
+            mark_periodic_range(plan, recorder, state, periodic_end, true)?;
+            break;
+        }
+
+        let mut progressed = false;
+        let mut stop_dispatch = false;
+        for (index, stream) in plan.logical_streams.iter().enumerate() {
+            if state.next_ordinals[index] >= targets[index] {
+                continue;
+            }
+            progressed = true;
+            let ordinal = state.next_ordinals[index];
+            state.next_ordinals[index] = state.next_ordinals[index].saturating_add(1);
+            let key = plan.resource_key(stream.resource, ordinal, plan.config.seed);
+            let shard = stable_shard(&key, senders.len());
+            match dispatch_application_item(
+                plan,
+                recorder,
+                stream,
+                ordinal,
+                &senders[shard],
+                tick_deadline,
+                _cutoff_deadline,
+                tick_end_ns,
+            )? {
+                DispatchOutcome::Accepted | DispatchOutcome::Dropped => {}
+                DispatchOutcome::Missed => {
+                    record_missed(recorder, stream_identity(stream), 1)?;
+                    mark_application_range(plan, recorder, state, &targets, true)?;
+                    mark_periodic_range(plan, recorder, state, periodic_end, true)?;
+                    stop_dispatch = true;
+                    break;
+                }
+                DispatchOutcome::MissedToken => {
+                    mark_application_range(plan, recorder, state, &targets, true)?;
+                    mark_periodic_range(plan, recorder, state, periodic_end, true)?;
+                    stop_dispatch = true;
+                    break;
+                }
+                DispatchOutcome::Stopped => {
+                    mark_application_range(plan, recorder, state, &targets, false)?;
+                    mark_periodic_range(plan, recorder, state, periodic_end, false)?;
+                    stop_dispatch = true;
+                    break;
+                }
+            }
+        }
+        if stop_dispatch {
+            break;
+        }
+
+        if state.periodic_cursor < periodic_end {
+            progressed = true;
+            let event = &plan.periodic_events[state.periodic_cursor];
+            let shard = plan
+                .heartbeat_item(event)
+                .map(|item| stable_shard(item.key.as_bytes(), senders.len()))
+                .unwrap_or(0);
+            match dispatch_periodic_item(
+                plan,
+                recorder,
+                event,
+                &senders[shard],
+                tick_deadline,
+                _cutoff_deadline,
+                tick_end_ns,
+            )? {
+                DispatchOutcome::Accepted | DispatchOutcome::Dropped => {
+                    state.periodic_cursor += 1;
+                }
+                DispatchOutcome::Missed => {
+                    record_missed(recorder, periodic_identity(event.kind), 1)?;
+                    state.periodic_cursor += 1;
+                    mark_application_range(plan, recorder, state, &targets, true)?;
+                    mark_periodic_range(plan, recorder, state, periodic_end, true)?;
+                    break;
+                }
+                DispatchOutcome::MissedToken => {
+                    state.periodic_cursor += 1;
+                    mark_application_range(plan, recorder, state, &targets, true)?;
+                    mark_periodic_range(plan, recorder, state, periodic_end, true)?;
+                    break;
+                }
+                DispatchOutcome::Stopped => {
+                    state.periodic_cursor += 1;
+                    mark_application_range(plan, recorder, state, &targets, false)?;
+                    mark_periodic_range(plan, recorder, state, periodic_end, false)?;
+                    break;
+                }
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+    }
+    Ok(())
+}
+#[derive(Debug)]
+enum ScheduleControl {
+    Tick,
+    Supervisor,
+    Interrupted,
+}
+
+async fn wait_for_schedule_event(
+    worker_tasks: &mut JoinSet<Result<(), String>>,
+    watch_tasks: &mut JoinSet<WatchTaskOutput>,
+    deadline: TokioInstant,
+    ctrl_c: &mut CtrlCFuture,
+) -> Result<ScheduleControl, String> {
+    tokio::select! {
+        biased;
+        _ = ctrl_c.as_mut() => Ok(ScheduleControl::Interrupted),
+        worker_result = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
+            match worker_result {
+                Some(Ok(Ok(()))) => Err("worker exited before the run ended".into()),
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => Err(format!("worker task failed: {error}")),
+                None => Err("all workers exited before the run ended".into()),
+            }
+        }
+        watch_result = watch_tasks.join_next(), if !watch_tasks.is_empty() => {
+            match watch_result {
+                Some(Ok((_name, _result))) => Ok(ScheduleControl::Supervisor),
+                Some(Err(error)) => Err(format!("watch task failed: {error}")),
+                None => Err("all watch tasks exited before the run ended".into()),
+            }
+        }
+        _ = time::sleep_until(deadline) => Ok(ScheduleControl::Tick),
+    }
+}
+fn mark_remaining_missed(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    state: &mut DispatchState,
+) -> Result<(), String> {
+    for (index, stream) in plan.logical_streams.iter().enumerate() {
+        let remaining = stream.planned.saturating_sub(state.next_ordinals[index]);
+        record_missed(recorder, stream_identity(stream), remaining)?;
+        state.next_ordinals[index] = stream.planned;
+    }
+    mark_periodic_range(plan, recorder, state, plan.periodic_events.len(), true)
+}
+
+fn mark_remaining_not_offered(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    state: &mut DispatchState,
+) -> Result<(), String> {
+    for (index, stream) in plan.logical_streams.iter().enumerate() {
+        let remaining = stream.planned.saturating_sub(state.next_ordinals[index]);
+        record_not_offered(recorder, stream_identity(stream), remaining)?;
+        state.next_ordinals[index] = stream.planned;
+    }
+    mark_periodic_range(plan, recorder, state, plan.periodic_events.len(), false)
+}
+
+enum DispatchExit {
+    Completed(DispatchState),
+    Interrupted(DispatchState),
+    Failed(String, DispatchState),
+}
+
+async fn dispatch_until(
+    plan: &CompiledPlan,
+    recorder: &MeasurementRecorder,
+    senders: &[mpsc::Sender<WorkItem>],
+    worker_tasks: &mut JoinSet<Result<(), String>>,
+    watch_tasks: &mut JoinSet<WatchTaskOutput>,
+    started: TokioInstant,
+    cutoff: TokioInstant,
+    ctrl_c: &mut CtrlCFuture,
+) -> DispatchExit {
+    let duration_ns = match nanos(run_duration(plan)) {
+        Ok(value) => value,
+        Err(error) => return DispatchExit::Failed(error, DispatchState::new(plan)),
+    };
+    let tick_ns = nanos(crate::plan::PACING_TICK).expect("1ms fits u64 nanoseconds");
+    let mut state = DispatchState::new(plan);
+
+    while state.next_tick.saturating_mul(tick_ns) < duration_ns {
+        let mut tick_start_ns = state.next_tick.saturating_mul(tick_ns);
+        let mut tick_end_ns = tick_start_ns.saturating_add(tick_ns).min(duration_ns);
+        let mut tick_deadline = started + Duration::from_nanos(tick_end_ns);
+        let wait_deadline = started + Duration::from_nanos(tick_start_ns);
+        loop {
+            match wait_for_schedule_event(
+                worker_tasks,
+                watch_tasks,
+                wait_deadline.min(cutoff),
+                ctrl_c,
+            )
+            .await
+            {
+                Ok(ScheduleControl::Interrupted) => {
+                    return DispatchExit::Interrupted(state);
+                }
+                Ok(ScheduleControl::Supervisor) if TokioInstant::now() < wait_deadline => {
+                    continue;
+                }
+                Ok(ScheduleControl::Supervisor | ScheduleControl::Tick) => break,
+                Err(error) => return DispatchExit::Failed(error, state),
+            }
+        }
+
+        let elapsed_ns =
+            nanos(TokioInstant::now().saturating_duration_since(started)).unwrap_or(u64::MAX);
+        if elapsed_ns >= duration_ns {
+            return match mark_remaining_missed(plan, recorder, &mut state) {
+                Ok(()) => DispatchExit::Completed(state),
+                Err(error) => DispatchExit::Failed(error, state),
+            };
+        }
+        let current_tick = elapsed_ns / tick_ns;
+        if current_tick > state.next_tick {
+            let skipped_start_ns = current_tick.saturating_mul(tick_ns).min(duration_ns);
+            if let Err(error) =
+                skip_application_before(plan, recorder, &mut state, skipped_start_ns)
+            {
+                return DispatchExit::Failed(error, state);
+            }
+            state.next_tick = current_tick;
+            tick_start_ns = skipped_start_ns;
+            tick_end_ns = tick_start_ns.saturating_add(tick_ns).min(duration_ns);
+            tick_deadline = started + Duration::from_nanos(tick_end_ns);
+        }
+        if let Err(error) = dispatch_tick(
+            plan,
+            recorder,
+            senders,
+            &mut state,
+            tick_start_ns,
+            tick_end_ns,
+            tick_deadline,
+            cutoff,
+        ) {
+            return DispatchExit::Failed(error, state);
+        }
+        state.next_tick = state.next_tick.saturating_add(1);
+    }
+    loop {
+        if TokioInstant::now() >= cutoff {
+            break;
+        }
+        match wait_for_schedule_event(worker_tasks, watch_tasks, cutoff, ctrl_c).await {
+            Ok(ScheduleControl::Interrupted) => return DispatchExit::Interrupted(state),
+            Ok(ScheduleControl::Supervisor | ScheduleControl::Tick) => {}
+            Err(error) => return DispatchExit::Failed(error, state),
+        }
+    }
+    match mark_remaining_missed(plan, recorder, &mut state) {
+        Ok(()) => DispatchExit::Completed(state),
+        Err(error) => DispatchExit::Failed(error, state),
+    }
+}
+async fn worker_loop(
+    mut receiver: mpsc::Receiver<WorkItem>,
+    client: ClientBundle,
+    plan: Arc<CompiledPlan>,
+    timeout: Duration,
+    latest_revision: Arc<AtomicI64>,
+) -> Result<(), String> {
+    let mut states = HashMap::<Vec<u8>, KeyState>::new();
+    let mut compactor = CompactorState::default();
+    while let Some(item) = receiver.recv().await {
+        let preparation = item.preparation().cloned();
+        item.started()?;
+        let (outcome, error_message) = match &item {
+            WorkItem::Txn {
+                resource,
+                key,
+                operation,
+                value,
+                ..
+            } => {
+                let label = resource_name(*resource);
+                let outcome = execute_txn(
+                    &client,
+                    &label,
+                    &mut states,
+                    key.clone(),
+                    value.clone(),
+                    *operation,
+                    CasRetryPolicy::until_deadline(),
+                    true,
+                    timeout,
+                    latest_revision.clone(),
+                )
+                .await;
+                (outcome, None)
+            }
+            WorkItem::Range {
+                request, selector, ..
+            } => match execute_range(
+                &client,
+                request.clone(),
+                *selector,
+                timeout,
+                latest_revision.clone(),
+            )
+            .await
+            {
+                Ok(_) => (Outcome::Success, None),
+                Err(error) => (error.outcome, Some(error.message)),
+            },
+            WorkItem::Heartbeat { item, resource, .. } => {
+                let outcome = execute_heartbeat(
+                    &client,
+                    &plan,
+                    &mut states,
+                    item.clone(),
+                    *resource,
+                    timeout,
+                    latest_revision.clone(),
+                )
+                .await;
+                (outcome, None)
+            }
+            WorkItem::Status { .. } => (
+                execute_status(&client, timeout, latest_revision.clone()).await,
+                None,
+            ),
+            WorkItem::CompactTick { .. } => (
+                execute_compact_tick(&client, &mut compactor, timeout, latest_revision.clone())
+                    .await,
+                None,
+            ),
+        };
+        if let Some(message) = error_message {
+            item.terminal_with_error(outcome, 0, &message)?;
+        } else {
+            item.terminal(outcome)?;
+        }
+        if let Some(preparation) = preparation {
+            preparation.complete(outcome);
+        }
+    }
+    Ok(())
+}
+fn resource_value_for_retry(value: &[u8], attempt: u32) -> Vec<u8> {
+    let mut retry = value.to_vec();
+    if let Some(first) = retry.first_mut() {
+        *first = first.wrapping_add((attempt & 0xff) as u8);
+    }
+    retry
+}
+
 async fn execute_txn(
     client: &ClientBundle,
     label: &ResourceName,
@@ -3273,115 +2065,59 @@ async fn execute_txn(
     key: Vec<u8>,
     value: Vec<u8>,
     operation: ResourceOperation,
-    mut inject_conflict: bool,
     cas_policy: CasRetryPolicy,
     recreate_missing: bool,
     timeout: Duration,
-    lease_pool: Option<&SharedPool>,
-    lease_epoch: TokioInstant,
     latest_revision: Arc<AtomicI64>,
 ) -> Outcome {
-    let lease_pool = lease_pool.filter(|_| operation.uses_native_lease());
     let deadline = Instant::now() + timeout;
-    let mut current_value = value;
-    let state = states.get(&key).cloned().unwrap_or_default();
-    let mut storage_attempts = 0u32;
-    let Some(mut storage_operation) =
-        storage_operation_for_state(operation, &state, recreate_missing)
-    else {
-        metrics::record_txn(label, shape(operation), TxnResult::Conflict);
+    let mut effective_operation = match states.get(&key) {
+        Some(state) => storage_operation_for_state(operation, state, recreate_missing),
+        None if operation == ResourceOperation::Create => Some(ResourceOperation::Create),
+        None if recreate_missing => Some(ResourceOperation::Create),
+        None => None,
+    };
+    let Some(mut effective_operation_value) = effective_operation.take() else {
         metrics::record_operation(operation_metric(operation), label, Outcome::NotFound);
         return Outcome::NotFound;
     };
+    let mut storage_attempts = 0;
+
     loop {
-        if Instant::now() >= deadline {
-            metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
-            return Outcome::Timeout;
-        }
-        let mut attempt = match storage_operation {
-            ResourceOperation::Create => TxnAttempt::create(key.clone(), current_value.clone()),
+        let expected = states
+            .get(&key)
+            .and_then(KeyState::mod_revision)
+            .unwrap_or_default();
+        let attempt = match effective_operation_value {
+            ResourceOperation::Create => TxnAttempt::create(key.clone(), value.clone()),
             ResourceOperation::GuaranteedUpdate => {
-                let revision = state.mod_revision().unwrap_or(0);
-                let expected_revision = if inject_conflict {
-                    inject_conflict = false;
-                    revision.saturating_sub(1)
-                } else {
-                    revision
-                };
-                TxnAttempt::update(key.clone(), current_value.clone(), expected_revision)
+                TxnAttempt::update(key.clone(), value.clone(), expected)
             }
-            ResourceOperation::ConditionalDelete => {
-                let revision = state.mod_revision().unwrap_or(0);
-                TxnAttempt::delete(key.clone(), revision)
-            }
+            ResourceOperation::ConditionalDelete => TxnAttempt::delete(key.clone(), expected),
         };
-        let mut cas = CasLoop::new(attempt.clone(), cas_policy, deadline);
-        loop {
+        let mut cas = CasLoop::new(attempt, cas_policy, deadline);
+        let next_operation = loop {
             if !take_storage_attempt(&mut storage_attempts, cas_policy.max_attempts) {
-                metrics::record_operation(operation_metric(operation), label, Outcome::Conflict);
-                return Outcome::Conflict;
-            }
-            // Kubernetes etcd3 gets a lease inside each Put attempt; a CAS
-            // retry may therefore reuse or obtain a different lease.
-            let lease_id = match lease_pool {
-                Some(shared) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        metrics::record_operation(
-                            operation_metric(operation),
-                            label,
-                            Outcome::Timeout,
-                        );
-                        return Outcome::Timeout;
-                    }
-                    match acquire_lease(
-                        shared,
-                        client,
-                        lease_epoch,
-                        remaining,
-                        latest_revision.clone(),
-                    )
-                    .await
-                    {
-                        Ok(lease_id) => lease_id,
-                        Err(outcome) => {
-                            metrics::record_operation(operation_metric(operation), label, outcome);
-                            return outcome;
-                        }
-                    }
-                }
-                None => 0,
-            };
-            let request = attempt.request_with_lease(lease_id);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
                 metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
                 return Outcome::Timeout;
             }
+            let request = cas.request();
             let start = Instant::now();
+            let remaining = deadline.saturating_duration_since(start);
+            if remaining.is_zero() {
+                metrics::record_txn(label, shape(effective_operation_value), TxnResult::Conflict);
+                metrics::record_operation(operation_metric(operation), label, Outcome::Timeout);
+                return Outcome::Timeout;
+            }
             metrics::add_inflight(Rpc::Txn);
-            let response = time::timeout(remaining, client.txn(request)).await;
+            let result = time::timeout(remaining, client.txn(request)).await;
             metrics::remove_inflight(Rpc::Txn);
             metrics::record_request_duration(Rpc::Txn, start.elapsed());
-            metrics::record_request_bytes(label, current_value.len() + key.len());
-            let response: TxnResponse = match response {
+            metrics::record_request_bytes(label, key.len() + value.len());
+            let response = match result {
                 Ok(Ok(response)) => {
-                    if let Some(header) = response.header.as_ref() {
-                        update_revision(&latest_revision, header.revision);
-                    }
                     metrics::record_request(Rpc::Txn, Outcome::Success);
                     response
-                }
-                Err(_) => {
-                    // A local deadline can race with server-side execution.
-                    // Treat the mutable result as unknown and never replay.
-                    metrics::record_request(Rpc::Txn, Outcome::ResultUnknown);
-                    metrics::record_operation(
-                        operation_metric(operation),
-                        label,
-                        Outcome::ResultUnknown,
-                    );
-                    return Outcome::ResultUnknown;
                 }
                 Ok(Err(error)) => {
                     let decision =
@@ -3393,31 +2129,63 @@ async fn execute_txn(
                         }
                     };
                     metrics::record_request(Rpc::Txn, outcome);
+                    metrics::record_txn(
+                        label,
+                        shape(effective_operation_value),
+                        TxnResult::Conflict,
+                    );
                     metrics::record_operation(operation_metric(operation), label, outcome);
                     return outcome;
                 }
+                Err(_) => {
+                    metrics::record_request(Rpc::Txn, Outcome::ResultUnknown);
+                    metrics::record_txn(
+                        label,
+                        shape(effective_operation_value),
+                        TxnResult::Conflict,
+                    );
+                    metrics::record_operation(
+                        operation_metric(operation),
+                        label,
+                        Outcome::ResultUnknown,
+                    );
+                    return Outcome::ResultUnknown;
+                }
             };
-            metrics::record_txn(
-                label,
-                shape(storage_operation),
-                if response.succeeded {
-                    TxnResult::Committed
-                } else {
-                    TxnResult::Conflict
-                },
-            );
+            if let Some(header) = response.header.as_ref() {
+                update_revision(&latest_revision, header.revision);
+            }
             match cas.observe(&response, Instant::now()) {
-                CasDecision::Succeeded { state: next, .. } => {
-                    if operation == ResourceOperation::ConditionalDelete {
-                        states.remove(&key);
-                    } else {
-                        states.insert(key.clone(), next);
-                    }
+                CasDecision::Succeeded {
+                    header_revision: _,
+                    state,
+                } => {
+                    *states.entry(key.clone()).or_default() = state;
+                    metrics::record_txn(
+                        label,
+                        shape(effective_operation_value),
+                        TxnResult::Committed,
+                    );
                     metrics::record_operation(operation_metric(operation), label, Outcome::Success);
                     return Outcome::Success;
                 }
-                CasDecision::CreateCollision { latest, .. } => {
-                    states.insert(key.clone(), latest);
+                CasDecision::CreateCollision {
+                    header_revision: _,
+                    latest,
+                } => {
+                    *states.entry(key.clone()).or_default() = latest.clone();
+                    metrics::record_txn(
+                        label,
+                        shape(effective_operation_value),
+                        TxnResult::Conflict,
+                    );
+                    if operation == ResourceOperation::GuaranteedUpdate
+                        && latest.mod_revision().is_some()
+                    {
+                        break Some(ResourceOperation::GuaranteedUpdate);
+                    }
+                    // A failed canonical Create is a conflict even when the
+                    // server omitted its failure KV.
                     metrics::record_operation(
                         operation_metric(operation),
                         label,
@@ -3425,34 +2193,44 @@ async fn execute_txn(
                     );
                     return Outcome::Conflict;
                 }
-                CasDecision::Retry { latest, .. } => {
-                    metrics::record_cas_retry(label, operation_metric(operation));
-                    current_value = if storage_operation == ResourceOperation::ConditionalDelete {
-                        Vec::new()
-                    } else {
-                        resource_value_for_retry(&current_value, attempt.number)
-                    };
-                    let Some(next) = cas.retry_with_value(current_value.clone(), &latest) else {
+                CasDecision::Retry {
+                    header_revision: _,
+                    latest,
+                    next_attempt,
+                } => {
+                    *states.entry(key.clone()).or_default() = latest.clone();
+                    metrics::record_txn(
+                        label,
+                        shape(effective_operation_value),
+                        TxnResult::Conflict,
+                    );
+                    let retry_value = resource_value_for_retry(&value, next_attempt);
+                    if cas.retry_with_value(retry_value, &latest).is_none() {
                         metrics::record_operation(
                             operation_metric(operation),
                             label,
                             Outcome::NotFound,
                         );
                         return Outcome::NotFound;
-                    };
-                    attempt = next.clone();
+                    }
                 }
                 CasDecision::Exhausted {
-                    reason: ExhaustedReason::MissingFailureKey,
-                    ..
-                } if recreate_missing
-                    && storage_operation == ResourceOperation::GuaranteedUpdate =>
-                {
-                    metrics::record_cas_retry(label, operation_metric(operation));
-                    storage_operation = ResourceOperation::Create;
-                    break;
-                }
-                CasDecision::Exhausted { reason, .. } => {
+                    header_revision: _,
+                    latest,
+                    reason,
+                } => {
+                    *states.entry(key.clone()).or_default() = latest;
+                    metrics::record_txn(
+                        label,
+                        shape(effective_operation_value),
+                        TxnResult::Conflict,
+                    );
+                    if reason == ExhaustedReason::MissingFailureKey
+                        && recreate_missing
+                        && operation == ResourceOperation::GuaranteedUpdate
+                    {
+                        break Some(ResourceOperation::Create);
+                    }
                     let outcome = match reason {
                         ExhaustedReason::CancelledOrDeadline => Outcome::Timeout,
                         ExhaustedReason::MissingFailureKey => Outcome::NotFound,
@@ -3462,792 +2240,1171 @@ async fn execute_txn(
                     return outcome;
                 }
             }
+        };
+        if let Some(next_operation) = next_operation {
+            effective_operation_value = next_operation;
+        } else {
+            return Outcome::Conflict;
         }
     }
-}
-fn resource_value_for_retry(value: &[u8], attempt: u32) -> Vec<u8> {
-    let mut out = value.to_vec();
-    if let Some(first) = out.first_mut() {
-        *first = first.wrapping_add(attempt as u8);
-    }
-    out
 }
 async fn execute_heartbeat(
     client: &ClientBundle,
+    plan: &CompiledPlan,
     states: &mut HashMap<Vec<u8>, KeyState>,
     item: HeartbeatItem,
+    resource: ResourceKind,
     timeout: Duration,
-    status_retry_limit: u32,
-    lease_retry_limit: u32,
     latest_revision: Arc<AtomicI64>,
 ) -> Outcome {
-    let (resource, kind) = match item.kind {
-        HeartbeatItemKind::NodeCreate
-        | HeartbeatItemKind::NodeReady
-        | HeartbeatItemKind::NodeStatus => (
-            "nodes",
-            if matches!(item.kind, HeartbeatItemKind::NodeStatus) {
-                HeartbeatKind::NodeStatus
-            } else {
-                HeartbeatKind::Node
-            },
-        ),
-        HeartbeatItemKind::NodeLeaseCreate | HeartbeatItemKind::NodeLeaseRenew => {
-            ("node_leases", HeartbeatKind::NodeLease)
-        }
-    };
-    let operation = if matches!(
-        item.kind,
-        HeartbeatItemKind::NodeCreate | HeartbeatItemKind::NodeLeaseCreate
-    ) {
-        ResourceOperation::Create
-    } else {
-        ResourceOperation::GuaranteedUpdate
-    };
-    let spec = ResourceSpec {
-        name: resource.into(),
-        key_pattern: item.key.clone(),
-        count: ResourceCountSpec::Fixed { count: 1 },
-        update_amplification: 1,
-        value_size_bytes: if resource == "nodes" { 2048 } else { 256 },
-        behavior: ResourceBehavior::GuaranteedUpdate,
-        lease_pool: None,
-    };
-    let label = ResourceName::try_from(resource).expect("static heartbeat metric label");
-    let policy = CasRetryPolicy {
-        max_attempts: match item.kind {
-            HeartbeatItemKind::NodeStatus => status_retry_limit.max(1),
-            HeartbeatItemKind::NodeLeaseRenew => lease_retry_limit.max(1),
-            _ => 1,
-        },
-    };
+    let key = item.key.into_bytes();
+    let sequence = u64::try_from(item.at.as_nanos()).unwrap_or(u64::MAX);
+    let value = plan.resource(resource).value(item.node as u64, sequence);
+    let label = resource_name(resource);
     let outcome = execute_txn(
         client,
         &label,
         states,
-        item.key.into_bytes(),
-        resource_value(&spec, item.node as u64, item.at.as_nanos() as u64),
-        operation,
-        false,
-        policy,
-        false,
+        key,
+        value,
+        ResourceOperation::GuaranteedUpdate,
+        CasRetryPolicy::until_deadline(),
+        true,
         timeout,
-        None,
-        TokioInstant::now(),
         latest_revision,
     )
     .await;
-    metrics::record_node_heartbeat(kind, outcome);
+    let heartbeat_kind = match item.kind {
+        HeartbeatItemKind::NodeLeaseRenew => HeartbeatKind::NodeLease,
+        HeartbeatItemKind::NodeStatus => HeartbeatKind::NodeStatus,
+    };
+    metrics::record_node_heartbeat(heartbeat_kind, outcome);
     outcome
 }
+
+pub async fn run(config: RunConfig, client: ClientBundle) -> RunResult {
+    run_with_ctrl_c(config, client, Box::pin(tokio::signal::ctrl_c())).await
+}
+
+async fn run_with_ctrl_c(
+    config: RunConfig,
+    client: ClientBundle,
+    mut ctrl_c: CtrlCFuture,
+) -> RunResult {
+    let plan = Arc::new(config.plan);
+    let request_timeout = request_timeout(&plan);
+    let status = match time::timeout(request_timeout, client.status()).await {
+        Ok(Ok(response)) => {
+            if let Some(header) = response.header.as_ref() {
+                metrics::set_revision(header.revision);
+            }
+            Ok(())
+        }
+        Ok(Err(error)) => Err(format!("status preflight failed: {error}")),
+        Err(_) => Err("status preflight timed out".into()),
+    };
+    if let Err(error) = status {
+        return RunResult::failed(error);
+    }
+    let preflight = match time::timeout(request_timeout, client.preflight_count()).await {
+        Ok(Ok(response)) if response.count == 0 => Ok(()),
+        Ok(Ok(response)) => Err(format!(
+            "preflight requires an empty keyspace (found {} keys)",
+            response.count
+        )),
+        Ok(Err(error)) => Err(format!("preflight failed: {error}")),
+        Err(_) => Err("preflight timed out".into()),
+    };
+    if let Err(error) = preflight {
+        return RunResult::failed(error);
+    }
+
+    let recorder = match MeasurementRecorder::new(&plan) {
+        Ok(recorder) => recorder,
+        Err(error) => return RunResult::failed(format!("measurement setup failed: {error}")),
+    };
+    let (senders, mut worker_tasks) = spawn_workers(plan.clone(), &client);
+    let preparation_deadline = TokioInstant::now() + preparation_timeout(&plan);
+    if let Err(error) = run_preparation(
+        plan.clone(),
+        &recorder,
+        &senders,
+        preparation_deadline,
+        &mut ctrl_c,
+    )
+    .await
+    {
+        abort_workers(senders, worker_tasks).await;
+        return RunResult::failed(error);
+    }
+
+    let watch_specs = plan.watch_specs();
+    let (watch_shutdown, mut watch_tasks, ready_receivers) = spawn_watches(&client, &watch_specs);
+    if let Err(error) = wait_for_watch_ready(
+        &mut watch_tasks,
+        ready_receivers,
+        preparation_deadline,
+        &mut ctrl_c,
+    )
+    .await
+    {
+        let _ = stop_watches(watch_shutdown, watch_tasks, watch_teardown_timeout(&plan)).await;
+        abort_workers(senders, worker_tasks).await;
+        return RunResult::failed(error);
+    }
+    if TokioInstant::now() >= preparation_deadline {
+        let _ = stop_watches(watch_shutdown, watch_tasks, watch_teardown_timeout(&plan)).await;
+        abort_workers(senders, worker_tasks).await;
+        return RunResult::failed("preparation deadline exceeded");
+    }
+
+    let measurement_window = match recorder.start_measurement() {
+        Ok(window) => window,
+        Err(error) => {
+            let _ = stop_watches(watch_shutdown, watch_tasks, watch_teardown_timeout(&plan)).await;
+            abort_workers(senders, worker_tasks).await;
+            return RunResult::failed(format!("measurement start failed: {error}"));
+        }
+    };
+    let dispatch_started = TokioInstant::from_std(measurement_window.start);
+    let dispatch_cutoff = TokioInstant::from_std(measurement_window.cutoff);
+
+    let (dispatch_error, interrupted, mut state) = match dispatch_until(
+        &plan,
+        &recorder,
+        &senders,
+        &mut worker_tasks,
+        &mut watch_tasks,
+        dispatch_started,
+        dispatch_cutoff,
+        &mut ctrl_c,
+    )
+    .await
+    {
+        DispatchExit::Completed(state) => (None, false, state),
+        DispatchExit::Interrupted(state) => (None, true, state),
+        DispatchExit::Failed(error, state) => (Some(error), false, state),
+    };
+
+    let _cutoff = match recorder.stop_measurement() {
+        Ok(cutoff) => cutoff,
+        Err(error) => {
+            let _ = stop_watches(watch_shutdown, watch_tasks, watch_teardown_timeout(&plan)).await;
+            abort_workers(senders, worker_tasks).await;
+            return RunResult::failed(format!("measurement stop failed: {error}"));
+        }
+    };
+    // Slots not yet enqueued at an early stop are classified only after the
+    // cutoff freezes. A normal window has already classified every slot as
+    // accepted, dropped, or missed.
+    if dispatch_error.is_some() || interrupted {
+        if let Err(error) = mark_remaining_not_offered(&plan, &recorder, &mut state) {
+            let _ = stop_watches(watch_shutdown, watch_tasks, watch_teardown_timeout(&plan)).await;
+            abort_workers(senders, worker_tasks).await;
+            return RunResult::failed(error);
+        }
+    }
+
+    let drain_error = drain_workers(senders, worker_tasks, drain_timeout(&plan)).await;
+    let watch_error =
+        stop_watches(watch_shutdown, watch_tasks, watch_teardown_timeout(&plan)).await;
+    let first_error = dispatch_error
+        .or_else(|| drain_error.err())
+        .or_else(|| watch_error.err());
+    let report = match recorder.finish() {
+        Ok(report) => report,
+        Err(error) => return RunResult::failed(format!("measurement finish failed: {error}")),
+    };
+    if interrupted {
+        RunResult::interrupted(first_error, Some(report))
+    } else if let Some(error) = first_error {
+        RunResult {
+            status: RunStatus::Failed,
+            error: Some(bound_error(error)),
+            measurement: Some(report),
+        }
+    } else {
+        RunResult::completed(report)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicUsize;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    use tokio::sync::oneshot;
-    use tokio_stream::Stream;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Server;
+    use tokio::net::TcpListener;
+    use tokio::sync::{Notify, oneshot};
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+    use tonic::transport::{Endpoint, Server};
+    use tonic::{Request, Response, Status};
 
     use super::*;
-    use crate::pb::etcdserverpb::ResponseOp;
-    use crate::pb::etcdserverpb::compare::TargetUnion;
-    use crate::pb::mvccpb;
+    use crate::config::SyntheticConfig;
+    use crate::measurement::MonotonicClock;
+    use crate::pb::etcdserverpb::kv_server::{Kv, KvServer};
+    use crate::pb::etcdserverpb::maintenance_server::{Maintenance, MaintenanceServer};
+    use crate::pb::etcdserverpb::watch_server::{Watch, WatchServer};
+    use crate::pb::etcdserverpb::{
+        AlarmRequest, AlarmResponse, CompactionRequest, CompactionResponse, DefragmentRequest,
+        DefragmentResponse, DeleteRangeRequest, DeleteRangeResponse, HashKvRequest, HashKvResponse,
+        HashRequest, HashResponse, MoveLeaderRequest, MoveLeaderResponse, PutRequest, PutResponse,
+        RangeResponse, ResponseHeader, ResponseOp, SnapshotRequest, SnapshotResponse,
+        StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest, WatchResponse,
+    };
+    use crate::pb::mvccpb::KeyValue;
+    use crate::plan::{CompiledPlan, DEFAULT_SYNTHETIC_CONFIG};
 
-    #[derive(Clone)]
-    struct LeaseTxnProbe {
-        grant_ttls: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
-        txn_leases: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
-        txn_calls: std::sync::Arc<AtomicUsize>,
+    fn small_plan() -> CompiledPlan {
+        let mut config = SyntheticConfig::parse_json(DEFAULT_SYNTHETIC_CONFIG).unwrap();
+        config.topology.node_count = 1;
+        config.topology.pod_count = 2;
+        config.topology.namespace_count = 1;
+        config.controllers.daemonset_count = 1;
+        config.controllers.pods_per_deployment = 1;
+        config.load.duration_ms = 20;
+        config.load.update_rps = 1_000;
+        config.load.update_weights.pods = 1;
+        config.load.update_weights.deployments = 0;
+        config.load.update_weights.replicasets = 0;
+        config.load.update_weights.daemonsets = 0;
+        config.watch.subscriptions_per_root = 1;
+        config.periodic.node_lease_interval_ms = 60_000;
+        config.periodic.node_status_interval_ms = 60_000;
+        config.periodic.status_interval_ms = 60_000;
+        config.periodic.compact_interval_ms = 60_000;
+        config.execution.workers = 1;
+        config.execution.queue_capacity = 64;
+        config.report.bucket_ms = 10;
+        CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap()
     }
 
-    impl LeaseTxnProbe {
-        fn new() -> Self {
-            Self {
-                grant_ttls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                txn_leases: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                txn_calls: std::sync::Arc::new(AtomicUsize::new(0)),
-            }
-        }
+    fn controlled_run_plan() -> CompiledPlan {
+        let mut config = small_plan().config;
+        config.load.duration_ms = 200;
+        CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap()
     }
 
-    #[tonic::async_trait]
-    impl crate::pb::etcdserverpb::kv_server::Kv for LeaseTxnProbe {
-        async fn range(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::RangeRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::RangeResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "range is not part of this probe",
-            ))
-        }
-
-        async fn put(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::PutRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::PutResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented(
-                "put is not part of this probe",
-            ))
-        }
-
-        async fn delete_range(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::DeleteRangeRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::DeleteRangeResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "delete_range is not part of this probe",
-            ))
-        }
-
-        async fn txn(
-            &self,
-            request: tonic::Request<crate::pb::etcdserverpb::TxnRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::TxnResponse>, tonic::Status> {
-            let call = self
-                .txn_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let request = request.into_inner();
-            let lease = request
-                .success
-                .first()
-                .and_then(|operation| match operation.request.as_ref() {
-                    Some(crate::pb::etcdserverpb::request_op::Request::RequestPut(put)) => {
-                        Some(put.lease)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(-1);
-            self.txn_leases.lock().unwrap().push(lease);
-
-            match call {
-                0 => Ok(tonic::Response::new(crate::pb::etcdserverpb::TxnResponse {
-                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                        revision: 2,
-                        ..Default::default()
-                    }),
-                    succeeded: false,
-                    responses: vec![ResponseOp {
-                        response: Some(
-                            crate::pb::etcdserverpb::response_op::Response::ResponseRange(
-                                crate::pb::etcdserverpb::RangeResponse {
-                                    kvs: vec![mvccpb::KeyValue {
-                                        key: b"k".to_vec(),
-                                        value: b"remote".to_vec(),
-                                        mod_revision: 1,
-                                        version: 2,
-                                        ..Default::default()
-                                    }],
-                                    ..Default::default()
-                                },
-                            ),
-                        ),
-                    }],
-                    ..Default::default()
-                })),
-                1 => Ok(tonic::Response::new(crate::pb::etcdserverpb::TxnResponse {
-                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                        revision: 3,
-                        ..Default::default()
-                    }),
-                    succeeded: true,
-                    ..Default::default()
-                })),
-                _ => Err(tonic::Status::internal("unexpected Txn call")),
-            }
-        }
-
-        async fn compact(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::CompactionRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::CompactionResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "compact is not part of this probe",
-            ))
-        }
-    }
-
-    #[tonic::async_trait]
-    impl crate::pb::etcdserverpb::lease_server::Lease for LeaseTxnProbe {
-        type LeaseKeepAliveStream = tokio_stream::Empty<
-            Result<crate::pb::etcdserverpb::LeaseKeepAliveResponse, tonic::Status>,
-        >;
-
-        async fn lease_grant(
-            &self,
-            request: tonic::Request<crate::pb::etcdserverpb::LeaseGrantRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseGrantResponse>, tonic::Status>
-        {
-            let ttl = request.into_inner().ttl;
-            let mut grants = self.grant_ttls.lock().unwrap();
-            let id = 100 + grants.len() as i64;
-            grants.push(ttl);
-            Ok(tonic::Response::new(
-                crate::pb::etcdserverpb::LeaseGrantResponse {
-                    id,
-                    ttl,
-                    ..Default::default()
-                },
-            ))
-        }
-
-        async fn lease_revoke(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::LeaseRevokeRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseRevokeResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "lease_revoke is not part of this probe",
-            ))
-        }
-
-        async fn lease_keep_alive(
-            &self,
-            _request: tonic::Request<
-                tonic::Streaming<crate::pb::etcdserverpb::LeaseKeepAliveRequest>,
-            >,
-        ) -> Result<tonic::Response<Self::LeaseKeepAliveStream>, tonic::Status> {
-            Err(tonic::Status::unimplemented(
-                "lease_keep_alive is not part of this probe",
-            ))
-        }
-
-        async fn lease_time_to_live(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::LeaseTimeToLiveRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseTimeToLiveResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "lease_time_to_live is not part of this probe",
-            ))
-        }
-
-        async fn lease_leases(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::LeaseLeasesRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::LeaseLeasesResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "lease_leases is not part of this probe",
-            ))
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct CreatePhaseProbe {
-        requests: Arc<std::sync::Mutex<Vec<crate::pb::etcdserverpb::TxnRequest>>>,
-        txn_replies:
-            Arc<std::sync::Mutex<VecDeque<oneshot::Receiver<Result<TxnResponse, tonic::Status>>>>>,
-        txn_entered: Arc<Notify>,
-        range_requests: Arc<std::sync::Mutex<Vec<RangeRequest>>>,
-        range_reply: Arc<std::sync::Mutex<Option<crate::pb::etcdserverpb::RangeResponse>>>,
-        compact_requests: Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
-        watch_error: Arc<std::sync::Mutex<Option<oneshot::Receiver<()>>>>,
-        watch_opened: Arc<Notify>,
-        watch_created: Arc<Notify>,
-    }
-
-    struct JoinedTimeout {
-        cancel: Option<std::sync::mpsc::Sender<()>>,
-        timeout: oneshot::Receiver<()>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl JoinedTimeout {
-        fn start(duration: Duration) -> Self {
-            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-            let (timeout_tx, timeout_rx) = oneshot::channel();
-            let handle = std::thread::spawn(move || {
-                if matches!(
-                    cancel_rx.recv_timeout(duration),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    let _ = timeout_tx.send(());
-                }
-            });
-            Self {
-                cancel: Some(cancel_tx),
-                timeout: timeout_rx,
-                handle: Some(handle),
-            }
-        }
-    }
-
-    impl Drop for JoinedTimeout {
-        fn drop(&mut self) {
-            drop(self.cancel.take());
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("timeout watchdog thread joins");
-            }
-        }
-    }
-
-    impl CreatePhaseProbe {
-        fn next_txn_reply(&self) -> oneshot::Sender<Result<TxnResponse, tonic::Status>> {
-            let (sender, receiver) = oneshot::channel();
-            self.txn_replies.lock().unwrap().push_back(receiver);
-            sender
-        }
-
-        async fn wait_for_txns(&self, count: usize) {
-            let mut timeout = JoinedTimeout::start(Duration::from_secs(3));
-            loop {
-                let notified = self.txn_entered.notified();
-                if self.requests.lock().unwrap().len() >= count {
-                    return;
-                }
-                tokio::select! {
-                    _ = notified => {}
-                    _ = &mut timeout.timeout => panic!("probe did not receive the expected Txn"),
-                }
-            }
-        }
-
-        fn fail_watch_after_created(&self) -> oneshot::Sender<()> {
-            let (sender, receiver) = oneshot::channel();
-            *self.watch_error.lock().unwrap() = Some(receiver);
-            sender
-        }
-    }
-
-    #[tonic::async_trait]
-    impl crate::pb::etcdserverpb::kv_server::Kv for CreatePhaseProbe {
-        async fn range(
-            &self,
-            request: tonic::Request<crate::pb::etcdserverpb::RangeRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::RangeResponse>, tonic::Status>
-        {
-            self.range_requests
-                .lock()
-                .unwrap()
-                .push(request.into_inner());
-            self.range_reply
-                .lock()
-                .unwrap()
-                .clone()
-                .map(tonic::Response::new)
-                .ok_or_else(|| tonic::Status::unimplemented("unscripted Range"))
-        }
-
-        async fn put(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::PutRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::PutResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented(
-                "put is not part of this probe",
-            ))
-        }
-
-        async fn delete_range(
-            &self,
-            _request: tonic::Request<crate::pb::etcdserverpb::DeleteRangeRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::DeleteRangeResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "delete_range is not part of this probe",
-            ))
-        }
-
-        async fn txn(
-            &self,
-            request: tonic::Request<crate::pb::etcdserverpb::TxnRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::TxnResponse>, tonic::Status> {
-            let revision = {
-                let mut requests = self.requests.lock().unwrap();
-                requests.push(request.into_inner());
-                requests.len() as i64
-            };
-            let reply = self.txn_replies.lock().unwrap().pop_front();
-            self.txn_entered.notify_one();
-            match reply {
-                Some(reply) => reply
-                    .await
-                    .expect("test dropped a scripted Txn response")
-                    .map(tonic::Response::new),
-                None => Ok(tonic::Response::new(compact_response(
-                    revision, true, 0, b"",
-                ))),
-            }
-        }
-
-        async fn compact(
-            &self,
-            request: tonic::Request<crate::pb::etcdserverpb::CompactionRequest>,
-        ) -> Result<tonic::Response<crate::pb::etcdserverpb::CompactionResponse>, tonic::Status>
-        {
-            self.compact_requests
-                .lock()
-                .unwrap()
-                .push(request.into_inner());
-            Err(tonic::Status::permission_denied(
-                "compaction denied after journal commit",
-            ))
-        }
-    }
-
-    #[tonic::async_trait]
-    impl crate::pb::etcdserverpb::watch_server::Watch for CreatePhaseProbe {
-        type WatchStream = std::pin::Pin<
-            Box<
-                dyn Stream<Item = Result<crate::pb::etcdserverpb::WatchResponse, tonic::Status>>
-                    + Send,
-            >,
-        >;
-
-        async fn watch(
-            &self,
-            _request: tonic::Request<tonic::Streaming<crate::pb::etcdserverpb::WatchRequest>>,
-        ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
-            let (responses, receiver) = mpsc::channel(2);
-            let error_signal = self.watch_error.lock().unwrap().take();
-            let watch_created = Arc::clone(&self.watch_created);
-            tokio::spawn(async move {
-                let created = crate::pb::etcdserverpb::WatchResponse {
-                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                        revision: 12,
-                        ..Default::default()
-                    }),
-                    watch_id: 1,
-                    created: true,
-                    ..Default::default()
-                };
-                if responses.send(Ok(created)).await.is_err() {
-                    return;
-                }
-                watch_created.notify_one();
-                if let Some(error_signal) = error_signal
-                    && error_signal.await.is_ok()
-                {
-                    let _ = responses
-                        .send(Err(tonic::Status::internal("server failed")))
-                        .await;
-                }
-            });
-            Ok(tonic::Response::new(Box::pin(
-                tokio_stream::wrappers::ReceiverStream::new(receiver),
-            )))
-        }
-    }
-
-    async fn start_create_probe(
-        probe: CreatePhaseProbe,
-    ) -> (ClientBundle, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            Server::builder()
-                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(
-                    probe.clone(),
-                ))
-                .add_service(crate::pb::etcdserverpb::watch_server::WatchServer::new(
-                    probe,
-                ))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        let client = ClientBundle::connect(
-            &format!("http://{address}"),
-            Duration::from_secs(3),
-            1024 * 1024,
-        )
-        .await
-        .unwrap();
-        (client, server)
-    }
-
-    fn spawn_probe_worker(
-        client: ClientBundle,
-        workload: WorkloadSpec,
-    ) -> (
-        mpsc::Sender<WorkItem>,
-        tokio::task::JoinHandle<Result<(), String>>,
-    ) {
-        let (sender, receiver) = mpsc::channel(4);
-        let worker = tokio::spawn(worker_loop(
-            receiver,
-            client,
-            workload,
-            Duration::from_secs(3),
-            Arc::new(HashMap::new()),
-            Arc::new(AtomicI64::new(0)),
-            TokioInstant::now(),
-            Arc::new(AtomicU64::new(0)),
-        ));
-        (sender, worker)
-    }
-
-    fn spawn_owned_probe_worker(
-        client: ClientBundle,
-        workload: WorkloadSpec,
-    ) -> (
-        mpsc::Sender<WorkItem>,
-        JoinSet<Result<(), String>>,
-        std::sync::Weak<()>,
-    ) {
-        let (sender, receiver) = mpsc::channel(4);
-        let lifetime = Arc::new(());
-        let weak = Arc::downgrade(&lifetime);
-        let mut workers = JoinSet::new();
-        workers.spawn(async move {
-            let _lifetime = lifetime;
-            worker_loop(
-                receiver,
-                client,
-                workload,
-                Duration::from_secs(3),
-                Arc::new(HashMap::new()),
-                Arc::new(AtomicI64::new(0)),
-                TokioInstant::now(),
-                Arc::new(AtomicU64::new(0)),
-            )
-            .await
-        });
-        (sender, workers, weak)
+    fn cancellation_run_plan() -> CompiledPlan {
+        let mut config = controlled_run_plan().config;
+        config.execution.queue_capacity = 1;
+        CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap()
     }
 
     fn pending_ctrl_c() -> CtrlCFuture {
         Box::pin(std::future::pending::<Result<(), std::io::Error>>())
     }
 
-    fn controlled_ctrl_c() -> (oneshot::Sender<()>, CtrlCFuture) {
-        let (sender, receiver) = oneshot::channel();
-        let future: CtrlCFuture = Box::pin(async move {
-            receiver
-                .await
-                .expect("test canceled signal sender prematurely");
-            Ok(())
-        });
-        (sender, future)
-    }
-
-    fn report_class(report: &RunReport, class: WorkClass) -> &WorkItemReport {
-        report
-            .work_items
-            .iter()
-            .find(|item| item.work_class == class.as_str())
-            .unwrap()
-    }
-
-    fn assert_report_equations(report: &RunReport) {
-        for item in &report.work_items {
-            assert_eq!(
-                item.offered,
-                item.accepted + item.dropped + item.unissued,
-                "{}",
-                item.work_class
-            );
-            assert_eq!(
-                item.accepted,
-                item.completed + item.unfinished,
-                "{}",
-                item.work_class
-            );
-            assert_eq!(
-                item.completed,
-                item.succeeded + item.failed,
-                "{}",
-                item.work_class
-            );
-            assert_eq!(
-                item.dropped,
-                item.dropped_full + item.dropped_closed,
-                "{}",
-                item.work_class
-            );
-            assert!(item.result_unknown <= item.failed, "{}", item.work_class);
-        }
-        assert!(
-            report
-                .accounting_invariants
-                .offered_equals_accepted_plus_dropped_plus_unissued
-        );
-        assert!(
-            report
-                .accounting_invariants
-                .accepted_equals_completed_plus_unfinished
-        );
-        assert!(
-            report
-                .accounting_invariants
-                .accepted_equals_succeeded_plus_failed_plus_unfinished
-        );
-        assert!(report.accounting_invariants.result_unknown_subset_failed);
-    }
-
     async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
         std::future::poll_fn(|cx| {
-            assert!(
-                future.as_mut().poll(cx).is_pending(),
-                "operation unexpectedly completed"
-            );
+            assert!(future.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
         })
         .await;
     }
 
-    fn probe_heartbeat(kind: HeartbeatItemKind) -> HeartbeatItem {
-        HeartbeatItem {
-            node: 0,
-            kind,
-            key: "/registry/minions/node-0000".into(),
-            at: Duration::ZERO,
+    struct FinalAcceptCutoffClock {
+        origin: Instant,
+        calls: AtomicUsize,
+        armed: AtomicBool,
+    }
+
+    impl FinalAcceptCutoffClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                calls: AtomicUsize::new(0),
+                armed: AtomicBool::new(false),
+            })
+        }
+
+        fn arm_for_cutoff(&self) {
+            self.calls.store(0, AtomicOrdering::Release);
+            self.armed.store(true, AtomicOrdering::Release);
         }
     }
 
-    fn probe_workload() -> WorkloadSpec {
-        let mut workload = exact_phase_workload();
-        workload.topology.node_count = 1;
-        workload.topology.pod_count = 1;
-        workload
-            .resources
-            .retain(|resource| resource.name == "pods");
-        workload.resources[0].update_amplification = 1;
-        workload.etcd_lease_pools.clear();
-        workload.watches.clear();
-        workload.ranges.clear();
-        workload.range_count_only_count = 0;
-        workload.cas_conflicts = 0;
-        workload.status_count = 0;
-        workload.compact_interval_s = 300.0;
-        workload.timeline = vec![crate::config::TimelineSegment {
-            duration_s: 1.0,
-            range_rps: 0.0,
-        }];
-        workload
+    impl MonotonicClock for FinalAcceptCutoffClock {
+        fn now(&self) -> Instant {
+            let call = self.calls.fetch_add(1, AtomicOrdering::AcqRel);
+            let armed = self.armed.load(AtomicOrdering::Acquire);
+            self.origin
+                + if armed && call >= 2 {
+                    Duration::from_millis(20)
+                } else {
+                    Duration::ZERO
+                }
+        }
     }
 
-    fn probe_config(workload: WorkloadSpec) -> RuntimeConfig {
-        RuntimeConfig {
-            endpoint: "http://127.0.0.1:1".into(),
-            nodes: workload.topology.node_count,
-            pod_size: workload.pod_size_bytes,
-            workload,
-            workers: 2,
-            queue_capacity: 8,
-            request_timeout: Duration::from_secs(3),
-            operation_timeout: Duration::from_secs(3),
-            max_message_size: 1024 * 1024,
+    fn range_page(revision: i64, keys: &[&[u8]], more: bool, count: i64) -> RangeResponse {
+        RangeResponse {
+            header: Some(ResponseHeader {
+                revision,
+                ..Default::default()
+            }),
+            kvs: keys
+                .iter()
+                .map(|key| KeyValue {
+                    key: key.to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+            more,
+            count,
+            ..Default::default()
+        }
+    }
+
+    fn compact_response(revision: i64, succeeded: bool, version: i64, value: &[u8]) -> TxnResponse {
+        TxnResponse {
+            header: Some(ResponseHeader {
+                revision,
+                ..Default::default()
+            }),
+            succeeded,
+            responses: if succeeded {
+                Vec::new()
+            } else {
+                vec![ResponseOp {
+                    response: Some(
+                        crate::pb::etcdserverpb::response_op::Response::ResponseRange(
+                            RangeResponse {
+                                kvs: vec![KeyValue {
+                                    mod_revision: version,
+                                    version,
+                                    value: value.to_vec(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                }]
+            },
+            ..Default::default()
+        }
+    }
+    struct TxnGate {
+        hold_first: AtomicBool,
+        observed: Notify,
+        release: Notify,
+        inflight: Arc<AtomicUsize>,
+    }
+
+    impl TxnGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                hold_first: AtomicBool::new(true),
+                observed: Notify::new(),
+                release: Notify::new(),
+                inflight: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    struct TxnInflightGuard {
+        inflight: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TxnInflightGuard {
+        fn drop(&mut self) {
+            self.inflight.fetch_sub(1, AtomicOrdering::AcqRel);
+        }
+    }
+
+    #[derive(Clone)]
+    struct WatchFixture {
+        created: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl Watch for WatchFixture {
+        type WatchStream = ReceiverStream<Result<WatchResponse, Status>>;
+
+        async fn watch(
+            &self,
+            request: Request<tonic::Streaming<WatchRequest>>,
+        ) -> Result<Response<Self::WatchStream>, Status> {
+            let mut requests = request.into_inner();
+            let created = self.created.clone();
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                if requests.next().await.is_none() {
+                    return;
+                }
+                created.notify_one();
+                if sender
+                    .send(Ok(WatchResponse {
+                        created: true,
+                        watch_id: 1,
+                        header: Some(ResponseHeader {
+                            revision: 1,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while requests.next().await.is_some() {}
+            });
+            Ok(Response::new(ReceiverStream::new(receiver)))
+        }
+    }
+
+    #[derive(Clone)]
+    struct TxnFixture {
+        responses: Arc<StdMutex<VecDeque<Result<TxnResponse, Status>>>>,
+        requests: Arc<StdMutex<Vec<TxnRequest>>>,
+        compact_responses: Option<Arc<StdMutex<VecDeque<Result<CompactionResponse, Status>>>>>,
+        compact_requests: Option<Arc<StdMutex<Vec<CompactionRequest>>>>,
+        range_requests: Option<Arc<AtomicUsize>>,
+        range_more: bool,
+        prep_request_count: Option<usize>,
+        load_observed: Option<Arc<Notify>>,
+        gate: Option<Arc<TxnGate>>,
+    }
+
+    #[tonic::async_trait]
+    impl Kv for TxnFixture {
+        async fn range(
+            &self,
+            _request: Request<crate::pb::etcdserverpb::RangeRequest>,
+        ) -> Result<Response<RangeResponse>, Status> {
+            if let Some(requests) = &self.range_requests {
+                requests.fetch_add(1, AtomicOrdering::AcqRel);
+            }
+            Ok(Response::new(RangeResponse {
+                header: Some(ResponseHeader {
+                    revision: 7,
+                    ..Default::default()
+                }),
+                more: self.range_more,
+                count: 0,
+                ..Default::default()
+            }))
+        }
+
+        async fn put(
+            &self,
+            _request: Request<PutRequest>,
+        ) -> Result<Response<PutResponse>, Status> {
+            Ok(Response::new(PutResponse::default()))
+        }
+
+        async fn delete_range(
+            &self,
+            _request: Request<DeleteRangeRequest>,
+        ) -> Result<Response<DeleteRangeResponse>, Status> {
+            Ok(Response::new(DeleteRangeResponse::default()))
+        }
+
+        async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+            let request = request.into_inner();
+            let request_count = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                requests.len()
+            };
+            if self
+                .prep_request_count
+                .is_some_and(|prep_count| request_count > prep_count)
+            {
+                if let Some(load_observed) = &self.load_observed {
+                    load_observed.notify_one();
+                }
+            }
+            if let Some(gate) = &self.gate {
+                if gate.hold_first.swap(false, AtomicOrdering::AcqRel) {
+                    gate.inflight.fetch_add(1, AtomicOrdering::AcqRel);
+                    let _guard = TxnInflightGuard {
+                        inflight: gate.inflight.clone(),
+                    };
+                    gate.observed.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(TxnResponse {
+                        succeeded: true,
+                        ..Default::default()
+                    })
+                })?;
+            Ok(Response::new(response))
+        }
+
+        async fn compact(
+            &self,
+            request: Request<CompactionRequest>,
+        ) -> Result<Response<CompactionResponse>, Status> {
+            if let Some(requests) = &self.compact_requests {
+                requests.lock().unwrap().push(request.into_inner());
+            }
+            let response = self
+                .compact_responses
+                .as_ref()
+                .and_then(|responses| responses.lock().unwrap().pop_front())
+                .unwrap_or_else(|| Ok(CompactionResponse::default()))?;
+            Ok(Response::new(response))
+        }
+    }
+
+    async fn serve_txn_fixture(
+        responses: Vec<Result<TxnResponse, Status>>,
+    ) -> (
+        ClientBundle,
+        Arc<StdMutex<Vec<TxnRequest>>>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let fixture = TxnFixture {
+            responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
+            requests: requests.clone(),
+            compact_responses: None,
+            compact_requests: None,
+            range_requests: None,
+            range_more: true,
+            prep_request_count: None,
+            load_observed: None,
+            gate: None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(KvServer::new(fixture))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let channel = Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (
+            ClientBundle::from_channel(channel, 64 * 1024 * 1024),
+            requests,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    async fn serve_compact_fixture(
+        txn_responses: Vec<Result<TxnResponse, Status>>,
+        compact_responses: Vec<Result<CompactionResponse, Status>>,
+    ) -> (
+        ClientBundle,
+        Arc<StdMutex<Vec<TxnRequest>>>,
+        Arc<StdMutex<Vec<CompactionRequest>>>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let compact_requests = Arc::new(StdMutex::new(Vec::new()));
+        let fixture = TxnFixture {
+            responses: Arc::new(StdMutex::new(txn_responses.into_iter().collect())),
+            requests: requests.clone(),
+            compact_responses: Some(Arc::new(StdMutex::new(
+                compact_responses.into_iter().collect(),
+            ))),
+            compact_requests: Some(compact_requests.clone()),
+            range_requests: None,
+            range_more: true,
+            prep_request_count: None,
+            load_observed: None,
+            gate: None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(KvServer::new(fixture))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let channel = Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (
+            ClientBundle::from_channel(channel, 64 * 1024 * 1024),
+            requests,
+            compact_requests,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct MaintenanceFixture {
+        status_error: Option<String>,
+    }
+
+    #[tonic::async_trait]
+    impl Maintenance for MaintenanceFixture {
+        type SnapshotStream = tokio_stream::Empty<Result<SnapshotResponse, Status>>;
+
+        async fn alarm(
+            &self,
+            _request: Request<AlarmRequest>,
+        ) -> Result<Response<AlarmResponse>, Status> {
+            Ok(Response::new(AlarmResponse::default()))
+        }
+
+        async fn status(
+            &self,
+            _request: Request<StatusRequest>,
+        ) -> Result<Response<StatusResponse>, Status> {
+            if let Some(error) = &self.status_error {
+                return Err(Status::unavailable(error.clone()));
+            }
+            Ok(Response::new(StatusResponse {
+                header: Some(ResponseHeader {
+                    revision: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        }
+
+        async fn defragment(
+            &self,
+            _request: Request<DefragmentRequest>,
+        ) -> Result<Response<DefragmentResponse>, Status> {
+            Ok(Response::new(DefragmentResponse::default()))
+        }
+
+        async fn hash(
+            &self,
+            _request: Request<HashRequest>,
+        ) -> Result<Response<HashResponse>, Status> {
+            Ok(Response::new(HashResponse::default()))
+        }
+
+        async fn hash_kv(
+            &self,
+            _request: Request<HashKvRequest>,
+        ) -> Result<Response<HashKvResponse>, Status> {
+            Ok(Response::new(HashKvResponse::default()))
+        }
+
+        async fn snapshot(
+            &self,
+            _request: Request<SnapshotRequest>,
+        ) -> Result<Response<Self::SnapshotStream>, Status> {
+            Ok(Response::new(tokio_stream::empty()))
+        }
+
+        async fn move_leader(
+            &self,
+            _request: Request<MoveLeaderRequest>,
+        ) -> Result<Response<MoveLeaderResponse>, Status> {
+            Ok(Response::new(MoveLeaderResponse::default()))
+        }
+    }
+
+    async fn serve_run_fixture(
+        txn_responses: Vec<Result<TxnResponse, Status>>,
+        status_error: Option<String>,
+    ) -> (
+        ClientBundle,
+        Arc<StdMutex<Vec<TxnRequest>>>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let fixture = TxnFixture {
+            responses: Arc::new(StdMutex::new(txn_responses.into_iter().collect())),
+            requests: requests.clone(),
+            compact_responses: None,
+            compact_requests: None,
+            range_requests: None,
+            range_more: true,
+            prep_request_count: None,
+            load_observed: None,
+            gate: None,
+        };
+        let maintenance = MaintenanceFixture { status_error };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(KvServer::new(fixture))
+                .add_service(MaintenanceServer::new(maintenance))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let channel = Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (
+            ClientBundle::from_channel(channel, 64 * 1024 * 1024),
+            requests,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    async fn serve_controlled_run_fixture(
+        prep_request_count: usize,
+    ) -> (
+        ClientBundle,
+        Arc<StdMutex<Vec<TxnRequest>>>,
+        Arc<AtomicUsize>,
+        Arc<TxnGate>,
+        Arc<Notify>,
+        Arc<Notify>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let range_requests = Arc::new(AtomicUsize::new(0));
+        let gate = TxnGate::new();
+        let created = Arc::new(Notify::new());
+        let load_observed = Arc::new(Notify::new());
+        let fixture = TxnFixture {
+            responses: Arc::new(StdMutex::new(VecDeque::new())),
+            requests: requests.clone(),
+            compact_responses: None,
+            compact_requests: None,
+            range_requests: Some(range_requests.clone()),
+            range_more: false,
+            prep_request_count: Some(prep_request_count),
+            load_observed: Some(load_observed.clone()),
+            gate: Some(gate.clone()),
+        };
+        let maintenance = MaintenanceFixture { status_error: None };
+        let watch = WatchFixture {
+            created: created.clone(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(KvServer::new(fixture))
+                .add_service(MaintenanceServer::new(maintenance))
+                .add_service(WatchServer::new(watch))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let channel = Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (
+            ClientBundle::from_channel(channel, 64 * 1024 * 1024),
+            requests,
+            range_requests,
+            gate,
+            created,
+            load_observed,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    fn run_config(plan: CompiledPlan) -> crate::config::RunConfig {
+        crate::config::RunConfig {
+            plan,
+            endpoint: "http://fixture".into(),
             metrics_listen: "127.0.0.1:0".parse().unwrap(),
-            seed: 7,
+            max_message_size: 64 * 1024 * 1024,
         }
+    }
+
+    fn txn_put_key(request: &TxnRequest) -> Option<Vec<u8>> {
+        request
+            .success
+            .iter()
+            .find_map(|operation| match operation.request.as_ref()? {
+                crate::pb::etcdserverpb::request_op::Request::RequestPut(put) => {
+                    Some(put.key.clone())
+                }
+                _ => None,
+            })
     }
 
     #[tokio::test]
-    async fn test_cas_retry_reacquires_lease() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let probe = LeaseTxnProbe::new();
-        let server_probe = probe.clone();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            ready_tx.send(()).unwrap();
-            Server::builder()
-                .add_service(crate::pb::etcdserverpb::kv_server::KvServer::new(
-                    server_probe.clone(),
-                ))
-                .add_service(crate::pb::etcdserverpb::lease_server::LeaseServer::new(
-                    server_probe,
-                ))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        ready_rx.await.unwrap();
+    async fn test_run_with_ctrl_c_create_failure_withholds_measurement() {
+        let plan = small_plan();
+        let first_create_failure = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 2,
+                ..Default::default()
+            }),
+            succeeded: false,
+            ..Default::default()
+        };
+        let (client, requests, shutdown, server) =
+            serve_run_fixture(vec![Ok(first_create_failure)], None).await;
+        let result = run_with_ctrl_c(run_config(plan.clone()), client, pending_ctrl_c()).await;
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(result.measurement.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("preparation outcome: conflict"))
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            usize::try_from(preparation_total(&plan)).unwrap()
+        );
+        assert_eq!(
+            requests[0].compare[0].target_union,
+            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                0
+            ))
+        );
+        drop(requests);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
 
-        let client = ClientBundle::connect(
-            &format!("http://{address}"),
-            Duration::from_secs(2),
-            1024 * 1024,
+    #[tokio::test]
+    async fn test_run_with_ctrl_c_bootstrap_unknown_no_replay() {
+        let plan = small_plan();
+        let prep_count = usize::try_from(preparation_total(&plan)).unwrap();
+        let first_pod_key = plan.resource(ResourceKind::Pods).key(0);
+        let (client, requests, shutdown, server) = serve_run_fixture(
+            vec![Err(Status::unavailable("bootstrap response lost"))],
+            None,
         )
+        .await;
+        let result = run_with_ctrl_c(run_config(plan.clone()), client, pending_ctrl_c()).await;
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(result.measurement.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("preparation outcome: result_unknown"))
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| txn_put_key(request).as_deref() == Some(first_pod_key.as_slice()))
+                .count(),
+            1
+        );
+        assert_eq!(requests.len(), prep_count);
+        drop(requests);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_with_ctrl_c_preparation_cancel_withholds_measurement() {
+        let plan = small_plan();
+        let (client, requests, shutdown, server) = serve_run_fixture(Vec::new(), None).await;
+        let result = run_with_ctrl_c(
+            run_config(plan),
+            client,
+            Box::pin(async { Ok::<(), std::io::Error>(()) }),
+        )
+        .await;
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(result.measurement.is_none());
+        assert!(requests.lock().unwrap().is_empty());
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_fixture_holds_preparation_before_watch_and_load() {
+        let plan = controlled_run_plan();
+        let prep_count = usize::try_from(preparation_total(&plan)).unwrap();
+        let (client, requests, range_requests, gate, created, load_observed, shutdown, server) =
+            serve_controlled_run_fixture(prep_count).await;
+        let observed = gate.observed.notified();
+        let created_ready = created.notified();
+        let load_ready = load_observed.notified();
+        let (cancel, receiver) = oneshot::channel();
+        let ctrl_c: CtrlCFuture = Box::pin(async move {
+            receiver
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
+                })
+                .map(|_| ())
+        });
+        let run = tokio::spawn(run_with_ctrl_c(run_config(plan.clone()), client, ctrl_c));
+
+        observed.await;
+        assert_eq!(gate.inflight.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(range_requests.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        gate.release.notify_one();
+        created_ready.await;
+        let requests_before_load = requests.lock().unwrap();
+        assert_eq!(requests_before_load.len(), prep_count);
+        for kind in ResourceKind::ALL {
+            if resource_count(&plan, kind) > 0 {
+                let key = plan.resource(kind).key(0);
+                assert!(
+                    requests_before_load
+                        .iter()
+                        .any(|request| txn_put_key(request).as_deref() == Some(key.as_slice()))
+                );
+            }
+        }
+        drop(requests_before_load);
+
+        load_ready.await;
+        let requests_after_load = requests.lock().unwrap();
+        assert!(requests_after_load.len() > prep_count);
+        assert!(
+            requests_after_load
+                .iter()
+                .skip(prep_count)
+                .any(|request| txn_put_key(request).is_some())
+        );
+        drop(requests_after_load);
+        cancel.send(()).unwrap();
+        let result = run.await.unwrap();
+        assert_eq!(result.status, RunStatus::Interrupted);
+        assert!(result.measurement.is_some());
+        assert_eq!(gate.inflight.load(AtomicOrdering::Acquire), 0);
+
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_fixture_cancellation_aborts_inflight_preparation() {
+        let plan = cancellation_run_plan();
+        let prep_count = usize::try_from(preparation_total(&plan)).unwrap();
+        let (client, requests, range_requests, gate, _created, _load_observed, shutdown, server) =
+            serve_controlled_run_fixture(prep_count).await;
+        let observed = gate.observed.notified();
+        let (cancel, receiver) = oneshot::channel();
+        let ctrl_c: CtrlCFuture = Box::pin(async move {
+            receiver
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
+                })
+                .map(|_| ())
+        });
+        let run = tokio::spawn(run_with_ctrl_c(run_config(plan), client, ctrl_c));
+
+        observed.await;
+        assert_eq!(range_requests.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        cancel.send(()).unwrap();
+        let result = run.await.unwrap();
+        assert_eq!(result.status, RunStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("interrupted during preparation")
+        );
+        assert!(result.measurement.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.inflight.load(AtomicOrdering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
         .unwrap();
-        let key = b"k".to_vec();
-        let mut states = HashMap::new();
-        states.insert(key.clone(), KeyState::Present { mod_revision: 1 });
-        let shared = SharedPool {
-            name: PoolName::new("masterleases").unwrap(),
-            pool: Mutex::new(LeasePool::new(LeasePoolConfig {
-                object_ttl: Duration::from_secs(15),
-                reuse_window: Duration::from_secs(60),
-                max_objects: 1,
-            })),
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    struct DropSentinel(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    #[test]
+    fn test_cas_retry_refreshes_revision() {
+        let mut cas = CasLoop::new(
+            TxnAttempt::update(b"k", b"v", 1),
+            CasRetryPolicy::until_deadline(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        let decision = cas.observe(&compact_response(10, false, 2, b"latest"), Instant::now());
+        let CasDecision::Retry { latest, .. } = decision else {
+            panic!("expected CAS retry");
         };
-        let result = execute_txn(
+        let attempt = cas.retry_with_value(b"recomputed", &latest).unwrap();
+        assert_eq!(attempt.expected_mod_revision, 2);
+        assert_eq!(
+            attempt.request().compare[0].target_union,
+            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                2
+            ))
+        );
+    }
+
+    #[test]
+    fn test_cas_collision_and_expired_not_sent() {
+        let mut create = CasLoop::new(
+            TxnAttempt::create(b"k", b"v"),
+            CasRetryPolicy::until_deadline(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(matches!(
+            create.observe(&compact_response(3, false, 1, b"existing"), Instant::now()),
+            CasDecision::CreateCollision { .. }
+        ));
+
+        let mut expired = CasLoop::new(
+            TxnAttempt::update(b"k", b"v", 1),
+            CasRetryPolicy::until_deadline(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(matches!(
+            expired.observe(&compact_response(4, false, 2, b"latest"), Instant::now()),
+            CasDecision::Exhausted {
+                reason: ExhaustedReason::CancelledOrDeadline,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cas_missing_failure_key_is_terminal() {
+        let mut cas = CasLoop::new(
+            TxnAttempt::update(b"k", b"v", 1),
+            CasRetryPolicy::until_deadline(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        let response = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 5,
+                ..Default::default()
+            }),
+            succeeded: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cas.observe(&response, Instant::now()),
+            CasDecision::Exhausted {
+                reason: ExhaustedReason::MissingFailureKey,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_update_missing_recreates_as_create() {
+        assert_eq!(
+            storage_operation_for_state(
+                ResourceOperation::GuaranteedUpdate,
+                &KeyState::Absent,
+                true,
+            ),
+            Some(ResourceOperation::Create)
+        );
+        assert_eq!(
+            storage_operation_for_state(
+                ResourceOperation::GuaranteedUpdate,
+                &KeyState::Absent,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_txn_missing_failure_recreates_via_real_rpc() {
+        let missing = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 11,
+                ..Default::default()
+            }),
+            succeeded: false,
+            ..Default::default()
+        };
+        let committed = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 12,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let (client, requests, shutdown, server) =
+            serve_txn_fixture(vec![Ok(missing), Ok(committed)]).await;
+        let key = b"/registry/pods/bench-ns-00000/pod-00000".to_vec();
+        let mut states = HashMap::from([(key.clone(), KeyState::Present { mod_revision: 10 })]);
+        let outcome = execute_txn(
             &client,
-            &ResourceName::new("events").unwrap(),
+            &ResourceName::new("pods").unwrap(),
             &mut states,
             key,
             b"value".to_vec(),
             ResourceOperation::GuaranteedUpdate,
-            false,
-            CasRetryPolicy { max_attempts: 5 },
-            false,
-            Duration::from_secs(2),
-            Some(&shared),
-            TokioInstant::now(),
+            CasRetryPolicy::until_deadline(),
+            true,
+            Duration::from_secs(1),
             Arc::new(AtomicI64::new(0)),
         )
         .await;
-
-        assert_eq!(result, Outcome::Success);
-        assert_eq!(*probe.grant_ttls.lock().unwrap(), vec![15, 15]);
-        assert_eq!(*probe.txn_leases.lock().unwrap(), vec![100, 101]);
-
-        server.abort();
-        let _ = server.await;
+        assert_eq!(outcome, Outcome::Success);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].failure.len(), 1);
+        assert!(requests[1].failure.is_empty());
+        drop(requests);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
-    fn resource_cas_conflict(mod_revision: Option<i64>) -> TxnResponse {
-        TxnResponse {
-            header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                revision: 10,
+    #[tokio::test]
+    async fn test_execute_txn_retry_sends_refreshed_revision_and_value() {
+        let conflict = compact_response(10, false, 2, b"latest");
+        let committed = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 12,
                 ..Default::default()
             }),
-            succeeded: false,
-            responses: vec![crate::pb::etcdserverpb::ResponseOp {
-                response: Some(
-                    crate::pb::etcdserverpb::response_op::Response::ResponseRange(
-                        crate::pb::etcdserverpb::RangeResponse {
-                            kvs: mod_revision
-                                .map(|mod_revision| mvccpb::KeyValue {
-                                    key: b"k".to_vec(),
-                                    value: b"latest".to_vec(),
-                                    mod_revision,
-                                    ..Default::default()
-                                })
-                                .into_iter()
-                                .collect(),
-                            ..Default::default()
-                        },
-                    ),
-                ),
-            }],
-        }
-    }
-
-    async fn run_resource_cas_probe(
-        operation: ResourceOperation,
-        recreate_missing: bool,
-        max_attempts: u32,
-        timeout: Duration,
-        replies: Vec<Result<TxnResponse, tonic::Status>>,
-    ) -> (
-        Outcome,
-        Vec<crate::pb::etcdserverpb::TxnRequest>,
-        Option<i64>,
-    ) {
-        let probe = CreatePhaseProbe::default();
-        let expected_requests = replies.len();
-        for reply in replies {
-            probe.next_txn_reply().send(reply).unwrap();
-        }
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let key = b"k".to_vec();
+            succeeded: true,
+            ..Default::default()
+        };
+        let (client, requests, shutdown, server) =
+            serve_txn_fixture(vec![Ok(conflict), Ok(committed)]).await;
+        let key = b"/registry/pods/bench-ns-00000/pod-00000".to_vec();
         let mut states = HashMap::from([(key.clone(), KeyState::Present { mod_revision: 1 })]);
         let outcome = execute_txn(
             &client,
@@ -4255,322 +3412,662 @@ mod tests {
             &mut states,
             key.clone(),
             b"value".to_vec(),
-            operation,
-            false,
-            CasRetryPolicy { max_attempts },
-            recreate_missing,
-            timeout,
-            None,
-            TokioInstant::now(),
+            ResourceOperation::GuaranteedUpdate,
+            CasRetryPolicy::until_deadline(),
+            true,
+            Duration::from_secs(1),
             Arc::new(AtomicI64::new(0)),
         )
         .await;
-        server.abort();
-        let _ = server.await;
-        let requests = std::mem::take(&mut *probe.requests.lock().unwrap());
-        assert_eq!(
-            requests.len(),
-            expected_requests,
-            "resource CAS must issue exactly the scripted attempts"
-        );
-        (
-            outcome,
-            requests,
-            states.get(&key).and_then(KeyState::mod_revision),
-        )
-    }
-
-    #[tokio::test]
-    async fn test_cas_failure_outcome() {
-        for (name, operation, recreate, budget, replies, expected, revisions) in [
-            (
-                "create collision",
-                ResourceOperation::Create,
-                false,
-                u32::MAX,
-                vec![TxnResponse {
-                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                        revision: 10,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                Outcome::Conflict,
-                vec![0],
-            ),
-            (
-                "ordinary missing key",
-                ResourceOperation::GuaranteedUpdate,
-                false,
-                5,
-                vec![resource_cas_conflict(None)],
-                Outcome::NotFound,
-                vec![1],
-            ),
-            (
-                "finite attempt exhaustion",
-                ResourceOperation::GuaranteedUpdate,
-                false,
-                2,
-                vec![
-                    resource_cas_conflict(Some(2)),
-                    resource_cas_conflict(Some(3)),
-                ],
-                Outcome::Conflict,
-                vec![1, 2],
-            ),
-            (
-                "masterlease recreation shares the attempt budget",
-                ResourceOperation::GuaranteedUpdate,
-                true,
-                1,
-                vec![resource_cas_conflict(None)],
-                Outcome::Conflict,
-                vec![1],
-            ),
-        ] {
-            let (outcome, requests, _) = run_resource_cas_probe(
-                operation,
-                recreate,
-                budget,
-                Duration::from_secs(3),
-                replies.into_iter().map(Ok).collect(),
-            )
-            .await;
-            assert_eq!(outcome, expected, "{name}");
-            for (request, revision) in requests.iter().zip(revisions) {
-                assert_eq!(
-                    request.compare[0].target_union,
-                    Some(TargetUnion::ModRevision(revision)),
-                    "{name}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_cas_retry_refreshes_revision() {
-        let (outcome, requests, revision) = run_resource_cas_probe(
-            ResourceOperation::GuaranteedUpdate,
-            false,
-            u32::MAX,
-            Duration::from_secs(3),
-            vec![
-                Ok(resource_cas_conflict(Some(2))),
-                Ok(TxnResponse {
-                    succeeded: true,
-                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                        revision: 10,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-            ],
-        )
-        .await;
         assert_eq!(outcome, Outcome::Success);
-        assert_eq!(revision, Some(10));
-        assert_eq!(
-            requests[0].compare[0].target_union,
-            Some(TargetUnion::ModRevision(1))
-        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[1].compare[0].target_union,
-            Some(TargetUnion::ModRevision(2))
+            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
+                2
+            ))
         );
-        assert_ne!(requests[0].success, requests[1].success);
+        let Some(crate::pb::etcdserverpb::request_op::Request::RequestPut(put)) =
+            requests[1].success[0].request.as_ref()
+        else {
+            panic!("retry request did not contain a Put");
+        };
+        assert_eq!(put.value, b"xalue");
+        assert_eq!(states.get(&key).and_then(KeyState::mod_revision), Some(12));
+        drop(requests);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn test_masterlease_missing_recreate() {
-        let (outcome, requests, revision) = run_resource_cas_probe(
+    async fn test_execute_txn_create_collision_without_failure_key_is_conflict() {
+        let collision = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 11,
+                ..Default::default()
+            }),
+            succeeded: false,
+            ..Default::default()
+        };
+        let (client, requests, shutdown, server) = serve_txn_fixture(vec![Ok(collision)]).await;
+        let key = b"/registry/pods/bench-ns-00000/pod-00000".to_vec();
+        let outcome = execute_txn(
+            &client,
+            &ResourceName::new("pods").unwrap(),
+            &mut HashMap::new(),
+            key,
+            b"value".to_vec(),
             ResourceOperation::GuaranteedUpdate,
+            CasRetryPolicy::until_deadline(),
             true,
-            2,
-            Duration::from_secs(3),
-            vec![
-                Ok(resource_cas_conflict(None)),
-                Ok(TxnResponse {
-                    succeeded: true,
-                    header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                        revision: 10,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-            ],
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
         )
         .await;
-        assert_eq!(outcome, Outcome::Success);
-        assert_eq!(revision, Some(10));
-        assert_eq!(
-            requests[0].compare[0].target_union,
-            Some(TargetUnion::ModRevision(1))
-        );
-        assert_eq!(
-            requests[1].compare[0].target_union,
-            Some(TargetUnion::ModRevision(0))
-        );
-        assert!(requests[1].failure.is_empty());
+        assert_eq!(outcome, Outcome::Conflict);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn test_cas_expired_not_sent() {
-        let (outcome, requests, _) = run_resource_cas_probe(
+    async fn test_execute_txn_unknown_response_is_not_replayed() {
+        let (client, requests, shutdown, server) =
+            serve_txn_fixture(vec![Err(Status::unavailable("response lost"))]).await;
+        let key = b"/registry/pods/bench-ns-00000/pod-00000".to_vec();
+        let mut states = HashMap::from([(key.clone(), KeyState::Present { mod_revision: 10 })]);
+        let outcome = execute_txn(
+            &client,
+            &ResourceName::new("pods").unwrap(),
+            &mut states,
+            key,
+            b"value".to_vec(),
             ResourceOperation::GuaranteedUpdate,
+            CasRetryPolicy::until_deadline(),
+            true,
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::ResultUnknown);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_txn_expired_deadline_sends_no_rpc() {
+        let (client, requests, shutdown, server) = serve_txn_fixture(Vec::new()).await;
+        let key = b"/registry/pods/bench-ns-00000/pod-00000".to_vec();
+        let outcome = execute_txn(
+            &client,
+            &ResourceName::new("pods").unwrap(),
+            &mut HashMap::new(),
+            key,
+            b"value".to_vec(),
+            ResourceOperation::Create,
+            CasRetryPolicy::until_deadline(),
             false,
-            5,
             Duration::ZERO,
-            Vec::new(),
+            Arc::new(AtomicI64::new(0)),
         )
         .await;
         assert_eq!(outcome, Outcome::Timeout);
-        assert!(requests.is_empty());
+        assert!(requests.lock().unwrap().is_empty());
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn test_cas_unknown_no_replay() {
-        for status in [
-            tonic::Status::unavailable("response lost after possible commit"),
-            tonic::Status::deadline_exceeded("commit result is unknown"),
-        ] {
-            let (outcome, requests, _) = run_resource_cas_probe(
-                ResourceOperation::GuaranteedUpdate,
-                false,
-                5,
-                Duration::from_secs(3),
-                vec![Err(status)],
+    async fn test_execute_heartbeat_unknown_response_is_not_replayed() {
+        let (client, requests, shutdown, server) =
+            serve_txn_fixture(vec![Err(Status::unavailable("heartbeat response lost"))]).await;
+        let mut states = HashMap::new();
+        let outcome = execute_heartbeat(
+            &client,
+            &small_plan(),
+            &mut states,
+            HeartbeatItem {
+                node: 0,
+                kind: HeartbeatItemKind::NodeLeaseRenew,
+                key: "/registry/leases/node-00000".into(),
+                at: Duration::ZERO,
+            },
+            ResourceKind::NodeLeases,
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::ResultUnknown);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_range_invalid_page_via_real_rpc() {
+        let (client, _requests, shutdown, server) = serve_txn_fixture(Vec::new()).await;
+        let error = execute_range(
+            &client,
+            RangeRequest {
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
+                limit: 500,
+                ..Default::default()
+            },
+            RangeSelector::All { target: None },
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.outcome, Outcome::GrpcError);
+        assert!(error.message.contains("more=true"));
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_compact_tick_runs_coordination_and_compact_via_real_rpc() {
+        let first = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 1,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let second = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 2,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let (client, requests, shutdown, server) =
+            serve_txn_fixture(vec![Ok(first), Ok(second)]).await;
+        let mut compactor = CompactorState::default();
+        let revision = Arc::new(AtomicI64::new(0));
+        assert_eq!(
+            execute_compact_tick(
+                &client,
+                &mut compactor,
+                Duration::from_secs(1),
+                revision.clone()
             )
-            .await;
-            assert_eq!(outcome, Outcome::ResultUnknown);
-            assert_eq!(requests.len(), 1);
-        }
+            .await,
+            Outcome::Success
+        );
+        assert_eq!(
+            execute_compact_tick(&client, &mut compactor, Duration::from_secs(1), revision).await,
+            Outcome::Success
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn test_prepare_blocks_updates() {
-        let probe = CreatePhaseProbe::default();
-        let held_bootstrap = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let mut workload = probe_workload();
-        workload.timeline[0].duration_s = 0.1;
-        let mut running = tokio::spawn(run_with_ctrl_c(
-            probe_config(workload),
-            client,
-            pending_ctrl_c(),
-        ));
+    async fn test_compact_first_tick_noop_sends_no_compact_rpc() {
+        let response = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 1,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let (client, txn_requests, compact_requests, shutdown, server) =
+            serve_compact_fixture(vec![Ok(response)], Vec::new()).await;
+        let mut compactor = CompactorState::default();
+        assert_eq!(
+            execute_compact_tick(
+                &client,
+                &mut compactor,
+                Duration::from_secs(1),
+                Arc::new(AtomicI64::new(0)),
+            )
+            .await,
+            Outcome::Success
+        );
+        assert_eq!(txn_requests.lock().unwrap().len(), 1);
+        assert!(compact_requests.lock().unwrap().is_empty());
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
 
-        probe.wait_for_txns(1).await;
-        assert_pending(std::pin::Pin::new(&mut running)).await;
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        held_bootstrap
-            .send(Ok(compact_response(11, true, 0, b"")))
+    #[tokio::test]
+    async fn test_compact_conflict_sends_no_compact_rpc_or_retry() {
+        let (client, txn_requests, compact_requests, shutdown, server) =
+            serve_compact_fixture(vec![Ok(compact_response(6, false, 2, b"7"))], Vec::new()).await;
+        let mut compactor = CompactorState {
+            compact_version: 1,
+            previous_txn_header_revision: 4,
+            status: CompactorStatus::Active,
+            recovery: None,
+        };
+        assert_eq!(
+            execute_compact_tick(
+                &client,
+                &mut compactor,
+                Duration::from_secs(1),
+                Arc::new(AtomicI64::new(0)),
+            )
+            .await,
+            Outcome::Success
+        );
+        assert_eq!(txn_requests.lock().unwrap().len(), 1);
+        assert!(compact_requests.lock().unwrap().is_empty());
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_compact_rpc_unknown_is_not_replayed() {
+        let coordination = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 6,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let (client, txn_requests, compact_requests, shutdown, server) = serve_compact_fixture(
+            vec![Ok(coordination)],
+            vec![Err(Status::unavailable("compact response lost"))],
+        )
+        .await;
+        let mut compactor = CompactorState {
+            compact_version: 1,
+            previous_txn_header_revision: 5,
+            status: CompactorStatus::Active,
+            recovery: None,
+        };
+        assert_eq!(
+            execute_compact_tick(
+                &client,
+                &mut compactor,
+                Duration::from_secs(1),
+                Arc::new(AtomicI64::new(0)),
+            )
+            .await,
+            Outcome::ResultUnknown
+        );
+        assert_eq!(txn_requests.lock().unwrap().len(), 1);
+        assert_eq!(compact_requests.lock().unwrap().len(), 1);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_worker_loop_executes_real_txn_and_finishes_token() {
+        let (client, _requests, shutdown, server) = serve_txn_fixture(Vec::new()).await;
+        let plan = Arc::new(small_plan());
+        let clock = FinalAcceptCutoffClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
             .unwrap();
+        let identity = stream_identity(stream);
+        let token = match recorder.offer(identity).unwrap() {
+            OfferResult::Token(token) => token,
+            other => panic!("unexpected offer result: {other:?}"),
+        };
+        token.accept().unwrap();
+        let item = WorkItem::Txn {
+            resource: stream.resource,
+            key: plan.resource_key(stream.resource, 0, plan.config.seed),
+            operation: ResourceOperation::GuaranteedUpdate,
+            value: plan.resource_value(stream.resource, 0, plan.config.seed, 0),
+            token,
+            preparation: None,
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(item).await.unwrap();
+        drop(sender);
+        worker_loop(
+            receiver,
+            client.clone(),
+            plan,
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await
+        .unwrap();
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.accepted, 1);
+        assert_eq!(row.succeeded_before_cutoff, 1);
+    }
 
-        let report = time::timeout(Duration::from_secs(3), running)
+    #[tokio::test]
+    async fn test_worker_loop_invalid_range_records_error_and_first_error() {
+        let (client, _requests, shutdown, server) = serve_txn_fixture(Vec::new()).await;
+        let plan = Arc::new(small_plan());
+        let clock = FinalAcceptCutoffClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| {
+                matches!(
+                    stream.work_class,
+                    LogicalWorkClass::PointGet | LogicalWorkClass::BoundedList
+                )
+            })
+            .unwrap();
+        let identity = stream_identity(stream);
+        let token = match recorder.offer(identity).unwrap() {
+            OfferResult::Token(token) => token,
+            other => panic!("unexpected offer result: {other:?}"),
+        };
+        token.accept().unwrap();
+        let item = WorkItem::Range {
+            request: RangeRequest {
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
+                limit: 500,
+                ..Default::default()
+            },
+            selector: RangeSelector::All { target: None },
+            token,
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(item).await.unwrap();
+        drop(sender);
+        worker_loop(
+            receiver,
+            client.clone(),
+            plan,
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
+        )
+        .await
+        .unwrap();
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.failed_before_cutoff, 1);
+        assert!(row.first_error.as_deref().unwrap().contains("more=true"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_blocks_until_all_resources_complete() {
+        let tracker = PreparationTracker::new(2);
+        let mut waiting = Box::pin(tracker.wait(TokioInstant::now() + Duration::from_secs(1)));
+        assert_pending(waiting.as_mut()).await;
+        tracker.complete(Outcome::Success);
+        assert_pending(waiting.as_mut()).await;
+        tracker.complete(Outcome::Success);
+        waiting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prepare_deadline_deficit() {
+        let tracker = PreparationTracker::new(2);
+        tracker.complete(Outcome::Success);
+        let error = tracker
+            .wait(TokioInstant::now() + Duration::from_millis(1))
             .await
-            .expect("run completes after bootstrap release")
-            .expect("run task joins");
-        assert!(report.achieved, "{report:?}");
-        assert!(report.schedule_complete);
-        let requests = probe.requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
-        for request in &requests[..2] {
-            assert_eq!(request.compare[0].key, b"/registry/minions/node-0000");
-        }
-        assert!(requests[2].compare[0].key.starts_with(b"/registry/pods/"));
-        assert_eq!(
-            requests[2].compare[0].target_union,
-            Some(TargetUnion::ModRevision(0))
-        );
-        assert_eq!(
-            requests[3].compare[0].target_union,
-            Some(TargetUnion::ModRevision(3))
-        );
-        assert_report_equations(&report);
-        drop(requests);
-        server.abort();
-        let _ = server.await;
+            .unwrap_err();
+        assert_eq!(error, "preparation deadline exceeded");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_prepare_deadline_deficit() {
-        let tracker = PhaseTracker::new(vec![2]);
-        tracker.record(0, Outcome::Success);
-        let deadline = TokioInstant::now() + Duration::from_millis(1);
-        let wait = tracker.wait_until("update", deadline);
-        time::advance(Duration::from_millis(2)).await;
-        let error = wait.await.unwrap_err();
-        assert!(error.contains("update phase deadline exceeded"));
-        assert!(error.contains("target=2"));
-        assert!(error.contains("succeeded=1"));
-        assert!(error.contains("deficit=1"));
+    async fn test_preparation_tracker_rejects_completion_at_deadline() {
+        let tracker = PreparationTracker::new(0);
+        let deadline = TokioInstant::now();
+        let error = tracker.wait(deadline).await.unwrap_err();
+        assert_eq!(error, "preparation deadline exceeded");
     }
 
-    #[test]
-    fn test_update_dispatch_headroom() {
-        let duration = Duration::from_secs(100);
-        assert_eq!(update_dispatch_at(duration, 0, 10), Duration::ZERO);
-        assert_eq!(
-            update_dispatch_at(duration, 9, 10),
-            Duration::from_millis(85_500)
-        );
-        assert_eq!(
-            update_dispatch_at(duration, 9_999, 10_000),
-            Duration::from_nanos(94_990_500_000)
-        );
+    #[tokio::test(start_paused = true)]
+    async fn test_watch_ready_rejects_queued_success_at_deadline() {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        ready_tx.send(()).unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<WatchTaskOutput>());
+        let mut ctrl_c = pending_ctrl_c();
+        let error =
+            wait_for_watch_ready(&mut tasks, vec![ready_rx], TokioInstant::now(), &mut ctrl_c)
+                .await
+                .unwrap_err();
+        assert_eq!(error, "watch readiness timed out");
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
 
-    #[test]
-    fn test_range_rate_total() {
-        let workload = WorkloadSpec {
-            name: "k8s".into(),
-            pod_size_bytes: 4096,
-            topology: TopologySpec {
-                node_count: 1,
-                pod_count: 10_000,
-            },
-            relationships: crate::config::ResourceRelationshipsSpec::default(),
-            nodes: crate::config::NodeSpec {
-                status_interval_s: 300.0,
-                lease_interval_s: 10.0,
-                lease_jitter: 0.0,
-                status_retry_limit: 5,
-                lease_retry_limit: 5,
-                node_lease_enabled: false,
-            },
-            timeline: vec![crate::config::TimelineSegment {
-                duration_s: 10.0,
-                range_rps: 1000.0,
-            }],
-            resources: vec![ResourceSpec {
-                name: "pods".into(),
-                key_pattern: "/p/{id}".into(),
-                count: ResourceCountSpec::Pods {
-                    numerator: 1,
-                    denominator: 1,
-                },
-                update_amplification: 1,
-                value_size_bytes: 4096,
-                behavior: ResourceBehavior::GuaranteedUpdate,
-                lease_pool: None,
-            }],
-            ranges: vec![],
-            watches: vec![],
-            etcd_lease_pools: vec![],
-            status_count: 0,
-            compact_interval_s: 300.0,
-            master_lease_interval_s: 10.0,
-            cas_conflicts: 0,
-            range_count_only_count: 0,
+    #[tokio::test]
+    async fn test_prepare_error_ack_blocks_measurement() {
+        let tracker = PreparationTracker::new(1);
+        tracker.complete(Outcome::GrpcError);
+        let error = tracker
+            .wait(TokioInstant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "preparation outcome: grpc_error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_preparation_consumes_budget_before_watch_readiness() {
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        let tracker = PreparationTracker::new(1);
+        let mut preparation = Box::pin(tracker.wait(deadline));
+        assert_pending(preparation.as_mut()).await;
+        time::advance(Duration::from_millis(900)).await;
+        tracker.complete(Outcome::Success);
+        preparation.await.unwrap();
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            time::sleep_until(deadline).await;
+            let _ = ready_tx.send(());
+        });
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<WatchTaskOutput>());
+        let mut ctrl_c = pending_ctrl_c();
+        let mut waiting = Box::pin(wait_for_watch_ready(
+            &mut tasks,
+            vec![ready_rx],
+            deadline,
+            &mut ctrl_c,
+        ));
+        assert_pending(waiting.as_mut()).await;
+        time::advance(Duration::from_millis(100)).await;
+        assert_eq!(waiting.await.unwrap_err(), "watch readiness timed out");
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn test_prepare_cancel_leaves_measurement_in_preparation() {
+        let plan = Arc::new(small_plan());
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        let (cancel, receiver) = oneshot::channel();
+        let mut ctrl_c: CtrlCFuture = Box::pin(async move {
+            receiver
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
+                })
+                .map(|_| ())
+        });
+        cancel.send(()).unwrap();
+        let error = run_preparation(
+            plan,
+            &recorder,
+            &[sender],
+            TokioInstant::now() + Duration::from_secs(1),
+            &mut ctrl_c,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "interrupted during preparation");
+        assert_eq!(recorder.phase(), crate::measurement::Phase::Preparation);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_barrier_and_node_ready_order() {
+        let plan = Arc::new(small_plan());
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(64);
+        let acknowledged = Arc::new(AtomicU64::new(0));
+        let worker_acknowledged = acknowledged.clone();
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let worker_observed = observed.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(item) = receiver.recv().await {
+                let preparation = item.preparation().cloned();
+                match &item {
+                    WorkItem::Txn {
+                        resource,
+                        key,
+                        operation,
+                        ..
+                    } => worker_observed
+                        .lock()
+                        .unwrap()
+                        .push((*resource, *operation, key.clone())),
+                    other => panic!("unexpected preparation item: {other:?}"),
+                }
+                item.started().unwrap();
+                item.terminal(Outcome::Success).unwrap();
+                if let Some(preparation) = preparation {
+                    preparation.complete(Outcome::Success);
+                    worker_acknowledged.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        });
+        let mut ctrl_c = pending_ctrl_c();
+        run_preparation(
+            plan.clone(),
+            &recorder,
+            &[sender],
+            TokioInstant::now() + Duration::from_secs(1),
+            &mut ctrl_c,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acknowledged.load(AtomicOrdering::Relaxed),
+            preparation_total(&plan)
+        );
+        worker.await.unwrap();
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            usize::try_from(preparation_total(&plan)).unwrap()
+        );
+        let node_key = plan.resource(ResourceKind::Nodes).key(0);
+        let node_ready = observed
+            .iter()
+            .position(|(resource, operation, key)| {
+                *resource == ResourceKind::Nodes
+                    && *operation == ResourceOperation::GuaranteedUpdate
+                    && key == &node_key
+            })
+            .expect("NodeReady request missing");
+        assert!(
+            observed[..node_ready]
+                .iter()
+                .all(|(_, operation, _)| *operation == ResourceOperation::Create)
+        );
+        assert_eq!(recorder.phase(), crate::measurement::Phase::Preparation);
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_dispatch_preserves_partial_report() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let mut workers = JoinSet::new();
+        let mut watches = JoinSet::new();
+        let mut ctrl_c = {
+            let (_cancel, receiver) = oneshot::channel::<()>();
+            Box::pin(async move {
+                receiver
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "interrupt"))
+            }) as CtrlCFuture
         };
-        let cursor = RateCursor::new(&workload, 1, 1);
-        assert_eq!(cursor.total(), 10000);
+        let started = TokioInstant::now();
+        let cutoff = started + run_duration(&plan);
+        let exit = dispatch_until(
+            &plan,
+            &recorder,
+            &[],
+            &mut workers,
+            &mut watches,
+            started,
+            cutoff,
+            &mut ctrl_c,
+        )
+        .await;
+        let mut state = match exit {
+            DispatchExit::Interrupted(state) => state,
+            _ => panic!("expected interrupted dispatch"),
+        };
+        recorder.stop_measurement().unwrap();
+        mark_remaining_not_offered(&plan, &recorder, &mut state).unwrap();
+        let report = recorder.finish().unwrap();
+        assert!(
+            report
+                .measurement
+                .logical
+                .iter()
+                .any(|stream| stream.not_offered_after_stop > 0)
+        );
     }
+
     #[test]
-    fn test_prefix_ff_successor() {
-        assert_eq!(prefix_range_end(&[0xff]), vec![0]);
-        assert_eq!(prefix_range_end(&[b'a', 0xff]), vec![b'b']);
+    fn test_cas_unknown_no_replay() {
+        let error = crate::client::ClientError::Rpc(tonic::Status::unavailable("response lost"));
+        assert_eq!(
+            error.retry_decision(RpcMethod::Txn, RequestDisposition::Unknown),
+            RetryDecision::ResultUnknown
+        );
+        assert_eq!(
+            error.retry_decision(RpcMethod::Range, RequestDisposition::Unknown),
+            RetryDecision::Retry
+        );
+    }
+
+    #[test]
+    fn test_compact_rpc_unknown_policy_no_replay() {
+        let error = crate::client::ClientError::Rpc(tonic::Status::unavailable("response lost"));
+        assert_eq!(
+            error.retry_decision(RpcMethod::Compact, RequestDisposition::Unknown),
+            RetryDecision::ResultUnknown
+        );
     }
 
     #[test]
@@ -4578,7 +4075,8 @@ mod tests {
         assert_eq!(range_shape(&RangeRequest::default()), RangeShape::Point);
         assert_eq!(
             range_shape(&RangeRequest {
-                range_end: b"z".to_vec(),
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
                 count_only: true,
                 ..Default::default()
             }),
@@ -4586,276 +4084,21 @@ mod tests {
         );
         assert_eq!(
             range_shape(&RangeRequest {
-                range_end: b"z".to_vec(),
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
                 ..Default::default()
             }),
             RangeShape::UnboundedPrefix
         );
         assert_eq!(
             range_shape(&RangeRequest {
-                range_end: b"z".to_vec(),
-                limit: 500,
+                key: b"/registry/pods/".to_vec(),
+                range_end: b"/registry/pods0".to_vec(),
+                limit: 10,
                 ..Default::default()
             }),
             RangeShape::PagedPrefix
         );
-    }
-    #[test]
-    fn test_range_resource_prefix() {
-        let workload =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        let pods = workload
-            .ranges
-            .iter()
-            .find(|range| range.key_pattern == "/registry/pods/bench-{ns}/")
-            .unwrap();
-        let request = range_request(pods, 42);
-        assert_eq!(request.key, b"/registry/pods/bench-bench/");
-        assert_eq!(request.range_end, prefix_range_end(&request.key));
-
-        let minions = workload
-            .ranges
-            .iter()
-            .find(|range| range.key_pattern == "/registry/minions/")
-            .unwrap();
-        let request = range_request(minions, 42);
-        assert_eq!(request.key, b"/registry/minions/");
-        assert_eq!(request.range_end, prefix_range_end(&request.key));
-    }
-
-    #[test]
-    fn test_trace_operation_totals() {
-        let workload =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        assert_eq!(application_operation_total(&workload), 492_618);
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        assert_eq!(plan.total_creates(), 80_248);
-        assert_eq!(plan.total_updates(), 412_371);
-    }
-
-    #[test]
-    fn test_node_status_phase_spacing() {
-        let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
-            nodes: 4,
-            status_interval: Duration::from_secs(300),
-            ..Default::default()
-        });
-        let phases: Vec<_> = (0..4)
-            .map(|node| {
-                planner
-                    .initial_status_at(node, Duration::from_secs(300))
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(
-            phases,
-            vec![
-                Duration::from_secs(75),
-                Duration::from_secs(150),
-                Duration::from_secs(225),
-                Duration::from_secs(300),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_node_status_cutoff() {
-        let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
-            nodes: 1,
-            status_interval: Duration::from_secs(300),
-            ..Default::default()
-        });
-        let duration = Duration::from_secs(300);
-        let first = planner.initial_status_at(0, duration).unwrap();
-        assert_eq!(first, duration);
-        assert_eq!(planner.next_status_at(first, duration), None);
-
-        let planner = NodeHeartbeatPlanner::new(crate::heartbeat::HeartbeatConfig {
-            nodes: 4,
-            status_interval: Duration::from_secs(300),
-            ..Default::default()
-        });
-        let duration = Duration::from_secs(700);
-        let schedules: Vec<Vec<_>> = (0..4)
-            .map(|node| {
-                let mut times = Vec::new();
-                let mut current = planner.initial_status_at(node, duration);
-                while let Some(at) = current {
-                    times.push(at);
-                    current = planner.next_status_at(at, duration);
-                }
-                times
-            })
-            .collect();
-        assert_eq!(
-            schedules,
-            vec![
-                vec![
-                    Duration::from_secs(75),
-                    Duration::from_secs(375),
-                    Duration::from_secs(675),
-                ],
-                vec![Duration::from_secs(150), Duration::from_secs(450)],
-                vec![Duration::from_secs(225), Duration::from_secs(525)],
-                vec![Duration::from_secs(300), Duration::from_secs(600)],
-            ]
-        );
-    }
-
-    #[test]
-    fn test_rolling_budget_total() {
-        let base =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        let base_range = range_request_total(&base, 1);
-        let base_app = application_operation_total(&base);
-        let (nodes, batch) = (100u64, 10u64);
-        let waves = nodes.div_ceil(batch);
-        let workload = base
-            .rolling_update(nodes, batch, 500.0, "rolling-test", base_range, base_app)
-            .unwrap();
-        let expected = 8 * nodes + 1 + 2 * waves;
-        assert_eq!(application_operation_total(&workload), expected);
-        let ranges = RateCursor::new(&workload, 1, 0xB2);
-        let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
-        let producer = RangeProducer::new(weights.iter().copied());
-        let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
-        range_shape_plan(&workload, prefix_total).unwrap();
-    }
-
-    #[test]
-    fn test_masterlease_tick_cutoff() {
-        let interval = Duration::from_secs(10);
-        let duration = Duration::from_secs(15);
-        assert_eq!(masterlease_tick_at(interval, 0, duration), Some(interval));
-        assert_eq!(masterlease_tick_at(interval, 1, duration), None);
-        assert_eq!(
-            masterlease_tick_at(Duration::from_secs(300), 0, duration),
-            None
-        );
-        let trace_duration = Duration::from_secs(2310);
-        let ticks = (0..231)
-            .filter(|&ordinal| masterlease_tick_at(interval, ordinal, trace_duration).is_some())
-            .count();
-        assert_eq!(ticks, 231);
-        assert_eq!(masterlease_tick_at(interval, 231, trace_duration), None);
-        assert_eq!(
-            masterlease_tick_at(Duration::from_secs_f64(1e19), 1, trace_duration),
-            None
-        );
-    }
-    #[test]
-    fn test_trace_count_only_budget() {
-        let workload =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        let ranges = RateCursor::new(&workload, 1, 0xB2);
-        assert_eq!(ranges.total(), 22_080);
-        let weights: Vec<f64> = workload.ranges.iter().map(|range| range.weight).collect();
-        let producer = RangeProducer::new(weights.iter().copied());
-        let prefix_total = exact_prefix_total(producer, &weights, &workload.ranges, ranges.total());
-        let mut plan = range_shape_plan(&workload, prefix_total).unwrap();
-        assert_eq!(plan.prefix_total, 16_875);
-        assert_eq!(plan.count_only, 220);
-        let mut count_only = 0;
-        for _ in 0..plan.prefix_total {
-            let mut request = RangeRequest {
-                limit: 500,
-                ..Default::default()
-            };
-            plan.apply(&mut request);
-            count_only += u64::from(request.count_only);
-        }
-        assert_eq!(count_only, 220);
-    }
-
-    #[test]
-    fn test_count_only_prefix_slots() {
-        let mut workload =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        workload.ranges = vec![
-            crate::config::RangeSpec {
-                key_pattern: "/registry/prefix/".into(),
-                kind: "prefix".into(),
-                limit: 500,
-                count_only: false,
-                weight: 1.0,
-                selector_keep_every: 1,
-            },
-            crate::config::RangeSpec {
-                key_pattern: "/registry/point".into(),
-                kind: "point".into(),
-                limit: 0,
-                count_only: false,
-                weight: 1.0,
-                selector_keep_every: 1,
-            },
-        ];
-        workload.range_count_only_count = 1;
-        let weights = vec![1.0, 1.0];
-        let mut producer = RangeProducer::new(weights.iter().copied());
-        let prefix_total = exact_prefix_total(producer.clone(), &weights, &workload.ranges, 4);
-        assert_eq!(prefix_total, 2);
-        let mut plan = range_shape_plan(&workload, prefix_total).unwrap();
-        let mut prefix_requests = Vec::new();
-        let mut point_requests = Vec::new();
-        for _ in 0..4 {
-            let index = producer.next(&weights).unwrap();
-            let mut request = RangeRequest {
-                limit: 500,
-                ..Default::default()
-            };
-            if workload.ranges[index].kind == "prefix" {
-                plan.apply(&mut request);
-                prefix_requests.push(request);
-            } else {
-                point_requests.push(request);
-            }
-        }
-        assert_eq!(prefix_requests.len(), 2);
-        assert_eq!(point_requests.len(), 2);
-        assert_eq!(
-            prefix_requests
-                .iter()
-                .filter(|request| request.count_only)
-                .count(),
-            1
-        );
-        assert!(prefix_requests.iter().all(|request| {
-            if request.count_only {
-                request.limit == 0
-            } else {
-                request.limit == 500
-            }
-        }));
-        assert!(point_requests.iter().all(|request| !request.count_only));
-
-        workload.range_count_only_count = 3;
-        let Err(error) = range_shape_plan(&workload, prefix_total) else {
-            panic!("count-only shapes must not exceed prefix capacity");
-        };
-        assert!(error.contains("exceeds scheduled prefix Range capacity"));
-    }
-
-    fn range_page(
-        revision: i64,
-        keys: &[&[u8]],
-        more: bool,
-        count: i64,
-    ) -> crate::pb::etcdserverpb::RangeResponse {
-        crate::pb::etcdserverpb::RangeResponse {
-            header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                revision,
-                ..Default::default()
-            }),
-            kvs: keys
-                .iter()
-                .map(|key| crate::pb::mvccpb::KeyValue {
-                    key: key.to_vec(),
-                    ..Default::default()
-                })
-                .collect(),
-            more,
-            count,
-        }
     }
 
     #[test]
@@ -4868,24 +4111,41 @@ mod tests {
         };
         let mut pager = RangePager::new(request, RangeSelector::All { target: None });
         assert_eq!(pager.request().limit, 500);
-        let first = range_page(42, &[b"a", b"b"], true, 4);
         assert!(matches!(
-            pager.observe_response(&first, 2).unwrap(),
+            pager
+                .observe_response(&range_page(42, &[b"a", b"b"], true, 4), 2)
+                .unwrap(),
             RangePageOutcome::Continue(_)
         ));
-        let next = pager.request();
-        assert_eq!(next.key, b"b\0");
-        assert_eq!(next.range_end, b"/registry/pods0");
-        assert_eq!(next.revision, 42);
-        let second = range_page(45, &[b"c", b"d"], false, 4);
+        assert_eq!(pager.request().revision, 42);
+        assert_eq!(pager.request().key, b"b\0");
         assert_eq!(
-            pager.observe_response(&second, 2).unwrap(),
+            pager
+                .observe_response(&range_page(45, &[b"c", b"d"], false, 4), 2)
+                .unwrap(),
             RangePageOutcome::Complete
         );
-        assert_eq!(pager.result().last_key, b"d");
-        assert_eq!(pager.result().selected, 4);
-        assert_eq!(pager.result().discarded, 0);
         assert_eq!(pager.result().snapshot_revision, 42);
+        assert_eq!(pager.result().selected, 4);
+    }
+
+    #[test]
+    fn test_list_explicit_snapshot() {
+        let request = RangeRequest {
+            key: b"/registry/pods/".to_vec(),
+            range_end: b"/registry/pods0".to_vec(),
+            revision: 77,
+            limit: 500,
+            ..Default::default()
+        };
+        let mut pager = RangePager::new(request, RangeSelector::All { target: Some(1) });
+        assert_eq!(
+            pager
+                .observe_response(&range_page(42, &[b"a"], false, 1), 1)
+                .unwrap(),
+            RangePageOutcome::Complete
+        );
+        assert_eq!(pager.result().snapshot_revision, 77);
     }
 
     #[test]
@@ -4896,42 +4156,45 @@ mod tests {
             limit: 500,
             ..Default::default()
         };
-        let mut pager = RangePager::new(request.clone(), RangeSelector::All { target: None });
-        let missing_revision = range_page(0, &[b"a"], true, 2);
-        assert!(pager.observe_response(&missing_revision, 1).is_err());
-
+        let mut missing_revision =
+            RangePager::new(request.clone(), RangeSelector::All { target: None });
+        assert!(
+            missing_revision
+                .observe_response(&range_page(0, &[b"a"], true, 1), 1)
+                .is_err()
+        );
         let mut empty = RangePager::new(request, RangeSelector::All { target: None });
-        let response = range_page(7, &[], true, 1);
-        let error = empty.observe_response(&response, 0).unwrap_err();
+        let error = empty
+            .observe_response(&range_page(7, &[], true, 0), 0)
+            .unwrap_err();
         assert!(error.contains("more=true"));
     }
 
     #[test]
-    fn test_list_explicit_snapshot() {
+    fn test_list_limit_bounds_physical_pages() {
         let request = RangeRequest {
             key: b"/registry/pods/".to_vec(),
             range_end: b"/registry/pods0".to_vec(),
-            revision: 7,
-            limit: 500,
+            limit: 600,
             ..Default::default()
         };
-        let mut pager = RangePager::new(request, RangeSelector::All { target: None });
+        let mut pager = RangePager::new(request, RangeSelector::All { target: Some(600) });
+        assert_eq!(pager.request().limit, 500);
         assert!(matches!(
             pager
-                .observe_response(&range_page(9, &[b"a"], true, 2), 1)
+                .observe_response(
+                    &range_page(
+                        9,
+                        &[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j"],
+                        true,
+                        10_000,
+                    ),
+                    1,
+                )
                 .unwrap(),
             RangePageOutcome::Continue(_)
         ));
-        assert_eq!(pager.request().revision, 7);
-        assert_eq!(pager.request().key, b"a\0");
-        assert_eq!(
-            pager
-                .observe_response(&range_page(12, &[b"b"], false, 1), 1)
-                .unwrap(),
-            RangePageOutcome::Complete
-        );
-        assert_eq!(pager.result().snapshot_revision, 7);
-        assert_eq!(pager.result().selected, 2);
+        assert_eq!(pager.request().limit, 599);
     }
 
     #[test]
@@ -4942,23 +4205,18 @@ mod tests {
             limit: 10_000,
             ..Default::default()
         };
-        let spec = crate::config::RangeSpec {
-            key_pattern: "/registry/pods/".into(),
-            kind: "prefix".into(),
-            limit: 0,
-            count_only: false,
-            weight: 1.0,
-            selector_keep_every: 2,
+        let selector = RangeSelector::DropEvery {
+            every: 2,
+            target: None,
         };
-        let selector = configured_range_selector(spec.selector_keep_every, spec.limit);
         let mut pager = RangePager::new(request, selector);
-        for expected_limit in [500, 1_000, 2_000, 4_000, 8_000, 10_000] {
+        for expected_limit in [500, 1_000, 2_000, 4_000, 8_000, 9_995] {
             assert_eq!(pager.request().limit, expected_limit);
             let key = [expected_limit as u8];
-            let response = range_page(9, &[&key, b"keep"], expected_limit != 10_000, 12);
+            let response = range_page(9, &[&key, b"keep"], expected_limit != 9_995, 12);
             let selected = selector.selected_in_page(response.kvs.len(), 0);
             let outcome = pager.observe_response(&response, selected).unwrap();
-            if expected_limit != 10_000 {
+            if expected_limit != 9_995 {
                 assert!(matches!(outcome, RangePageOutcome::Continue(_)));
             } else {
                 assert_eq!(outcome, RangePageOutcome::Complete);
@@ -4972,175 +4230,380 @@ mod tests {
         for request in [
             RangeRequest {
                 key: b"/registry/pods/item".to_vec(),
-                limit: 1,
                 ..Default::default()
             },
             RangeRequest {
                 key: b"/registry/pods/".to_vec(),
                 range_end: b"/registry/pods0".to_vec(),
                 count_only: true,
-                limit: 0,
                 ..Default::default()
             },
             RangeRequest {
                 key: b"/registry/pods/".to_vec(),
                 range_end: b"/registry/pods0".to_vec(),
-                limit: 0,
                 ..Default::default()
             },
         ] {
-            let original = request.clone();
-            let mut pager = RangePager::new(
-                request,
-                RangeSelector::DropEvery {
-                    every: 2,
-                    target: Some(100),
-                },
-            );
-            assert_eq!(pager.request(), original);
-            let response = range_page(3, &[b"a"], true, 1);
-            assert_eq!(
-                pager.observe_response(&response, 0).unwrap(),
-                RangePageOutcome::Complete
-            );
-            assert_eq!(pager.result().pages, 1);
+            assert!(!matches!(range_shape(&request), RangeShape::PagedPrefix));
+            let limit = request.limit;
+            let pager = RangePager::new(request, RangeSelector::All { target: None });
+            assert_eq!(pager.request().limit, limit);
         }
-    }
-
-    #[tokio::test]
-    async fn test_read_inventory_prepared() {
-        let probe = CreatePhaseProbe::default();
-        let first_bootstrap = probe.next_txn_reply();
-        let second_bootstrap = probe.next_txn_reply();
-        let held_service_create = probe.next_txn_reply();
-        first_bootstrap
-            .send(Ok(compact_response(1, true, 0, b"")))
-            .unwrap();
-        second_bootstrap
-            .send(Ok(compact_response(2, true, 0, b"")))
-            .unwrap();
-        *probe.range_reply.lock().unwrap() = Some(range_page(20, &[], false, 0));
-
-        let mut workload =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        workload.topology.node_count = 1;
-        workload.topology.pod_count = 1;
-        workload.resources.retain(|resource| {
-            matches!(
-                resource.name.as_str(),
-                "pods" | "services" | "endpointslices"
-            )
-        });
-        for resource in &mut workload.resources {
-            resource.count = ResourceCountSpec::Fixed { count: 1 };
-            resource.update_amplification = 0;
-        }
-        workload.relationships = crate::config::ResourceRelationshipsSpec::default();
-        workload.etcd_lease_pools.clear();
-        workload.watches.clear();
-        workload.status_count = 0;
-        workload.cas_conflicts = 0;
-        workload.compact_interval_s = 300.0;
-        workload.ranges = vec![crate::config::RangeSpec {
-            key_pattern: "/registry/services/".into(),
-            kind: "prefix".into(),
-            limit: 1,
-            count_only: false,
-            weight: 1.0,
-            selector_keep_every: 1,
-        }];
-        workload.range_count_only_count = 0;
-        workload.timeline = vec![crate::config::TimelineSegment {
-            duration_s: 0.001,
-            range_rps: 1_000.0,
-        }];
-
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let mut running = tokio::spawn(run_with_ctrl_c(
-            probe_config(workload),
-            client,
-            pending_ctrl_c(),
-        ));
-        probe.wait_for_txns(3).await;
-        assert_pending(std::pin::Pin::new(&mut running)).await;
-        assert!(probe.range_requests.lock().unwrap().is_empty());
-        held_service_create
-            .send(Ok(compact_response(3, true, 0, b"")))
-            .unwrap();
-
-        let report = time::timeout(Duration::from_secs(3), running)
-            .await
-            .expect("run completes after read-only inventory creation")
-            .expect("run task joins");
-        assert!(report.achieved);
-        let requests = probe.requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        assert!(requests[2].compare[0].key.starts_with(b"/registry/pods/"));
-        assert!(
-            requests[3].compare[0]
-                .key
-                .starts_with(b"/registry/services/")
-        );
-        assert!(
-            requests[4].compare[0]
-                .key
-                .starts_with(b"/registry/endpointslices/")
-        );
-        let ranges = probe.range_requests.lock().unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].key, b"/registry/services/");
-        assert_report_equations(&report);
-        drop(ranges);
-        drop(requests);
-        server.abort();
-        let _ = server.await;
     }
 
     #[test]
-    fn test_queue_closed_accounting() {
-        let (sender, receiver) = mpsc::channel(1);
+    fn test_dispatch_rate() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream_index = plan
+            .logical_streams
+            .iter()
+            .position(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let stream = &plan.logical_streams[stream_index];
+        let expected = planned_at(stream, 1_000_000).unwrap();
+        assert!(expected > 0);
+        let (sender, mut receiver) = mpsc::channel(64);
+        let now = TokioInstant::now();
+        let deadline = now + Duration::from_secs(1);
+        let mut state = DispatchState::new(&plan);
+        dispatch_tick(
+            &plan,
+            &recorder,
+            &[sender.clone()],
+            &mut state,
+            0,
+            1_000_000,
+            deadline,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(state.next_ordinals[stream_index], expected);
+        let mut accepted = 0;
+        while let Ok(item) = receiver.try_recv() {
+            accepted += 1;
+            drop(item);
+        }
+        assert_eq!(accepted, expected);
+        drop(sender);
         drop(receiver);
-        let mut stats = ScheduleStats::default();
-        let accounting = RunAccounting::new();
-        assert!(!try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status),
-            },
-            &mut stats,
-        ));
-        assert_eq!(stats.dropped, 1);
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        let status = report_class(&report, WorkClass::Status);
-        assert_eq!(status.offered, 1);
-        assert_eq!(status.accepted, 0);
-        assert_eq!(status.dropped_closed, 1);
-        assert_eq!(status.dropped_full, 0);
-        assert_eq!(status.unissued, 0);
-        assert!(!report.achieved);
-        assert_report_equations(&report);
+        recorder.stop_measurement().unwrap();
+        recorder.finish().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_worker_drain_error() {
-        let mut workers = JoinSet::new();
-        workers.spawn(async { Err("worker failed".to_string()) });
-        let (result, interrupted) = drain_worker_tasks(
-            Vec::new(),
-            workers,
-            Arc::new(HashMap::new()),
-            Duration::from_secs(1),
-            &mut pending_ctrl_c(),
+    #[test]
+    fn test_dispatch_no_catchup() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream_index = plan
+            .logical_streams
+            .iter()
+            .position(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let stream = &plan.logical_streams[stream_index];
+        let (sender, mut receiver) = mpsc::channel(64);
+        let mut state = DispatchState::new(&plan);
+        let now = TokioInstant::now();
+        let expired = now - Duration::from_millis(1);
+        dispatch_tick(
+            &plan,
+            &recorder,
+            &[sender.clone()],
+            &mut state,
+            0,
+            1_000_000,
+            expired,
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+        let at_three_ms = planned_at(stream, 3_000_000).unwrap();
+        skip_application_before(&plan, &recorder, &mut state, 3_000_000).unwrap();
+        assert_eq!(state.next_ordinals[stream_index], at_three_ms);
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        dispatch_tick(
+            &plan,
+            &recorder,
+            &[sender.clone()],
+            &mut state,
+            3_000_000,
+            4_000_000,
+            deadline,
+            deadline,
+        )
+        .unwrap();
+        let at_four_ms = planned_at(stream, 4_000_000).unwrap();
+        assert_eq!(state.next_ordinals[stream_index], at_four_ms);
+        let mut accepted = 0;
+        while let Ok(item) = receiver.try_recv() {
+            accepted += 1;
+            drop(item);
+        }
+        assert_eq!(accepted, at_four_ms.saturating_sub(at_three_ms));
+        let cutoff = TokioInstant::now() - Duration::from_millis(1);
+        dispatch_tick(
+            &plan,
+            &recorder,
+            &[sender.clone()],
+            &mut state,
+            4_000_000,
+            5_000_000,
+            deadline,
+            cutoff,
+        )
+        .unwrap();
+        assert_eq!(
+            state.next_ordinals[stream_index],
+            planned_at(stream, 5_000_000).unwrap()
+        );
+        while let Ok(item) = receiver.try_recv() {
+            drop(item);
+        }
+        drop(sender);
+        drop(receiver);
+        recorder.stop_measurement().unwrap();
+        recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_dispatch_interleaves_periodic_and_skips_elapsed_events() {
+        let mut config = small_plan().config;
+        config.load.update_rps = 2_000;
+        config.periodic.node_lease_interval_ms = 1;
+        config.periodic.node_lease_jitter_percent = 0;
+        config.periodic.node_status_interval_ms = 1;
+        config.periodic.status_interval_ms = 1;
+        config.periodic.compact_interval_ms = 1;
+        let plan = CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(128);
+        let mut state = DispatchState::new(&plan);
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        dispatch_tick(
+            &plan,
+            &recorder,
+            &[sender.clone()],
+            &mut state,
+            10_000_000,
+            11_000_000,
+            deadline,
+            deadline,
+        )
+        .unwrap();
+
+        let mut first_periodic = None;
+        let mut last_application = None;
+        let mut total = 0;
+        while let Ok(item) = receiver.try_recv() {
+            let is_periodic = matches!(
+                &item,
+                WorkItem::Heartbeat { .. } | WorkItem::Status { .. } | WorkItem::CompactTick { .. }
+            );
+            if is_periodic {
+                if first_periodic.is_none() {
+                    first_periodic = Some(total);
+                }
+            } else {
+                last_application = Some(total);
+            }
+            total += 1;
+            drop(item);
+        }
+        let first_periodic = first_periodic.expect("current periodic event was not dispatched");
+        let last_application = last_application.expect("application event was not dispatched");
+        assert!(first_periodic > 0);
+        assert!(first_periodic < last_application);
+
+        drop(sender);
+        drop(receiver);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let periodic_kinds = [
+            PeriodicKind::NodeLease,
+            PeriodicKind::NodeStatus,
+            PeriodicKind::Status,
+            PeriodicKind::Compact,
+        ];
+        let mut expected_missed = [0u64; 4];
+        let mut expected_current = [0u64; 4];
+        for event in &plan.periodic_events {
+            if event.at_ns < 10_000_000 {
+                expected_missed[event.kind.index()] += 1;
+            } else if event.at_ns < 11_000_000 {
+                expected_current[event.kind.index()] += 1;
+            }
+        }
+        for kind in periodic_kinds {
+            let identity = periodic_identity(kind);
+            let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+            assert_eq!(row.missed_schedule, expected_missed[kind.index()]);
+            assert_eq!(row.accepted, expected_current[kind.index()]);
+        }
+    }
+
+    #[test]
+    fn test_final_cutoff_rejection_marks_remaining_slots_missed() {
+        let mut config = small_plan().config;
+        config.periodic.node_lease_interval_ms = 1;
+        config.periodic.node_lease_jitter_percent = 0;
+        config.periodic.node_status_interval_ms = 1;
+        config.periodic.status_interval_ms = 1;
+        config.periodic.compact_interval_ms = 1;
+        let plan = CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap();
+        let clock = FinalAcceptCutoffClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        for kind in ResourceKind::ALL {
+            for _ in 0..resource_count(&plan, kind) {
+                let token = match recorder
+                    .offer_preparation(PreparationStream::Create(kind))
+                    .unwrap()
+                {
+                    OfferResult::Token(token) => token,
+                    other => panic!("unexpected create preparation offer: {other:?}"),
+                };
+                token.accept().unwrap();
+                token.started().unwrap();
+                token.terminal(Outcome::Success).unwrap();
+            }
+        }
+        for _ in 0..plan.resource_counts.nodes {
+            let token = match recorder
+                .offer_preparation(PreparationStream::NodeReady)
+                .unwrap()
+            {
+                OfferResult::Token(token) => token,
+                other => panic!("unexpected NodeReady preparation offer: {other:?}"),
+            };
+            token.accept().unwrap();
+            token.started().unwrap();
+            token.terminal(Outcome::Success).unwrap();
+        }
+        clock.arm_for_cutoff();
+        recorder.start_measurement().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(128);
+        let mut state = DispatchState::new(&plan);
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        dispatch_tick(
+            &plan,
+            &recorder,
+            &[sender.clone()],
+            &mut state,
+            0,
+            10_000_000,
+            deadline,
+            deadline,
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(sender);
+        drop(receiver);
+        mark_remaining_missed(&plan, &recorder, &mut state).unwrap();
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        assert!(report.accounting.planned_conserved);
+        for row in &report.measurement.logical {
+            assert_eq!(row.not_offered_after_stop, 0);
+            assert_eq!(row.planned, row.missed_schedule);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dispatch_until_dispatches_current_tick_after_late_wake() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = stream_identity(stream);
+        let skipped = planned_at(stream, 3_000_000).unwrap();
+        let current = planned_at(stream, 4_000_000)
+            .unwrap()
+            .saturating_sub(skipped);
+        assert!(current > 0);
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(64);
+        let senders = vec![sender.clone()];
+        let mut worker_tasks = JoinSet::new();
+        let mut watch_tasks = JoinSet::new();
+        let mut first_ctrl_poll = true;
+        let mut ctrl_c: CtrlCFuture = Box::pin(std::future::poll_fn(move |_cx| {
+            if std::mem::replace(&mut first_ctrl_poll, false) {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }));
+        let started = TokioInstant::now() - Duration::from_millis(3);
+        let cutoff = started + run_duration(&plan);
+        let exit = dispatch_until(
+            &plan,
+            &recorder,
+            &senders,
+            &mut worker_tasks,
+            &mut watch_tasks,
+            started,
+            cutoff,
+            &mut ctrl_c,
         )
         .await;
-        assert!(result.unwrap_err().contains("worker failed"));
-        assert!(!interrupted);
+        let mut state = match exit {
+            DispatchExit::Interrupted(state) => state,
+            DispatchExit::Completed(_) => panic!("late wake should be interrupted"),
+            DispatchExit::Failed(error, _) => panic!("late wake failed: {error}"),
+        };
+        let mut items = Vec::new();
+        while let Ok(item) = receiver.try_recv() {
+            items.push(item);
+        }
+        assert_eq!(items.len(), usize::try_from(current).unwrap());
+        for item in &items {
+            match item {
+                WorkItem::Txn { resource, key, .. } => {
+                    assert_eq!(*resource, stream.resource);
+                    assert_eq!(
+                        key,
+                        &plan.resource_key(stream.resource, skipped, plan.config.seed)
+                    );
+                }
+                other => panic!("late wake emitted non-update work item: {other:?}"),
+            }
+        }
+        drop(items);
+        drop(senders);
+        drop(sender);
+        drop(receiver);
+        recorder.stop_measurement().unwrap();
+        mark_remaining_not_offered(&plan, &recorder, &mut state).unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.missed_schedule, skipped);
+        assert_eq!(row.offered, current);
+        assert_eq!(row.accepted, current);
     }
 
-    #[tokio::test]
-    async fn test_watch_terminal_stops_schedule() {
-        let mut tasks = JoinSet::new();
-        tasks.spawn(async {
+    #[tokio::test(start_paused = true)]
+    async fn test_watch_completion_does_not_dispatch_future_tick_early() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(128);
+        let senders = vec![sender];
+        let mut worker_tasks = JoinSet::new();
+        let mut watch_tasks = JoinSet::new();
+        let (watch_release_tx, watch_release_rx) = oneshot::channel();
+        let (watch_done_tx, watch_done_rx) = oneshot::channel();
+        watch_tasks.spawn(async move {
+            watch_release_rx.await.unwrap();
+            let _ = watch_done_tx.send(());
             (
                 "pods".to_string(),
                 Ok(crate::watch::WatchOutcome {
@@ -5151,25 +4614,364 @@ mod tests {
                 }),
             )
         });
-        let mut ctrl_c: CtrlCFuture =
-            Box::pin(std::future::pending::<Result<(), std::io::Error>>());
+        let mut ctrl_c = pending_ctrl_c();
+        let started = TokioInstant::now();
+        let cutoff = started + run_duration(&plan);
+        let mut dispatch = Box::pin(dispatch_until(
+            &plan,
+            &recorder,
+            &senders,
+            &mut worker_tasks,
+            &mut watch_tasks,
+            started,
+            cutoff,
+            &mut ctrl_c,
+        ));
+        assert_pending(dispatch.as_mut()).await;
+        let initial = receiver.len();
+        assert!(initial > 0);
+        time::advance(Duration::from_micros(100)).await;
+        watch_release_tx.send(()).unwrap();
+        watch_done_rx.await.unwrap();
+        assert!(TokioInstant::now() < started + Duration::from_millis(1));
+        assert_pending(dispatch.as_mut()).await;
+        assert_eq!(receiver.len(), initial);
+        time::advance(run_duration(&plan) + Duration::from_millis(1)).await;
+        let mut state = match dispatch.await {
+            DispatchExit::Completed(state) => state,
+            DispatchExit::Interrupted(_) => panic!("watch terminal interrupted the run"),
+            DispatchExit::Failed(error, _) => panic!("watch terminal failed the run: {error}"),
+        };
+        while let Ok(item) = receiver.try_recv() {
+            drop(item);
+        }
+        drop(receiver);
+        drop(senders);
+        recorder.stop_measurement().unwrap();
+        mark_remaining_missed(&plan, &recorder, &mut state).unwrap();
+        let report = recorder.finish().unwrap();
+        assert_eq!(
+            report.timing.observed_measurement_ns,
+            Some(u64::try_from(run_duration(&plan).as_nanos()).unwrap())
+        );
+    }
 
-        let result = time::timeout(
-            Duration::from_secs(1),
-            wait_for_supervised_schedule_event(
-                &mut tasks,
-                &mut JoinSet::new(),
-                &mut None,
-                TokioInstant::now() + Duration::from_secs(60),
-                &mut ctrl_c,
-            ),
+    #[tokio::test(start_paused = true)]
+    async fn test_dispatch_until_waits_for_cutoff_before_completion() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let (sender, receiver) = mpsc::channel::<WorkItem>(64);
+        let senders = vec![sender.clone()];
+        let mut worker_tasks = JoinSet::new();
+        let mut watch_tasks = JoinSet::new();
+        let mut ctrl_c = pending_ctrl_c();
+        let started = TokioInstant::now();
+        let cutoff = started + run_duration(&plan);
+        let exit = dispatch_until(
+            &plan,
+            &recorder,
+            &senders,
+            &mut worker_tasks,
+            &mut watch_tasks,
+            started,
+            cutoff,
+            &mut ctrl_c,
+        )
+        .await;
+        let mut state = match exit {
+            DispatchExit::Completed(state) => state,
+            DispatchExit::Interrupted(_) => panic!("normal dispatch was interrupted"),
+            DispatchExit::Failed(error, _) => panic!("normal dispatch failed: {error}"),
+        };
+        assert!(TokioInstant::now() >= cutoff);
+        drop(senders);
+        drop(sender);
+        drop(receiver);
+        recorder.stop_measurement().unwrap();
+        mark_remaining_not_offered(&plan, &recorder, &mut state).unwrap();
+        recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_compactor_journal_revision_and_recovery() {
+        let mut state = CompactorState::default();
+        assert_eq!(state.txn_inputs(), (0, 0));
+        assert_eq!(
+            state
+                .observe(&compact_response(11, true, 0, b""))
+                .unwrap()
+                .compact_target,
+            None
+        );
+        let conflict = state
+            .observe(&compact_response(30, false, 7, b"19"))
+            .unwrap();
+        assert_eq!(conflict.compact_target, None);
+        assert_eq!(conflict.remote_compact_revision, Some(19));
+        assert_eq!(state.txn_inputs(), (7, 30));
+        let next = state.observe(&compact_response(40, true, 0, b"")).unwrap();
+        assert_eq!(next.compact_target, Some(30));
+        assert_eq!(state.txn_inputs(), (8, 40));
+
+        let mut invalid = CompactorState {
+            compact_version: 7,
+            previous_txn_header_revision: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid.observe(&compact_response(30, false, 7, b"bad")),
+            Err(CompactorObservationError::FailureValueNotDecimal)
+        );
+        assert_eq!(invalid.status, CompactorStatus::ResyncRequired);
+        let recovered = invalid
+            .observe(&compact_response(50, false, 9, b"19"))
+            .unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(invalid.txn_inputs(), (9, 50));
+    }
+
+    #[test]
+    fn test_offered_token_crossing_tick_is_missed_once() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = stream_identity(stream);
+        let token = match recorder.offer(identity).unwrap() {
+            OfferResult::Token(token) => token,
+            other => panic!("unexpected offer result: {other:?}"),
+        };
+        assert_eq!(
+            token.accept_for_tick(0).unwrap(),
+            TokenAction::RejectedAfterTick
+        );
+        assert_eq!(
+            token.accept_for_tick(0).unwrap(),
+            TokenAction::AlreadyFinalized
+        );
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.offered, 0);
+        assert_eq!(row.missed_schedule, 1);
+        assert_eq!(row.not_offered_after_stop, 0);
+    }
+
+    #[test]
+    fn test_rejected_admission_never_reaches_worker_receiver() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = stream_identity(stream);
+        let (sender, mut receiver) = mpsc::channel(1);
+        let result = dispatch_application_item(
+            &plan,
+            &recorder,
+            stream,
+            0,
+            &sender,
+            TokioInstant::now() + Duration::from_secs(1),
+            TokioInstant::now() + Duration::from_secs(1),
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, DispatchOutcome::MissedToken);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(sender);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.accepted, 0);
+        assert_eq!(row.missed_schedule, 1);
+    }
+
+    #[test]
+    fn test_queue_full_drop() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = LogicalStreamIdentity::Application {
+            work_class: stream.work_class,
+            resource: stream.resource,
+        };
+        let filler = match recorder
+            .offer(LogicalStreamIdentity::Periodic {
+                kind: PeriodicKind::Compact,
+            })
+            .unwrap()
+        {
+            OfferResult::Token(token) => WorkItem::CompactTick { token },
+            other => panic!("unexpected filler offer: {other:?}"),
+        };
+        filler.accept().unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        sender.try_send(filler).unwrap();
+        let result = dispatch_application_item(
+            &plan,
+            &recorder,
+            stream,
+            0,
+            &sender,
+            TokioInstant::now() + Duration::from_secs(1),
+            TokioInstant::now() + Duration::from_secs(1),
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(result, DispatchOutcome::Dropped);
+        drop(sender);
+        drop(receiver);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.dropped_full, 1);
+    }
+
+    #[test]
+    fn test_queue_closed_drop() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = stream_identity(stream);
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let error = dispatch_application_item(
+            &plan,
+            &recorder,
+            stream,
+            0,
+            &sender,
+            TokioInstant::now() + Duration::from_secs(1),
+            TokioInstant::now() + Duration::from_secs(1),
+            1_000_000,
+        )
+        .unwrap_err();
+        assert_eq!(error, "measurement worker queue closed");
+        drop(sender);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.dropped_closed, 0);
+        assert_eq!(row.not_offered_after_stop, 1);
+    }
+
+    #[tokio::test]
+    async fn test_worker_abort_unfinished() {
+        let plan = small_plan();
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = stream_identity(stream);
+        let token = match recorder.offer(identity).unwrap() {
+            OfferResult::Token(token) => token,
+            other => panic!("unexpected offer result: {other:?}"),
+        };
+        let item = WorkItem::Txn {
+            resource: stream.resource,
+            key: plan.resource_key(stream.resource, 0, plan.config.seed),
+            operation: ResourceOperation::GuaranteedUpdate,
+            value: plan.resource_value(stream.resource, 0, plan.config.seed, 0),
+            token,
+            preparation: None,
+        };
+        item.accept().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(1);
+        let (started, started_rx) = oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let Some(item) = receiver.recv().await else {
+                return Ok(());
+            };
+            item.started().unwrap();
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        });
+        sender.send(item).await.unwrap();
+        started_rx.await.unwrap();
+        abort_workers(vec![sender], tasks).await;
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[identity.measurement_index().unwrap()];
+        assert_eq!(row.canceled_running, 1);
+        assert_eq!(row.accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn test_watch_ready_waits_all() {
+        let (first_tx, first_rx) = oneshot::channel();
+        let (last_tx, last_rx) = oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<WatchTaskOutput>());
+        tasks.spawn(std::future::pending::<WatchTaskOutput>());
+        let mut ctrl_c = pending_ctrl_c();
+        let mut waiting = Box::pin(wait_for_watch_ready(
+            &mut tasks,
+            vec![first_rx, last_rx],
+            TokioInstant::now() + Duration::from_secs(1),
+            &mut ctrl_c,
+        ));
+        assert_pending(waiting.as_mut()).await;
+        first_tx.send(()).unwrap();
+        assert_pending(waiting.as_mut()).await;
+        last_tx.send(()).unwrap();
+        waiting.await.unwrap();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn test_watch_ready_preserves_terminal_cause() {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        drop(ready_tx);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async {
+            time::sleep(Duration::from_millis(1)).await;
+            (
+                "pods".to_string(),
+                Ok(crate::watch::WatchOutcome {
+                    terminal: crate::watch::WatchTerminal::Canceled {
+                        reason: "server canceled".into(),
+                    },
+                    state: crate::watch::WatchState::default(),
+                }),
+            )
+        });
+        let mut ctrl_c = pending_ctrl_c();
+        let error = wait_for_watch_ready(
+            &mut tasks,
+            vec![ready_rx],
+            TokioInstant::now() + Duration::from_secs(1),
+            &mut ctrl_c,
         )
         .await
-        .unwrap();
-
-        let Err(error) = result else {
-            panic!("watch terminal should stop scheduling");
-        };
+        .unwrap_err();
         assert_eq!(
             error,
             "watch pods terminated: Canceled { reason: \"server canceled\" }"
@@ -5186,1544 +4988,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_watch_error_cancels_workers() {
-        let probe = CreatePhaseProbe::default();
-        let fail_watch = probe.fail_watch_after_created();
-        for revision in 1..=3 {
-            probe
-                .next_txn_reply()
-                .send(Ok(compact_response(revision, true, 0, b"")))
-                .unwrap();
-        }
-        let held_update = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let mut workload = probe_workload();
-        workload.resources[0].update_amplification = 2;
-        workload.watches = vec![crate::config::WatchSpec {
-            name: "pods".into(),
-            resource_prefix: "/registry/pods".into(),
-            start_revision: 0,
-            prev_kv: true,
-            progress_notify: true,
-        }];
-        let running = tokio::spawn(run_with_ctrl_c(
-            probe_config(workload),
-            client,
-            pending_ctrl_c(),
-        ));
-
-        probe.wait_for_txns(4).await;
-        fail_watch.send(()).unwrap();
-        let report = time::timeout(Duration::from_secs(3), running)
-            .await
-            .expect("watch failure run returns")
-            .expect("watch failure task joins");
-        assert!(!report.achieved);
-        assert!(!report.interrupted);
-        assert!(!report.schedule_complete);
-        assert!(
-            report
-                .termination_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("server failed")
-        );
-        assert_eq!(probe.requests.lock().unwrap().len(), 4);
-        assert_report_equations(&report);
-        drop(held_update);
-        server.abort();
-        let _ = server.await;
-    }
-
-    fn compact_response(
-        header_revision: i64,
-        succeeded: bool,
-        remote_version: i64,
-        remote_value: &[u8],
-    ) -> TxnResponse {
-        TxnResponse {
-            header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                revision: header_revision,
-                ..Default::default()
-            }),
-            succeeded,
-            responses: if succeeded {
-                Vec::new()
-            } else {
-                vec![ResponseOp {
-                    response: Some(
-                        crate::pb::etcdserverpb::response_op::Response::ResponseRange(
-                            crate::pb::etcdserverpb::RangeResponse {
-                                kvs: vec![mvccpb::KeyValue {
-                                    version: remote_version,
-                                    value: remote_value.to_vec(),
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            },
-                        ),
-                    ),
-                }]
-            },
-            ..Default::default()
-        }
-    }
-    fn compact_response_without_kv(header_revision: i64) -> TxnResponse {
-        TxnResponse {
-            header: Some(crate::pb::etcdserverpb::ResponseHeader {
-                revision: header_revision,
-                ..Default::default()
-            }),
-            succeeded: false,
-            responses: vec![ResponseOp {
-                response: Some(
-                    crate::pb::etcdserverpb::response_op::Response::ResponseRange(
-                        crate::pb::etcdserverpb::RangeResponse::default(),
-                    ),
-                ),
-            }],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_compactor_previous_revision() {
-        let mut state = CompactorState::default();
-        assert_eq!(state.txn_inputs(), (0, 0));
-        let first = state.observe(&compact_response(11, true, 0, b"")).unwrap();
-        assert_eq!(first.compact_target, None);
-        assert_eq!(state.txn_inputs(), (1, 11));
-        let observation = state.observe(&compact_response(20, true, 0, b"")).unwrap();
-        assert_eq!(observation.compact_target, Some(11));
-        assert_eq!(state.txn_inputs(), (2, 20));
-    }
-
-    #[test]
-    fn test_compactor_cas_resync() {
-        let mut state = CompactorState {
-            compact_version: 2,
-            previous_txn_header_revision: 20,
-            status: CompactorStatus::Active,
-            recovery: None,
-        };
-        let conflict = state
-            .observe(&compact_response(30, false, 7, b"19"))
-            .unwrap();
-        assert_eq!(conflict.compact_target, None);
-        assert_eq!(conflict.remote_compact_revision, Some(19));
-        assert_eq!(state.txn_inputs(), (7, 30));
-        let observation = state.observe(&compact_response(40, true, 0, b"")).unwrap();
-        assert_eq!(observation.compact_target, Some(30));
-        assert_eq!(state.txn_inputs(), (8, 40));
-    }
-
-    #[test]
-    fn test_compactor_missing_key_recovers() {
-        let mut state = CompactorState {
-            compact_version: 7,
-            previous_txn_header_revision: 20,
-            status: CompactorStatus::Active,
-            recovery: None,
-        };
-        assert_eq!(
-            state.observe(&compact_response_without_kv(30)),
-            Err(CompactorObservationError::FailureKvMissing)
-        );
-        assert_eq!(state.status, CompactorStatus::ResyncRequired);
-        assert_eq!(state.recovery, Some(CompactorRecovery::MissingKey));
-        assert_eq!(state.txn_inputs(), (0, 30));
-
-        // The next tick is a single Version==0 CAS probe.  Its success
-        // rebuilds the journal and cannot trigger a stale Compact.
-        let recovery = state.observe(&compact_response(40, true, 0, b"")).unwrap();
-        assert!(recovery.recovered);
-        assert_eq!(recovery.compact_target, None);
-        assert_eq!(state.status, CompactorStatus::Active);
-        assert_eq!(state.recovery, None);
-        assert_eq!(state.txn_inputs(), (1, 40));
-
-        let next = state.observe(&compact_response(50, true, 0, b"")).unwrap();
-        assert_eq!(next.compact_target, Some(40));
-        assert_eq!(state.txn_inputs(), (2, 50));
-    }
-
-    #[test]
-    fn test_compactor_invalid_value_recovers() {
-        let mut state = CompactorState {
-            compact_version: 7,
-            previous_txn_header_revision: 20,
-            status: CompactorStatus::Active,
-            recovery: None,
-        };
-        assert_eq!(
-            state.observe(&compact_response(30, false, 7, b"not-a-revision")),
-            Err(CompactorObservationError::FailureValueNotDecimal)
-        );
-        assert_eq!(state.status, CompactorStatus::ResyncRequired);
-        assert_eq!(state.recovery, Some(CompactorRecovery::InvalidValue));
-        // Every malformed tick coordinates again and remains explicit; it
-        // never carries forward the old version/header into Compact.
-        assert_eq!(
-            state.observe(&compact_response(40, false, 8, b"\xff")),
-            Err(CompactorObservationError::FailureValueNotUtf8)
-        );
-        assert_eq!(state.status, CompactorStatus::ResyncRequired);
-        assert_eq!(state.txn_inputs(), (0, 40));
-
-        // A legal remote value completes resync in the same failed Txn
-        // response, still without a Compact on this tick.
-        let recovery = state
-            .observe(&compact_response(50, false, 9, b"19"))
-            .unwrap();
-        assert!(recovery.recovered);
-        assert_eq!(recovery.compact_target, None);
-        assert_eq!(recovery.remote_compact_revision, Some(19));
-        assert_eq!(state.status, CompactorStatus::Active);
-        assert_eq!(state.recovery, None);
-        assert_eq!(state.txn_inputs(), (9, 50));
-
-        let next = state.observe(&compact_response(60, true, 0, b"")).unwrap();
-        assert_eq!(next.compact_target, Some(50));
-        assert_eq!(state.txn_inputs(), (10, 60));
-    }
-    fn exact_phase_workload() -> WorkloadSpec {
-        let mut workload =
-            WorkloadSpec::from_json(include_str!("../workloads/k8s-no-node-lease.json")).unwrap();
-        workload.topology.node_count = 2;
-        workload.topology.pod_count = 4;
-        workload
-            .resources
-            .retain(|resource| resource.name == "pods" || resource.name == "events");
-        workload.relationships = crate::config::ResourceRelationshipsSpec::default();
-        let pods = workload
-            .resources
-            .iter_mut()
-            .find(|resource| resource.name == "pods")
-            .unwrap();
-        pods.count = ResourceCountSpec::Pods {
-            numerator: 1,
-            denominator: 1,
-        };
-        pods.update_amplification = 2;
-        let events = workload
-            .resources
-            .iter_mut()
-            .find(|resource| resource.name == "events")
-            .unwrap();
-        events.count = ResourceCountSpec::Pods {
-            numerator: 1,
-            denominator: 1,
-        };
-        events.update_amplification = 1;
-        workload
-    }
-
-    #[test]
-    fn test_workload_plan_totals() {
-        let workload = exact_phase_workload();
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        assert_eq!(plan.total_creates(), 8);
-        assert_eq!(plan.total_updates(), 12);
-        let creates: Vec<_> = plan.creates().collect();
-        assert_eq!(creates.len(), 8);
-        let expected: std::collections::BTreeSet<_> =
-            (0..4).flat_map(|id| [(0, id), (1, id)]).collect();
-        let actual: std::collections::BTreeSet<_> = creates
-            .iter()
-            .map(|operation| (operation.resource, operation.id))
-            .collect();
-        assert_eq!(actual, expected);
-
-        let mut workload = exact_phase_workload();
-        workload.topology.node_count = 2_000;
-        workload.topology.pod_count = 40_000;
-        workload
-            .resources
-            .iter_mut()
-            .find(|resource| resource.name == "pods")
-            .unwrap()
-            .update_amplification = 10;
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        assert_eq!(plan.resources[0].count, 40_000);
-        assert_eq!(plan.resources[1].count, 40_000);
-        assert_eq!(plan.total_creates(), 80_000);
-        assert_eq!(plan.total_updates(), 440_000);
-        assert_eq!(plan.creates().count(), 80_000);
-    }
-
-    #[test]
-    fn test_update_cursor_key_counts() {
-        let workload = exact_phase_workload();
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        let mut counts = HashMap::new();
-        for operation in UpdateCursor::new(&plan, 7) {
-            *counts
-                .entry((operation.resource, operation.id))
-                .or_insert(0u64) += 1;
-        }
-        for id in 0..4 {
-            assert_eq!(counts.get(&(0, id)), Some(&2));
-            assert_eq!(counts.get(&(1, id)), Some(&1));
-        }
-        assert_eq!(counts.values().sum::<u64>(), 12);
-    }
-
-    #[test]
-    fn test_create_metrics_deficit() {
-        let workload = exact_phase_workload();
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        let tracker = PhaseTracker::new(plan.create_targets(workload.resources.len()));
-        for _ in 0..4 {
-            tracker.record(0, Outcome::Success);
-        }
-        for _ in 0..3 {
-            tracker.record(1, Outcome::Success);
-        }
-        tracker.record(1, Outcome::ResultUnknown);
-
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        ::metrics::with_local_recorder(&recorder, || {
-            tracker.publish(&workload, PhaseKind::Create);
-        });
-        let rendered = recorder.handle().render();
-        let value = |resource: &str, state: &str| {
-            rendered
-                .lines()
-                .find(|line| {
-                    line.starts_with(metrics::RESOURCE_OBJECTS)
-                        && line.contains(&format!("resource=\"{resource}\""))
-                        && line.contains(&format!("state=\"{state}\""))
-                })
-                .and_then(|line| line.rsplit_once(' '))
-                .and_then(|(_, value)| value.parse::<u64>().ok())
-                .unwrap()
-        };
-        assert_eq!(value("pods", "planned"), 4);
-        assert_eq!(value("pods", "succeeded"), 4);
-        assert_eq!(value("events", "planned"), 4);
-        assert_eq!(value("events", "succeeded"), 3);
-        assert_eq!(value("events", "deficit"), 1);
-    }
-
-    #[test]
-    fn test_create_deficit_error() {
-        let tracker = PhaseTracker::new(vec![3]);
-        tracker.record(0, Outcome::Success);
-        tracker.record(0, Outcome::ResultUnknown);
-        tracker.record(0, Outcome::Success);
-        let error = tracker.result("create").unwrap_err();
-        assert!(error.contains("target=3"));
-        assert!(error.contains("succeeded=2"));
-        assert!(error.contains("deficit=1"));
-    }
-    #[test]
-    fn test_accounting_terminal_totals() {
-        let accounting = RunAccounting::new();
-        let mut success = tracked(&accounting, WorkClass::Create);
-        success.mark_accepted();
-        success.mark_complete(Outcome::Success);
-
-        let mut unknown = tracked(&accounting, WorkClass::Create);
-        unknown.mark_accepted();
-        unknown.mark_complete(Outcome::ResultUnknown);
-
-        let mut dropped = tracked(&accounting, WorkClass::Create);
-        dropped.mark_dropped(DropReason::Backpressure);
-
-        let mut unissued = tracked(&accounting, WorkClass::Create);
-        unissued.mark_unissued();
-
-        {
-            let mut unfinished = tracked(&accounting, WorkClass::Create);
-            unfinished.mark_accepted();
-        }
-
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        let create = report
-            .work_items
-            .iter()
-            .find(|item| item.work_class == "create")
-            .unwrap();
-        assert_eq!(create.offered, 5);
-        assert_eq!(create.accepted, 3);
-        assert_eq!(create.completed, 2);
-        assert_eq!(create.succeeded, 1);
-        assert_eq!(create.failed, 1);
-        assert_eq!(create.result_unknown, 1);
-        assert_eq!(create.dropped, 1);
-        assert_eq!(create.dropped_full, 1);
-        assert_eq!(create.unfinished, 1);
-        assert_eq!(create.unissued, 1);
-        assert!(
-            report
-                .accounting_invariants
-                .offered_equals_accepted_plus_dropped_plus_unissued
-        );
-        assert!(
-            report
-                .accounting_invariants
-                .accepted_equals_completed_plus_unfinished
-        );
-        assert!(
-            report
-                .accounting_invariants
-                .accepted_equals_succeeded_plus_failed_plus_unfinished
-        );
-        assert!(report.accounting_invariants.result_unknown_subset_failed);
-        assert!(!report.achieved);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_enqueue_timeout_unissued() {
-        let accounting = RunAccounting::new();
-        let (sender, receiver) = mpsc::channel(1);
-        let mut stats = ScheduleStats::default();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status)
-            },
-            &mut stats,
-        ));
-
-        let second = WorkItem::Status {
-            accounting: tracked(&accounting, WorkClass::Status),
-        };
-        let enqueue = enqueue_until(
-            &sender,
-            second,
-            TokioInstant::now() + Duration::from_millis(1),
-        );
-        time::advance(Duration::from_millis(2)).await;
-        let result = enqueue.await;
-        assert!(matches!(result, EnqueueResult::Unissued));
-        drop(receiver);
-
-        let report = accounting.report(RunTargets::default(), true, false, None);
-        let status = report
-            .work_items
-            .iter()
-            .find(|item| item.work_class == "status")
-            .unwrap();
-        assert_eq!(status.offered, 2);
-        assert_eq!(status.accepted, 1);
-        assert_eq!(status.unfinished, 1);
-        assert_eq!(status.unissued, 1);
-        assert_report_equations(&report);
-    }
-
-    #[tokio::test]
-    async fn test_bootstrap_rpc_unknown() {
-        let probe = CreatePhaseProbe::default();
-        probe
-            .next_txn_reply()
-            .send(Err(tonic::Status::deadline_exceeded("response lost")))
-            .unwrap();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, worker) = spawn_probe_worker(client, probe_workload());
-        let (done, ack) = oneshot::channel();
-        let mut stats = ScheduleStats::default();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut stats,
-        ));
-        drop(sender);
-        let error = time::timeout(Duration::from_secs(3), ack)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(error.contains("result_unknown"));
-        time::timeout(Duration::from_secs(3), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        let bootstrap = report_class(&report, WorkClass::Bootstrap);
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        assert_eq!(bootstrap.offered, 1);
-        assert_eq!(bootstrap.accepted, 1);
-        assert_eq!(bootstrap.completed, 1);
-        assert_eq!(bootstrap.succeeded, 0);
-        assert_eq!(bootstrap.failed, 1);
-        assert_eq!(bootstrap.result_unknown, 1);
-        assert_eq!(bootstrap.unfinished, 0);
-        assert!(!report.achieved);
-        assert_report_equations(&report);
-        let untouched_run = RunAccounting::new().report(RunTargets::default(), false, true, None);
-        assert!(
-            untouched_run
-                .work_items
-                .iter()
-                .all(|item| item.offered == 0)
-        );
-        assert_report_equations(&untouched_run);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_heartbeat_rpc_unknown() {
-        let probe = CreatePhaseProbe::default();
-        probe
-            .next_txn_reply()
-            .send(Ok(compact_response(11, true, 0, b"")))
-            .unwrap();
-        probe
-            .next_txn_reply()
-            .send(Err(tonic::Status::unavailable("committed response lost")))
-            .unwrap();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, worker) = spawn_probe_worker(client, probe_workload());
-        let (done, ack) = oneshot::channel();
-        let mut stats = ScheduleStats::default();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut stats,
-        ));
-        time::timeout(Duration::from_secs(3), ack)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Heartbeat {
-                item: probe_heartbeat(HeartbeatItemKind::NodeStatus),
-                accounting: tracked(&accounting, WorkClass::Heartbeat),
-            },
-            &mut stats,
-        ));
-        drop(sender);
-        time::timeout(Duration::from_secs(3), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        let heartbeat = report_class(&report, WorkClass::Heartbeat);
-        let requests = probe.requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            2,
-            "periodic heartbeat must reach the RPC, without replay"
-        );
-        assert!(matches!(
-            requests[1].compare[0].target_union,
-            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
-                11
-            ))
-        ));
-        drop(requests);
-        assert_eq!(report_class(&report, WorkClass::Bootstrap).succeeded, 1);
-        assert_eq!(heartbeat.offered, 1);
-        assert_eq!(heartbeat.accepted, 1);
-        assert_eq!(heartbeat.completed, 1);
-        assert_eq!(heartbeat.succeeded, 0);
-        assert_eq!(heartbeat.failed, 1);
-        assert_eq!(heartbeat.result_unknown, 1);
-        assert_eq!(heartbeat.unfinished, 0);
-        assert!(!report.achieved);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    async fn run_compact_probe(responses: Vec<TxnResponse>) -> (RunReport, CreatePhaseProbe) {
-        let probe = CreatePhaseProbe::default();
-        let ticks = responses.len();
-        for response in responses {
-            probe.next_txn_reply().send(Ok(response)).unwrap();
-        }
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, worker) = spawn_probe_worker(client, probe_workload());
-        let mut stats = ScheduleStats::default();
-        for _ in 0..ticks {
-            assert!(try_enqueue(
-                &sender,
-                WorkItem::CompactTick {
-                    accounting: tracked(&accounting, WorkClass::Compact)
-                },
-                &mut stats,
-            ));
-        }
-        drop(sender);
-        time::timeout(Duration::from_secs(3), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        assert_report_equations(&report);
-        let compact = report_class(&report, WorkClass::Compact);
-        assert_eq!(compact.offered, ticks as u64);
-        assert_eq!(compact.accepted, ticks as u64);
-        assert_eq!(compact.completed, ticks as u64);
-        assert_eq!(compact.unfinished, 0);
-        server.abort();
-        let _ = server.await;
-        (report, probe)
-    }
-
-    #[tokio::test]
-    async fn test_compact_first_tick_noop() {
-        let (report, probe) = run_compact_probe(vec![compact_response(11, true, 0, b"")]).await;
-        assert_eq!(
-            *probe.requests.lock().unwrap(),
-            vec![build_compact_revision_txn(b"0", 0)]
-        );
-        assert!(probe.compact_requests.lock().unwrap().is_empty());
-        let compact = report_class(&report, WorkClass::Compact);
-        assert_eq!(compact.succeeded, 1);
-        assert_eq!(compact.failed, 0);
-        assert_eq!(compact.result_unknown, 0);
-        assert!(report.achieved);
-    }
-
-    #[tokio::test]
-    async fn test_compact_conflict_no_retry() {
-        let (report, probe) = run_compact_probe(vec![
-            compact_response(11, true, 0, b""),
-            compact_response(22, false, 9, b"7"),
-        ])
-        .await;
-        assert_eq!(
-            *probe.requests.lock().unwrap(),
-            vec![
-                build_compact_revision_txn(b"0", 0),
-                build_compact_revision_txn(b"11", 1),
-            ]
-        );
-        assert!(probe.compact_requests.lock().unwrap().is_empty());
-        let compact = report_class(&report, WorkClass::Compact);
-        assert_eq!(compact.succeeded, 2);
-        assert_eq!(compact.failed, 0);
-        assert_eq!(compact.result_unknown, 0);
-        assert!(report.achieved);
-    }
-
-    #[tokio::test]
-    async fn test_compact_rpc_error() {
-        let (report, probe) = run_compact_probe(vec![
-            compact_response(11, true, 0, b""),
-            compact_response(22, true, 0, b""),
-        ])
-        .await;
-        assert_eq!(
-            *probe.requests.lock().unwrap(),
-            vec![
-                build_compact_revision_txn(b"0", 0),
-                build_compact_revision_txn(b"11", 1),
-            ]
-        );
-        assert_eq!(
-            *probe.compact_requests.lock().unwrap(),
-            vec![CompactionRequest {
-                revision: 11,
-                physical: false,
-            }]
-        );
-        let compact = report_class(&report, WorkClass::Compact);
-        assert_eq!(compact.succeeded, 1);
-        assert_eq!(compact.failed, 1);
-        assert_eq!(compact.result_unknown, 0);
-        assert!(compact.first_error.is_some());
-        assert!(!report.achieved);
-    }
-
-    #[tokio::test]
-    async fn test_range_invalid_page_error() {
-        let probe = CreatePhaseProbe::default();
-        *probe.range_reply.lock().unwrap() = Some(range_page(7, &[], true, 1));
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, worker) = spawn_probe_worker(client, probe_workload());
-        let request = RangeRequest {
-            key: b"/registry/pods/".to_vec(),
-            range_end: b"/registry/pods0".to_vec(),
-            limit: 500,
-            ..Default::default()
-        };
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Range {
-                request: request.clone(),
-                selector_keep_every: 1,
-                target: 0,
-                accounting: tracked(&accounting, WorkClass::Range),
-            },
-            &mut ScheduleStats::default(),
-        ));
-        drop(sender);
-        time::timeout(Duration::from_secs(3), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        assert_eq!(*probe.range_requests.lock().unwrap(), vec![request]);
-        let range = report_class(&report, WorkClass::Range);
-        assert_eq!(range.accepted, 1);
-        assert_eq!(range.completed, 1);
-        assert_eq!(range.succeeded, 0);
-        assert_eq!(range.failed, 1);
-        assert_eq!(range.result_unknown, 0);
-        assert_eq!(range.unfinished, 0);
-        assert!(range.first_error.as_ref().unwrap().contains("more=true"));
-        assert!(!report.achieved);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[test]
-    fn test_queue_full_drop() {
-        let accounting = RunAccounting::new();
-        let (sender, receiver) = mpsc::channel(1);
-        let mut stats = ScheduleStats::default();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status)
-            },
-            &mut stats,
-        ));
-        assert!(!try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status)
-            },
-            &mut stats,
-        ));
-        drop(receiver);
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        let status = report_class(&report, WorkClass::Status);
-        assert_eq!(stats.dropped, 1);
-        assert_eq!(status.offered, 2);
-        assert_eq!(status.accepted, 1);
-        assert_eq!(status.dropped_full, 1);
-        assert_eq!(status.dropped_closed, 0);
-        assert_eq!(status.unfinished, 1);
-        assert_eq!(status.unissued, 0);
-        assert!(!report.achieved);
-        assert_report_equations(&report);
-    }
-
-    #[tokio::test]
-    async fn test_queue_cancel_unissued() {
-        let accounting = RunAccounting::new();
-        let (sender, receiver) = mpsc::channel(1);
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status)
-            },
-            &mut ScheduleStats::default(),
-        ));
-        let mut enqueue = Box::pin(enqueue_until(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status),
-            },
-            TokioInstant::now() + Duration::from_secs(60),
-        ));
-        assert_pending(enqueue.as_mut()).await;
-        drop(enqueue);
-        drop(receiver);
-
-        let report = accounting.report(RunTargets::default(), true, false, None);
-        let status = report_class(&report, WorkClass::Status);
-        assert_eq!(status.offered, 2);
-        assert_eq!(status.accepted, 1);
-        assert_eq!(status.completed, 0);
-        assert_eq!(status.dropped, 0);
-        assert_eq!(status.unfinished, 1);
-        assert_eq!(status.unissued, 1);
-        assert_report_equations(&report);
-    }
-
-    #[tokio::test]
-    async fn test_worker_abort_unfinished() {
-        let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, probe_workload());
-        let (first_done, first_ack) = oneshot::channel();
-        let (second_done, second_ack) = oneshot::channel();
-        let mut stats = ScheduleStats::default();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done: first_done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut stats,
-        ));
-        probe.wait_for_txns(1).await;
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeReady),
-                done: second_done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut stats,
-        ));
-        time::timeout(
-            Duration::from_secs(3),
-            abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())),
-        )
-        .await
-        .unwrap();
-        assert!(worker_lifetime.upgrade().is_none());
-        assert!(first_ack.await.is_err());
-        assert!(second_ack.await.is_err());
-        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
-
-        let report = accounting.report(RunTargets::default(), true, false, None);
-        let bootstrap = report_class(&report, WorkClass::Bootstrap);
-        assert_eq!(
-            probe.requests.lock().unwrap().len(),
-            1,
-            "queued work must not reach RPC"
-        );
-        assert_eq!(bootstrap.offered, 2);
-        assert_eq!(bootstrap.accepted, 2);
-        assert_eq!(bootstrap.completed, 0);
-        assert_eq!(bootstrap.succeeded, 0);
-        assert_eq!(bootstrap.failed, 0);
-        assert_eq!(bootstrap.result_unknown, 0);
-        assert_eq!(bootstrap.unfinished, 2);
-        assert_eq!(bootstrap.unissued, 0);
-        assert!(!report.achieved);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_watch_ready_waits_all() {
-        let probe = CreatePhaseProbe::default();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let workload = probe_workload();
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        let accounting = RunAccounting::new();
-        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, workload.clone());
-        run_create_phase(
-            &workload,
-            &plan,
-            std::slice::from_ref(&sender),
-            1,
-            Duration::from_secs(3),
-            &accounting,
-        )
-        .await
-        .unwrap();
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        let (first_created, first_ready) = oneshot::channel();
-        let (last_created, last_ready) = oneshot::channel();
-        let mut watches = JoinSet::new();
-        for _ in 0..2 {
-            watches.spawn(std::future::pending::<WatchTaskOutput>());
-        }
-        let mut ctrl_c = pending_ctrl_c();
-        let update_started = std::cell::Cell::new(false);
-        let mut gated_update = Box::pin(async {
-            wait_for_watch_ready(
-                &mut watches,
-                vec![first_ready, last_ready],
-                Duration::from_secs(3),
-                &mut ctrl_c,
-            )
-            .await?;
-            update_started.set(true);
-            run_update_phase(
-                workload,
-                plan,
-                vec![sender.clone()],
-                1,
-                7,
-                TokioInstant::now(),
-                Duration::from_secs(3),
-                Arc::clone(&accounting),
-            )
-            .await
-        });
-        assert_pending(gated_update.as_mut()).await;
-        assert!(!update_started.get());
-        first_created.send(()).unwrap();
-        assert_pending(gated_update.as_mut()).await;
-        assert!(
-            !update_started.get(),
-            "one Created must not release a two-Watch barrier"
-        );
-        assert_eq!(
-            probe.requests.lock().unwrap().len(),
-            1,
-            "no update RPC before final Created"
-        );
-        last_created.send(()).unwrap();
-        assert_eq!(
-            time::timeout(Duration::from_secs(3), gated_update)
-                .await
-                .unwrap()
-                .unwrap(),
-            1
-        );
-        assert!(update_started.get());
-        assert_eq!(probe.requests.lock().unwrap().len(), 2);
-        assert!(matches!(
-            probe.requests.lock().unwrap()[1].compare[0].target_union,
-            Some(crate::pb::etcdserverpb::compare::TargetUnion::ModRevision(
-                1
-            ))
-        ));
-        let (drained, interrupted) = drain_worker_tasks(
-            vec![sender],
-            workers,
-            Arc::new(HashMap::new()),
-            Duration::from_secs(1),
-            &mut ctrl_c,
-        )
-        .await;
-        drained.unwrap();
-        assert!(!interrupted);
-        assert!(worker_lifetime.upgrade().is_none());
-        watches.abort_all();
-        while watches.join_next().await.is_some() {}
-        let report = accounting.report(RunTargets::default(), false, true, None);
-        assert_eq!(report_class(&report, WorkClass::Update).succeeded, 1);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_watch_ready_preserves_cause() {
-        let (created, ready) = oneshot::channel();
-        let (terminal, terminate) = oneshot::channel();
-        let mut watches = JoinSet::new();
-        watches.spawn(async move {
-            terminate.await.unwrap();
-            (
-                "pods".to_string(),
-                Ok(crate::watch::WatchOutcome {
-                    terminal: crate::watch::WatchTerminal::Canceled {
-                        reason: "authorization revoked".into(),
-                    },
-                    state: crate::watch::WatchState::default(),
-                }),
-            )
-        });
-        drop(created);
-        let mut ctrl_c = pending_ctrl_c();
-        let mut readiness = Box::pin(wait_for_watch_ready(
-            &mut watches,
-            vec![ready],
-            Duration::from_secs(3),
-            &mut ctrl_c,
-        ));
-        assert_pending(readiness.as_mut()).await;
-        terminal.send(()).unwrap();
-        let error = time::timeout(Duration::from_secs(1), readiness)
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert!(error.contains("watch pods terminated"));
-        assert!(error.contains("authorization revoked"));
-        assert!(watches.is_empty());
-        let report = RunAccounting::new().report(RunTargets::default(), false, false, Some(error));
-        assert!(!report.achieved);
-        assert!(
-            report
-                .termination_error
-                .unwrap()
-                .contains("authorization revoked")
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn test_watch_ready_timeout() {
-        let (_created, ready) = oneshot::channel();
-        let mut watches = JoinSet::new();
-        watches.spawn(std::future::pending::<WatchTaskOutput>());
+        let (_ready_tx, ready_rx) = oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<WatchTaskOutput>());
         let mut ctrl_c = pending_ctrl_c();
-        let waiting = wait_for_watch_ready(
-            &mut watches,
-            vec![ready],
-            Duration::from_millis(1),
+        let error = wait_for_watch_ready(
+            &mut tasks,
+            vec![ready_rx],
+            TokioInstant::now() + Duration::from_millis(1),
             &mut ctrl_c,
-        );
-        time::advance(Duration::from_millis(2)).await;
-        let error = waiting.await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error, "watch readiness timed out");
-        watches.abort_all();
-        while watches.join_next().await.is_some() {}
-        let report = RunAccounting::new().report(RunTargets::default(), false, false, Some(error));
-        assert!(!report.achieved);
-        assert_eq!(
-            report.termination_error.as_deref(),
-            Some("watch readiness timed out")
-        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
-
     #[tokio::test]
-    async fn test_bootstrap_cancel_blocks_load() {
-        let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let (cancel, ctrl_c) = controlled_ctrl_c();
-        let run = tokio::spawn(run_with_ctrl_c(
-            probe_config(probe_workload()),
-            client,
-            ctrl_c,
-        ));
-        probe.wait_for_txns(1).await;
-        cancel.send(()).unwrap();
-        let report = time::timeout(Duration::from_secs(1), run)
-            .await
-            .unwrap()
-            .unwrap();
-        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
-        assert!(report.interrupted);
-        assert!(!report.achieved);
-        assert!(!report.schedule_complete);
-        assert_eq!(report_class(&report, WorkClass::Create).offered, 0);
-        assert_eq!(report_class(&report, WorkClass::Update).offered, 0);
-        let bootstrap = report_class(&report, WorkClass::Bootstrap);
-        assert_eq!(bootstrap.accepted, 2);
-        assert_eq!(bootstrap.unfinished, 2);
-        assert_eq!(bootstrap.completed, 0);
-        assert_eq!(bootstrap.result_unknown, 0);
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_bootstrap_error_blocks_load() {
-        let probe = CreatePhaseProbe::default();
-        probe
-            .next_txn_reply()
-            .send(Err(tonic::Status::permission_denied("bootstrap rejected")))
-            .unwrap();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let report = time::timeout(
-            Duration::from_secs(1),
-            run_with_ctrl_c(probe_config(probe_workload()), client, pending_ctrl_c()),
-        )
-        .await
-        .unwrap();
-        assert!(!report.achieved);
-        assert!(!report.interrupted);
-        assert!(!report.schedule_complete);
-        assert!(
-            report
-                .termination_error
-                .as_ref()
-                .unwrap()
-                .starts_with("bootstrap:")
-        );
-        assert_eq!(report_class(&report, WorkClass::Create).offered, 0);
-        assert_eq!(report_class(&report, WorkClass::Update).offered, 0);
-        assert!(report_class(&report, WorkClass::Bootstrap).failed >= 1);
-        assert_eq!(
-            report_class(&report, WorkClass::Bootstrap).result_unknown,
-            0
-        );
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_cancel_joins_tasks() {
-        let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, workers, worker_lifetime) = spawn_owned_probe_worker(client, probe_workload());
-        let (done, ack) = oneshot::channel();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut ScheduleStats::default()
-        ));
-        probe.wait_for_txns(1).await;
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Status {
-                accounting: tracked(&accounting, WorkClass::Status),
-            },
-            &mut ScheduleStats::default()
-        ));
-        let (shutdown, mut watch_shutdown) = shutdown_watch::channel(false);
-        let watch_guard = Arc::new(());
-        let watch_lifetime = Arc::downgrade(&watch_guard);
-        let mut watches = JoinSet::new();
-        watches.spawn(async move {
-            let _guard = watch_guard;
-            watch_shutdown.changed().await.unwrap();
-            (
-                "pods".into(),
-                Ok(crate::watch::WatchOutcome {
-                    terminal: crate::watch::WatchTerminal::ContextCanceled,
-                    state: crate::watch::WatchState::default(),
-                }),
-            )
-        });
-        let (cancel, mut ctrl_c) = controlled_ctrl_c();
-        let mut draining = Box::pin(drain_worker_tasks(
-            vec![sender],
-            workers,
-            Arc::new(HashMap::new()),
-            Duration::from_secs(60),
-            &mut ctrl_c,
-        ));
-        assert_pending(draining.as_mut()).await;
-        assert!(worker_lifetime.upgrade().is_some());
-        assert!(watch_lifetime.upgrade().is_some());
-        cancel.send(()).unwrap();
-        let (drain_result, interrupted) = time::timeout(Duration::from_secs(1), draining)
-            .await
-            .unwrap();
-        drain_result.unwrap();
-        assert!(interrupted);
-        assert!(worker_lifetime.upgrade().is_none());
-        assert!(ack.await.is_err());
-        let (stop_result, interrupted) = time::timeout(
-            Duration::from_secs(1),
-            stop_watches_with_ctrl(
-                shutdown,
-                watches,
-                Duration::from_secs(1),
-                &mut ctrl_c,
-                interrupted,
-            ),
-        )
-        .await
-        .unwrap();
-        stop_result.unwrap();
-        assert!(
-            interrupted,
-            "completed cancellation future must remain latched through Watch stop"
-        );
-        assert!(watch_lifetime.upgrade().is_none());
-        let _ = held_reply.send(Ok(compact_response(11, true, 0, b"")));
-        let report = accounting.report(RunTargets::default(), interrupted, true, None);
-        assert!(report.interrupted);
-        assert!(report.schedule_complete);
-        assert!(!report.achieved);
-        for class in [WorkClass::Bootstrap, WorkClass::Status] {
-            let item = report_class(&report, class);
-            assert_eq!(item.accepted, 1);
-            assert_eq!(item.completed, 0);
-            assert_eq!(item.failed, 0);
-            assert_eq!(item.result_unknown, 0);
-            assert_eq!(item.unfinished, 1);
-        }
-        assert_report_equations(&report);
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_watch_error_report() {
-        let probe = CreatePhaseProbe::default();
-        let fail_watch = probe.fail_watch_after_created();
-        for revision in 1..=3 {
-            probe
-                .next_txn_reply()
-                .send(Ok(compact_response(revision, true, 0, b"")))
-                .unwrap();
-        }
-        let held_compact_journal = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let mut workload = probe_workload();
-        workload.resources[0].update_amplification = 0;
-        workload.timeline[0].duration_s = 0.05;
-        workload.compact_interval_s = 0.05;
-        workload.watches = vec![crate::config::WatchSpec {
-            name: "drain-watch".into(),
-            resource_prefix: "/registry/pods".into(),
-            start_revision: 0,
-            prev_kv: true,
-            progress_notify: true,
-        }];
-        let watch_error_observed = crate::watch::watch_error_observer("drain-watch");
-        let watch_error_observed = watch_error_observed.notified();
-        let mut run = tokio::spawn(run_with_ctrl_c(
-            probe_config(workload),
-            client,
-            pending_ctrl_c(),
-        ));
-
-        probe.wait_for_txns(4).await;
-        assert_pending(std::pin::Pin::new(&mut run)).await;
-        fail_watch.send(()).unwrap();
-        time::timeout(Duration::from_secs(1), watch_error_observed)
-            .await
-            .expect("scheduler observes the Watch error before drain release");
-        held_compact_journal
-            .send(Ok(compact_response(4, true, 0, b"")))
-            .unwrap();
-        let report = time::timeout(Duration::from_secs(3), run)
-            .await
-            .expect("drain run finishes")
-            .expect("drain run task joins");
-        assert!(report.schedule_complete);
-        assert!(!report.interrupted);
-        assert!(!report.achieved);
-        assert!(
-            report
-                .termination_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("server failed")
-        );
-        assert_eq!(report_class(&report, WorkClass::Compact).succeeded, 1);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watch_stop_timeout_joins() {
-        let (shutdown, observer) = shutdown_watch::channel(false);
-        let guard = Arc::new(());
-        let lifetime = Arc::downgrade(&guard);
-        let mut watches = JoinSet::new();
-        watches.spawn(async move {
-            let _guard = guard;
+    async fn test_watch_teardown_timeout_joins_and_drops_task() {
+        let (shutdown, _state) = shutdown_watch::channel(false);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sentinel = DropSentinel(dropped.clone());
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _sentinel = sentinel;
             std::future::pending::<WatchTaskOutput>().await
         });
-        let mut ctrl_c = pending_ctrl_c();
-        let stopping = stop_watches_with_ctrl(
-            shutdown,
-            watches,
-            Duration::from_millis(1),
-            &mut ctrl_c,
-            false,
-        );
-        time::advance(Duration::from_millis(2)).await;
-        let (stopped, interrupted) = stopping.await;
-        assert!(*observer.borrow());
-        assert!(
-            lifetime.upgrade().is_none(),
-            "Watch task must be dropped before reporting timeout"
-        );
-        assert!(!interrupted);
-        let error = stopped.unwrap_err();
-        assert!(error.contains("watch shutdown timed out"));
-        let report = RunAccounting::new().report(RunTargets::default(), false, true, Some(error));
-        assert!(!report.achieved);
-        assert!(
-            report
-                .termination_error
-                .unwrap()
-                .contains("watch shutdown timed out")
-        );
+        let error = stop_watches(shutdown, tasks, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "watch teardown deadline exceeded");
+        assert!(dropped.load(AtomicOrdering::Acquire));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_update_done_keeps_periodic() {
-        let probe = CreatePhaseProbe::default();
-        let update_finished = update_finished_observer("periodic-update");
-        let update_finished = update_finished.notified();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let mut workload = probe_workload();
-        workload.name = "periodic-update".into();
-        workload.compact_interval_s = 1.0;
-        let mut running = tokio::spawn(run_with_ctrl_c(
-            probe_config(workload),
-            client,
-            pending_ctrl_c(),
-        ));
-
-        probe.wait_for_txns(4).await;
-        assert_eq!(probe.requests.lock().unwrap().len(), 4);
-        let mut timeout = tokio::spawn(async {
-            time::advance(Duration::from_millis(100)).await;
+    #[tokio::test]
+    async fn test_worker_drain_timeout_joins_and_drops_task() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sentinel = DropSentinel(dropped.clone());
+        let mut workers = JoinSet::new();
+        workers.spawn(async move {
+            let _sentinel = sentinel;
+            std::future::pending::<Result<(), String>>().await
         });
-        tokio::select! {
-            biased;
-            _ = update_finished => {}
-            _ = &mut timeout => {
-                panic!("supervisor must observe update completion before the periodic deadline")
-            }
-        }
-        time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        let mut watchdog = tokio::spawn(async {
-            time::advance(Duration::from_secs(2)).await;
-        });
-        let report = tokio::select! {
-            biased;
-            result = &mut running => result.expect("periodic run task joins"),
-            _ = &mut watchdog => panic!("periodic run did not finish at the scheduled deadline"),
-        };
-        watchdog.abort();
-        assert_eq!(report_class(&report, WorkClass::Update).succeeded, 1);
-        assert_eq!(report_class(&report, WorkClass::Compact).accepted, 1);
-        assert_eq!(report_class(&report, WorkClass::Compact).succeeded, 1);
-        assert_eq!(probe.requests.lock().unwrap().len(), 5);
-        assert!(probe.compact_requests.lock().unwrap().is_empty());
-        assert!(report.schedule_complete);
-        assert!(report.achieved, "{:?}", report.termination_error);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
+        let error = drain_workers(Vec::new(), workers, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("worker drain deadline exceeded"));
+        assert!(dropped.load(AtomicOrdering::Acquire));
     }
 
     #[tokio::test]
     async fn test_worker_panic_preempts_schedule() {
-        let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let (sender, mut workers, _worker_lifetime) =
-            spawn_owned_probe_worker(client, probe_workload());
-        let (done, _ack) = oneshot::channel();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut ScheduleStats::default()
-        ));
-        probe.wait_for_txns(1).await;
+        let mut workers = JoinSet::new();
         workers.spawn(async {
             panic!("injected worker panic");
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
         });
-        let mut update = Some(tokio::spawn(async {
-            std::future::pending::<Result<u64, String>>().await
-        }));
         let mut watches = JoinSet::new();
-
-        let result = time::timeout(
-            Duration::from_secs(1),
-            wait_for_supervised_schedule_event(
-                &mut watches,
-                &mut workers,
-                &mut update,
-                TokioInstant::now() + Duration::from_secs(60),
-                &mut pending_ctrl_c(),
-            ),
+        let error = wait_for_schedule_event(
+            &mut workers,
+            &mut watches,
+            TokioInstant::now() + Duration::from_secs(60),
+            &mut pending_ctrl_c(),
         )
         .await
-        .unwrap();
-        let Err(error) = result else {
-            panic!("fatal worker panic must preempt timeline");
-        };
+        .unwrap_err();
         assert!(error.contains("worker task failed"));
         assert!(error.contains("injected worker panic"));
-
-        let producer = update.take().unwrap();
-        producer.abort();
-        assert!(producer.await.unwrap_err().is_cancelled());
-        abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())).await;
-        drop(held_reply);
-        server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
-    async fn test_update_queue_closed_preempts_schedule() {
-        let probe = CreatePhaseProbe::default();
-        let held_reply = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let accounting = RunAccounting::new();
-        let workload = probe_workload();
-        let plan = WorkloadPlan::build(&workload).unwrap();
-        let (sender, mut workers, _worker_lifetime) =
-            spawn_owned_probe_worker(client, workload.clone());
-        let (done, _ack) = oneshot::channel();
-        assert!(try_enqueue(
-            &sender,
-            WorkItem::Bootstrap {
-                item: probe_heartbeat(HeartbeatItemKind::NodeCreate),
-                done,
-                accounting: tracked(&accounting, WorkClass::Bootstrap),
-            },
-            &mut ScheduleStats::default()
-        ));
-        probe.wait_for_txns(1).await;
-        let (closed_sender, receiver) = mpsc::channel(1);
-        drop(receiver);
-        let producer_accounting = Arc::clone(&accounting);
-        let mut update = Some(tokio::spawn(async move {
-            run_update_phase(
-                workload,
-                plan,
-                vec![closed_sender],
-                1,
-                7,
-                TokioInstant::now(),
-                Duration::from_secs(60),
-                producer_accounting,
-            )
+    async fn test_worker_drain_error() {
+        let mut workers = JoinSet::new();
+        workers.spawn(async { Err::<(), _>("worker failed".to_string()) });
+        let error = drain_workers(Vec::new(), workers, Duration::from_secs(1))
             .await
-        }));
-        let mut watches = JoinSet::new();
-        let result = time::timeout(
-            Duration::from_secs(1),
-            wait_for_supervised_schedule_event(
-                &mut watches,
-                &mut workers,
-                &mut update,
-                TokioInstant::now() + Duration::from_secs(60),
-                &mut pending_ctrl_c(),
-            ),
-        )
-        .await
-        .unwrap();
-        let Ok(SupervisedScheduleControl::UpdateFinished(Err(error))) = result else {
-            panic!("actual update producer failure must preempt the long timeline");
-        };
-        update.take();
-        assert!(error.contains("update phase worker queue closed"));
-        abort_worker_tasks(vec![sender], workers, Arc::new(HashMap::new())).await;
-        drop(held_reply);
-        let report = accounting.report(RunTargets::default(), false, false, Some(error));
-        let update = report_class(&report, WorkClass::Update);
-        assert_eq!(update.offered, 1);
-        assert_eq!(update.accepted, 0);
-        assert_eq!(update.dropped_closed, 1);
-        assert_eq!(update.unissued, 0);
-        assert_eq!(report_class(&report, WorkClass::Bootstrap).unfinished, 1);
-        assert_eq!(probe.requests.lock().unwrap().len(), 1);
-        assert!(!report.achieved);
-        assert!(!report.schedule_complete);
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_drain_cancel_partial_report() {
-        let probe = CreatePhaseProbe::default();
-        for revision in 1..=3 {
-            probe
-                .next_txn_reply()
-                .send(Ok(compact_response(revision, true, 0, b"")))
-                .unwrap();
-        }
-        let held_reply = probe.next_txn_reply();
-        let (client, server) = start_create_probe(probe.clone()).await;
-        let mut workload = probe_workload();
-        workload.resources[0].update_amplification = 0;
-        workload.timeline[0].duration_s = 1.0;
-        workload.compact_interval_s = 1.0;
-        let (cancel, ctrl_c) = controlled_ctrl_c();
-        let mut run = tokio::spawn(run_with_ctrl_c(probe_config(workload), client, ctrl_c));
-        probe.wait_for_txns(3).await;
-        time::advance(Duration::from_secs(1)).await;
-        probe.wait_for_txns(4).await;
-        assert_pending(std::pin::Pin::new(&mut run)).await;
-
-        cancel.send(()).unwrap();
-        let mut watchdog = tokio::spawn(async {
-            time::advance(Duration::from_secs(2)).await;
-        });
-        let report = tokio::select! {
-            biased;
-            result = &mut run => result.expect("cancelled drain task joins"),
-            _ = &mut watchdog => panic!("cancelled drain did not finish"),
-        };
-        watchdog.abort();
-        drop(held_reply);
-        assert!(
-            report.schedule_complete,
-            "cancellation must exercise post-schedule drain"
-        );
-        assert!(report.interrupted);
-        assert!(!report.achieved);
-        assert!(report.termination_error.is_none());
-        assert_eq!(report_class(&report, WorkClass::Bootstrap).succeeded, 2);
-        assert_eq!(report_class(&report, WorkClass::Create).succeeded, 1);
-        let compact = report_class(&report, WorkClass::Compact);
-        assert_eq!(compact.accepted, 1);
-        assert_eq!(compact.completed, 0);
-        assert_eq!(compact.unfinished, 1);
-        assert_eq!(compact.failed, 0);
-        assert_eq!(compact.result_unknown, 0);
-        assert!(probe.compact_requests.lock().unwrap().is_empty());
-        assert_report_equations(&report);
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn test_watch_stop_cancel_joins() {
-        let (shutdown, observer) = shutdown_watch::channel(false);
-        let (finish, finished) = oneshot::channel();
-        let guard = Arc::new(());
-        let lifetime = Arc::downgrade(&guard);
-        let mut watches = JoinSet::new();
-        watches.spawn(async move {
-            let _guard = guard;
-            finished.await.unwrap();
-            (
-                "pods".into(),
-                Ok(crate::watch::WatchOutcome {
-                    terminal: crate::watch::WatchTerminal::ContextCanceled,
-                    state: crate::watch::WatchState::default(),
-                }),
-            )
-        });
-        let (cancel, mut ctrl_c) = controlled_ctrl_c();
-        let mut stopping = Box::pin(stop_watches_with_ctrl(
-            shutdown,
-            watches,
-            Duration::from_secs(3),
-            &mut ctrl_c,
-            false,
-        ));
-        assert_pending(stopping.as_mut()).await;
-        assert!(*observer.borrow());
-        cancel.send(()).unwrap();
-        assert_pending(stopping.as_mut()).await;
-        assert!(
-            lifetime.upgrade().is_some(),
-            "report must wait for the owned Watch task"
-        );
-        finish.send(()).unwrap();
-        let (stopped, interrupted) = time::timeout(Duration::from_secs(1), stopping)
-            .await
-            .unwrap();
-        stopped.unwrap();
-        assert!(interrupted);
-        assert!(lifetime.upgrade().is_none());
-        let report = RunAccounting::new().report(RunTargets::default(), interrupted, true, None);
-        assert!(report.interrupted);
-        assert!(!report.achieved);
+            .unwrap_err();
+        assert!(error.contains("worker failed"));
     }
 }
