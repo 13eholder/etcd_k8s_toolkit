@@ -14,3 +14,5 @@ perf.data.*
 .agents/stages/*/verify/**/*.gz
 etcd_k8s_bench/verify/**/*.txt
 etcd_k8s_bench/verify/**/*.jsonl
+__pycache__/
+*.pyc
