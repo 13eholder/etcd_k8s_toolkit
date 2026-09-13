@@ -318,6 +318,8 @@ pub struct CounterStorage {
     pub rpc_timeout: u64,
     pub rpc_result_unknown: u64,
     pub rpc_payload_bytes: u64,
+    pub request_payload_bytes: u64,
+    pub response_payload_bytes: u64,
 }
 
 /// Fixed-width monotonic phase state.  The recorder stores this exact type so
@@ -330,34 +332,13 @@ pub struct PhaseClockStorage {
     pub measurement_start: Option<Instant>,
     pub configured_cutoff_ns: u64,
     pub effective_cutoff_ns: Option<u64>,
+    pub setup_end_ns: Option<u64>,
     pub preparation_end_ns: Option<u64>,
     pub drain_start_ns: Option<u64>,
     pub drain_end_ns: Option<u64>,
+    pub watch_teardown_start_ns: Option<u64>,
+    pub watch_teardown_end_ns: Option<u64>,
     pub phase: u8,
-}
-
-/// `PhaseStorage` contains seven Vec headers.  This mirror keeps their
-/// metadata in the single `MeasurementLayout` calculation without tying the
-/// plan module to histogram element types.
-#[repr(C)]
-pub struct MeasurementPhaseMetadataStorage {
-    pub logical_counters: Vec<u8>,
-    pub queue_counters: Vec<u8>,
-    pub rpc_counters: Vec<u8>,
-    pub logical_histograms: Vec<u8>,
-    pub queue_histograms: Vec<u8>,
-    pub rpc_histograms: Vec<u8>,
-    pub logical_errors: Vec<u8>,
-}
-
-/// Timing retained by one in-flight logical token.  Tokens are bounded by the
-/// configured queue and worker residency, and are not an operation history.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TokenTimingStorage {
-    pub accepted_ns: u64,
-    pub started_ns: u64,
-    pub state: u8,
 }
 
 /// Fixed-width bucket counter storage.  Histograms are kept beside this
@@ -373,6 +354,8 @@ pub struct BucketCounterStorage {
     pub logical_errors: u64,
     pub rpc_started: u64,
     pub rpc_completed: u64,
+    pub txn_started: u64,
+    pub txn_completed: u64,
     pub watch_events: u64,
     pub watch_payload_bytes: u64,
 }
@@ -442,7 +425,7 @@ pub struct MeasurementLayout {
     pub estimated_measurement_memory_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct CompiledPlan {
     pub config: SyntheticConfig,
     pub resource_counts: SyntheticResourceCounts,
@@ -508,12 +491,6 @@ impl CompiledPlan {
     /// Return the compiled mapping for one of the six fixed resource kinds.
     pub fn resource(&self, kind: ResourceKind) -> &ResourcePlan {
         &self.resources[kind.index()]
-    }
-
-    /// Map a logical operation ordinal to a resource ID using the supplied
-    /// run seed. A complete cycle covers the resource's entire ID domain.
-    pub fn resource_id(&self, kind: ResourceKind, ordinal: u64, seed: u64) -> u64 {
-        self.resource(kind).id_for_ordinal(ordinal, seed)
     }
 
     /// Build the deterministic key for a resource operation.
@@ -1339,7 +1316,8 @@ fn measurement_layout(
     let watch_streams = watch_roots
         .checked_mul(config.watch.subscriptions_per_root)
         .ok_or_else(|| ConfigError::Invalid("Watch stream count overflows".into()))?;
-    let watch_state_size = size_bytes::<WatchStreamStateStorage>("Watch state estimate")?;
+    let watch_state_size = crate::measurement::watch_state_size_bytes()
+        .ok_or_else(|| ConfigError::Invalid("Watch state estimate overflows".into()))?;
     let watch_state_bytes = watch_streams
         .checked_mul(watch_state_size)
         .ok_or_else(|| ConfigError::Invalid("Watch estimate overflows".into()))?;
@@ -1771,6 +1749,41 @@ mod tests {
         assert_eq!(first.periodic_plan, second.periodic_plan);
         assert_eq!(first.periodic_indexes, second.periodic_indexes);
         assert_eq!(first.measurement_layout, second.measurement_layout);
+    }
+    #[test]
+    fn test_run_config_clone_shares_periodic_storage() {
+        let mut synthetic = small_config();
+        synthetic.load.duration_ms = 500;
+        synthetic.periodic.node_lease_interval_ms = 100;
+        synthetic.periodic.node_lease_jitter_percent = 0;
+        synthetic.periodic.node_status_interval_ms = 100;
+        synthetic.periodic.status_interval_ms = 100;
+        synthetic.periodic.compact_interval_ms = 100;
+        let plan = CompiledPlan::compile(synthetic, 64 * 1024 * 1024).unwrap();
+        assert!(!plan.periodic_events.is_empty());
+        assert!(plan.periodic_indexes.iter().all(|index| !index.is_empty()));
+
+        let config = crate::config::RunConfig {
+            plan: std::sync::Arc::new(plan),
+            endpoint: "http://fixture".into(),
+            metrics_listen: "127.0.0.1:0".parse().unwrap(),
+            max_message_size: 64 * 1024 * 1024,
+            setup_started_at: std::time::Instant::now(),
+        };
+        let clone = config.clone();
+
+        assert!(std::ptr::eq(
+            config.plan.periodic_events.as_slice(),
+            clone.plan.periodic_events.as_slice()
+        ));
+        for (original, copied) in config
+            .plan
+            .periodic_indexes
+            .iter()
+            .zip(clone.plan.periodic_indexes.iter())
+        {
+            assert!(std::ptr::eq(original.as_slice(), copied.as_slice()));
+        }
     }
 
     #[test]

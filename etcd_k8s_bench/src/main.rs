@@ -87,33 +87,90 @@ fn run_plan(args: PlanArgs) -> Result<(), AppError> {
 
 async fn run_new(args: RunArgs) -> Result<(), AppError> {
     let config = args.resolve().map_err(AppError::config)?;
-    metrics::install_exporter(config.metrics_listen)
-        .map_err(|error| AppError::execution(format!("metrics exporter: {error}")))?;
-    let workload = metrics::WorkloadName::try_from(config.plan.config.name.as_str())
-        .map_err(AppError::execution)?;
-    metrics::record_info(env!("CARGO_PKG_VERSION"), &workload);
-    metrics::set_pod_size(config.plan.config.value_size_bytes.pods);
-    metrics::set_nodes(config.plan.config.topology.node_count);
+    let report_config = config.clone();
+    let mut ctrl_c: scheduler::CtrlCFuture = Box::pin(tokio::signal::ctrl_c());
+    let exporter = match metrics::install_exporter(config.metrics_listen) {
+        Ok(exporter) => exporter,
+        Err(error) => {
+            let report = report::RunReport::setup_failure(
+                &report_config,
+                report::RunStatus::Failed,
+                "setup",
+                format!("metrics exporter: {error}"),
+            );
+            write_report(&report)?;
+            return Err(AppError::execution(format!("metrics exporter: {error}")));
+        }
+    };
 
     let request_timeout =
         std::time::Duration::from_millis(config.plan.config.execution.request_timeout_ms);
-    let client = ClientBundle::connect(&config.endpoint, request_timeout, config.max_message_size)
-        .await
-        .map_err(|error| AppError::execution(format!("connect to {}: {error}", config.endpoint)))?;
+    let connect: Result<ClientBundle, String> = tokio::select! {
+        result = ClientBundle::connect(&config.endpoint, request_timeout, config.max_message_size) => {
+            result.map_err(|error| error.to_string())
+        }
+        signal = ctrl_c.as_mut() => {
+            match signal {
+                Ok(()) => Err("interrupted while connecting".into()),
+                Err(error) => Err(format!("ctrl-c signal failed: {error}")),
+            }
+        }
+    };
+    let client = match connect {
+        Ok(client) => client,
+        Err(error) => {
+            let interrupted = error == "interrupted while connecting";
+            let status = if interrupted {
+                report::RunStatus::Interrupted
+            } else {
+                report::RunStatus::Failed
+            };
+            let mut failure = format!("connect to {}: {error}", report_config.endpoint);
+            if let Err(shutdown_error) = exporter.shutdown().await {
+                failure.push_str(&format!("; metrics exporter shutdown: {shutdown_error}"));
+            }
+            let report =
+                report::RunReport::setup_failure(&report_config, status, "setup", failure.clone());
+            write_report(&report)?;
+            return if interrupted {
+                Err(AppError::interrupted("synthetic run interrupted"))
+            } else {
+                Err(AppError::execution(failure))
+            };
+        }
+    };
 
-    let result = scheduler::run(config, client).await;
-    let failed = result.status == scheduler::RunStatus::Failed;
-    let interrupted = result.status == scheduler::RunStatus::Interrupted;
-    let json = serde_json::to_string(&result)
-        .map_err(|error| AppError::execution(format!("encode run result: {error}")))?;
-    println!("{json}");
-    if failed {
+    let mut report = scheduler::run_with_existing_ctrl_c(config, client, ctrl_c)
+        .await
+        .report;
+    if let Err(error) = exporter.shutdown().await {
+        report.record_exporter_failure(error);
+    }
+    let status = report.status();
+    let report_error = report.experiment.first_error.clone();
+    write_report(&report)?;
+    if status == report::RunStatus::Failed {
         return Err(AppError::execution(
-            result.error.as_deref().unwrap_or("synthetic run failed"),
+            report_error.as_deref().unwrap_or("synthetic run failed"),
         ));
     }
-    if interrupted {
+    if status == report::RunStatus::Interrupted {
         return Err(AppError::interrupted("synthetic run interrupted"));
     }
+    Ok(())
+}
+
+fn write_report(report: &report::RunReport) -> Result<(), AppError> {
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    report
+        .write_json(&mut writer)
+        .map_err(|error| AppError::execution(format!("encode run report: {error}")))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| AppError::execution(format!("write run report: {error}")))?;
+    writer
+        .flush()
+        .map_err(|error| AppError::execution(format!("flush run report: {error}")))?;
     Ok(())
 }

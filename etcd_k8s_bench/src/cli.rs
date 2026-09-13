@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
@@ -179,11 +180,13 @@ impl RunArgs {
         if self.endpoint.trim().is_empty() {
             return Err(ConfigError::Invalid("endpoint must not be empty".into()));
         }
+        let plan = Arc::new(self.base.resolve_plan()?);
         Ok(RunConfig {
-            plan: self.base.resolve_plan()?,
+            plan,
             endpoint: self.endpoint.clone(),
             metrics_listen: self.metrics_listen,
             max_message_size: self.base.max_message_size,
+            setup_started_at: Instant::now(),
         })
     }
 }

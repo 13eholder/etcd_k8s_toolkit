@@ -1,6 +1,8 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -43,10 +45,11 @@ pub struct SyntheticConfigOverrides {
 /// settings so `plan` stays read-only and backend independent.
 #[derive(Clone, Debug)]
 pub struct RunConfig {
-    pub plan: crate::plan::CompiledPlan,
+    pub plan: Arc<crate::plan::CompiledPlan>,
     pub endpoint: String,
     pub metrics_listen: SocketAddr,
     pub max_message_size: usize,
+    pub setup_started_at: Instant,
 }
 
 /// One long-lived Kubernetes-style prefix Watch stream.
@@ -301,21 +304,16 @@ impl SyntheticConfig {
         }
     }
 
+    #[cfg(test)]
     pub fn from_json(input: &str, max_message_size: usize) -> Result<Self, ConfigError> {
         let config = Self::parse_json(input)?;
         config.validate(max_message_size)?;
         Ok(config)
     }
 
-    pub fn from_path(path: impl AsRef<Path>, max_message_size: usize) -> Result<Self, ConfigError> {
-        let config = Self::parse_path(path)?;
-        config.validate(max_message_size)?;
-        Ok(config)
-    }
-
     pub fn validate(&self, max_message_size: usize) -> Result<(), ConfigError> {
         WorkloadName::new(self.name.clone()).map_err(|error| {
-            ConfigError::Invalid(format!("name is not a valid metric label: {error}"))
+            ConfigError::Invalid(format!("name is not a valid workload name: {error}"))
         })?;
         positive(self.topology.node_count, "topology.node_count")?;
         positive(self.topology.pod_count, "topology.pod_count")?;
@@ -566,11 +564,6 @@ impl SyntheticUpdateWeights {
             "load.update_weights",
         )
     }
-
-    pub fn total(&self) -> u64 {
-        self.checked_total()
-            .expect("SyntheticUpdateWeights must be validated before total")
-    }
 }
 
 impl SyntheticReadWeights {
@@ -586,21 +579,11 @@ impl SyntheticReadWeights {
             "load.read_weights",
         )
     }
-
-    pub fn total(&self) -> u64 {
-        self.checked_total()
-            .expect("SyntheticReadWeights must be validated before total")
-    }
 }
 
 impl SyntheticReadShapeWeights {
     pub fn checked_total(&self) -> Result<u64, ConfigError> {
         checked_sum([self.point, self.bounded_list], "load.read_shape_weights")
-    }
-
-    pub fn total(&self) -> u64 {
-        self.checked_total()
-            .expect("SyntheticReadShapeWeights must be validated before total")
     }
 }
 

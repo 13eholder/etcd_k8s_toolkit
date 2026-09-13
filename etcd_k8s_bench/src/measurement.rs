@@ -4,17 +4,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use prost::Message;
 use thiserror::Error;
+use tokio::sync::watch as readiness_channel;
 
+use crate::config::WatchSpec;
+use crate::metrics::RunMetrics;
 pub use crate::metrics::{DropReason, Outcome};
 use crate::plan::{
     BucketCounterStorage, CompiledPlan, CounterStorage, HistogramCounterStorage, HistogramPlan,
     LogicalWorkClass, MeasurementLayout, PeriodicKind, PhaseClockStorage, ResourceKind,
+    WatchStreamStateStorage,
 };
 use crate::report::{
-    BucketReport, CutoffReport, HistogramMetadata, HistogramView, LogicalStreamReport,
-    MeasurementAccounting, MeasurementReport, PhaseReport, QueueStreamReport, RpcReport,
-    TimingReport,
+    BucketReport, CutoffReport, HistogramMetadata, HistogramView, LatencyReport,
+    LogicalStreamReport, MeasurementAccounting, MeasurementReport, PhaseReport,
+    PreparationResourceReport, QueueStreamReport, RpcReport, TimingReport, WatchReport,
+    WatchRootReport, WatchStreamReport,
 };
 
 const PHASE_PREPARATION: u8 = 0;
@@ -29,6 +35,12 @@ pub const PREPARATION_STREAM_COUNT: usize = 7;
 pub const MEASUREMENT_STREAM_COUNT: usize = 18;
 pub const RPC_METHOD_COUNT: usize = 4;
 const PREPARATION_LOGICAL_STREAMS: usize = PREPARATION_STREAM_COUNT;
+pub const WATCH_TERMINAL_COMPACTED: u64 = 1;
+pub const WATCH_TERMINAL_CANCELED: u64 = 2;
+pub const WATCH_TERMINAL_NO_LEADER: u64 = 3;
+pub const WATCH_TERMINAL_SEMANTIC: u64 = 4;
+pub const WATCH_TERMINAL_PHASE_DEADLINE: u64 = 5;
+pub const WATCH_TERMINAL_CONTEXT_CANCELED: u64 = 6;
 const MEASUREMENT_LOGICAL_STREAMS: usize = MEASUREMENT_STREAM_COUNT;
 const RPC_METHODS: usize = RPC_METHOD_COUNT;
 /// A monotonic source used by the recorder. Production uses the same monotonic
@@ -64,15 +76,6 @@ impl Phase {
         }
     }
 
-    const fn code(self) -> u8 {
-        match self {
-            Self::Preparation => PHASE_PREPARATION,
-            Self::Measurement => PHASE_MEASUREMENT,
-            Self::Drain => PHASE_DRAIN,
-            Self::Finished => PHASE_FINISHED,
-        }
-    }
-
     const fn from_code(code: u8) -> Self {
         match code {
             PHASE_PREPARATION => Self::Preparation,
@@ -95,20 +98,6 @@ impl PreparationStream {
         match self {
             Self::Create(kind) => kind.index(),
             Self::NodeReady => 6,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Create(kind) => match kind {
-                ResourceKind::Pods => "create_pods",
-                ResourceKind::Nodes => "create_nodes",
-                ResourceKind::NodeLeases => "create_node_leases",
-                ResourceKind::Deployments => "create_deployments",
-                ResourceKind::ReplicaSets => "create_replicasets",
-                ResourceKind::DaemonSets => "create_daemonsets",
-            },
-            Self::NodeReady => "node_ready",
         }
     }
 }
@@ -189,16 +178,6 @@ pub enum StreamId {
     Measurement(LogicalStreamIdentity),
 }
 
-impl StreamId {
-    pub const fn preparation(stream: PreparationStream) -> Self {
-        Self::Preparation(stream)
-    }
-
-    pub const fn measurement(stream: LogicalStreamIdentity) -> Self {
-        Self::Measurement(stream)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RpcMethod {
     Range,
@@ -241,8 +220,6 @@ pub enum MeasurementError {
     CounterOverflow,
     #[error("measurement histogram bounds are invalid: {0}")]
     HistogramBounds(String),
-    #[error("measurement histogram allocation exceeds the compiled layout")]
-    HistogramAllocationExceedsLayout,
     #[error("measurement has {0} active logical tokens")]
     ActiveTokens(u64),
     #[error("measurement has {0} active RPC attempts")]
@@ -451,6 +428,16 @@ impl HistogramSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RangeStats {
+    pages: u64,
+    snapshot_revision: i64,
+    server_count: i64,
+    last_key_bytes: u64,
+    selected: u64,
+    discarded: u64,
+}
+
 struct PhaseData {
     logical: Vec<CounterStorage>,
     queue: Vec<CounterStorage>,
@@ -462,6 +449,7 @@ struct PhaseData {
     queue_total: HistogramSlot,
     rpc_total: HistogramSlot,
     errors: Vec<ErrorSlot>,
+    range: RangeStats,
 }
 
 impl PhaseData {
@@ -506,6 +494,7 @@ impl PhaseData {
             queue_total: HistogramSlot::new(queue_plan)?,
             rpc_total: HistogramSlot::new(rpc_plan)?,
             errors: vec![ErrorSlot::default(); logical_count],
+            range: RangeStats::default(),
         })
     }
 
@@ -591,17 +580,57 @@ impl BucketData {
     }
 }
 
+#[repr(C)]
+struct WatchData {
+    storage: WatchStreamStateStorage,
+    measurement_connected_since_ns: u64,
+    drain_connected_since_ns: u64,
+    measurement_gap: u64,
+    measurement_terminal: u64,
+    measurement_events: u64,
+    measurement_payload_bytes: u64,
+    drain_events: u64,
+    drain_payload_bytes: u64,
+}
+
+impl WatchData {
+    const INACTIVE: u64 = u64::MAX;
+
+    fn new() -> Self {
+        Self {
+            storage: WatchStreamStateStorage {
+                connected_since_ns: Self::INACTIVE,
+                ..Default::default()
+            },
+            measurement_connected_since_ns: Self::INACTIVE,
+            drain_connected_since_ns: Self::INACTIVE,
+            measurement_gap: 0,
+            measurement_terminal: 0,
+            measurement_events: 0,
+            measurement_payload_bytes: 0,
+            drain_events: 0,
+            drain_payload_bytes: 0,
+        }
+    }
+}
+
+pub(crate) fn watch_state_size_bytes() -> Option<u64> {
+    u64::try_from(size_of::<WatchData>()).ok()
+}
+
 struct MeasurementState {
     clock: PhaseClockStorage,
     preparation: PhaseData,
     measurement: PhaseData,
     drain: PhaseData,
     buckets: Vec<BucketData>,
+    watch: Vec<WatchData>,
     planned_preparation: [u64; PREPARATION_LOGICAL_STREAMS],
     planned_measurement: [u64; MEASUREMENT_LOGICAL_STREAMS],
     active_tokens: u64,
     active_rpc_attempts: u64,
     arithmetic_overflow: bool,
+    drain_timed_out: bool,
 }
 
 impl MeasurementState {
@@ -616,15 +645,6 @@ impl MeasurementState {
         Phase::from_code(self.clock.phase)
     }
 
-    fn phase_data(&self, phase: Phase) -> &PhaseData {
-        match phase {
-            Phase::Preparation => &self.preparation,
-            Phase::Measurement => &self.measurement,
-            Phase::Drain => &self.drain,
-            Phase::Finished => &self.drain,
-        }
-    }
-
     fn phase_data_mut(&mut self, phase: Phase) -> &mut PhaseData {
         match phase {
             Phase::Preparation => &mut self.preparation,
@@ -637,9 +657,12 @@ impl MeasurementState {
 struct RecorderInner {
     layout: MeasurementLayout,
     clock: Arc<dyn MonotonicClock>,
+    metrics: Option<RunMetrics>,
+    watch_specs: Vec<WatchSpec>,
     state: Mutex<MeasurementState>,
+    fatal_error: Mutex<ErrorSlot>,
+    watch_readiness: readiness_channel::Sender<()>,
 }
-
 fn lock_recover<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
     mutex
         .lock()
@@ -690,20 +713,62 @@ impl MeasurementRecorder {
         }
     }
 
+    fn record_internal_error(&self, error: &MeasurementError) {
+        let mut fatal = lock_recover(&self.inner.fatal_error);
+        fatal.set(0xFFFF_FFFF_FFFF_FFFEu64, &error.to_string());
+    }
+
+    fn fatal_error(&self) -> Option<String> {
+        lock_recover(&self.inner.fatal_error).view()
+    }
+
+    fn fatal_error_result(&self) -> Option<MeasurementError> {
+        self.fatal_error().map(|error| {
+            MeasurementError::InvalidPhase(format!("recorder invariant failure: {error}"))
+        })
+    }
+
+    #[cfg(test)]
     pub fn new(plan: &CompiledPlan) -> Result<Self, MeasurementError> {
         Self::with_clock(plan, Arc::new(TokioMonotonicClock))
     }
 
-    pub fn new_with_clock(
+    pub fn new_with_metrics_at(
         plan: &CompiledPlan,
-        clock: Arc<dyn MonotonicClock>,
+        metrics: RunMetrics,
+        start: Instant,
     ) -> Result<Self, MeasurementError> {
-        Self::with_clock(plan, clock)
+        Self::with_clock_and_metrics_start(
+            plan,
+            Arc::new(TokioMonotonicClock),
+            Some(metrics),
+            start,
+        )
     }
 
+    #[cfg(test)]
     pub fn with_clock(
         plan: &CompiledPlan,
         clock: Arc<dyn MonotonicClock>,
+    ) -> Result<Self, MeasurementError> {
+        Self::with_clock_and_metrics(plan, clock, None)
+    }
+
+    #[cfg(test)]
+    pub fn with_clock_and_metrics(
+        plan: &CompiledPlan,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Option<RunMetrics>,
+    ) -> Result<Self, MeasurementError> {
+        let start = clock.now();
+        Self::with_clock_and_metrics_start(plan, clock, metrics, start)
+    }
+
+    fn with_clock_and_metrics_start(
+        plan: &CompiledPlan,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Option<RunMetrics>,
+        start: Instant,
     ) -> Result<Self, MeasurementError> {
         let layout = plan.measurement_layout.clone();
         if layout.logical_streams_per_phase != u64::try_from(MEASUREMENT_LOGICAL_STREAMS).unwrap()
@@ -720,7 +785,6 @@ impl MeasurementRecorder {
                 "compiled plan does not contain the fixed logical stream shape".into(),
             ));
         }
-        let start = clock.now();
         let configured_duration_ns = plan
             .config
             .load
@@ -733,9 +797,12 @@ impl MeasurementRecorder {
             measurement_start: None,
             configured_cutoff_ns: configured_duration_ns,
             effective_cutoff_ns: None,
+            setup_end_ns: None,
             preparation_end_ns: None,
             drain_start_ns: None,
             drain_end_ns: None,
+            watch_teardown_start_ns: None,
+            watch_teardown_end_ns: None,
             phase: PHASE_PREPARATION,
         };
         let mut planned_measurement = [0u64; MEASUREMENT_LOGICAL_STREAMS];
@@ -818,23 +885,42 @@ impl MeasurementRecorder {
                 "bucket capacity exceeds compiled bucket count".into(),
             ));
         }
+        let watch_count = usize::try_from(layout.watch_streams).map_err(|_| {
+            MeasurementError::InvalidLayout("watch stream count exceeds usize".into())
+        })?;
+        let mut watch = Vec::with_capacity(watch_count);
+        for _ in 0..watch_count {
+            watch.push(WatchData::new());
+        }
+        if watch.capacity() != watch_count {
+            return Err(MeasurementError::InvalidLayout(
+                "watch state capacity exceeds compiled stream count".into(),
+            ));
+        }
         let state = MeasurementState {
             clock: clock_state,
             preparation,
             measurement,
             drain,
             buckets,
+            watch,
             planned_preparation,
             planned_measurement,
             active_tokens: 0,
             active_rpc_attempts: 0,
             arithmetic_overflow: false,
+            drain_timed_out: false,
         };
+        let (watch_readiness, _readiness_receiver) = readiness_channel::channel(());
         let recorder = Self {
             inner: Arc::new(RecorderInner {
                 layout,
                 clock,
+                metrics,
+                watch_specs: plan.watch_specs(),
                 state: Mutex::new(state),
+                fatal_error: Mutex::new(ErrorSlot::default()),
+                watch_readiness,
             }),
         };
         if recorder.allocated_bytes()? > recorder.inner.layout.estimated_measurement_memory_bytes {
@@ -845,12 +931,16 @@ impl MeasurementRecorder {
         Ok(recorder)
     }
 
-    pub fn layout(&self) -> &MeasurementLayout {
-        &self.inner.layout
-    }
-
     pub fn phase(&self) -> Phase {
         lock_recover(&self.inner.state).phase()
+    }
+
+    pub(crate) fn watch_readiness(&self) -> readiness_channel::Receiver<()> {
+        self.inner.watch_readiness.subscribe()
+    }
+
+    fn notify_watch_readiness(&self) {
+        self.inner.watch_readiness.send_replace(());
     }
 
     pub fn allocated_bytes(&self) -> Result<u64, MeasurementError> {
@@ -866,11 +956,504 @@ impl MeasurementRecorder {
                 .checked_add(bucket.allocated_bytes()?)
                 .ok_or(MeasurementError::CounterOverflow)?;
         }
+        let watch_size =
+            u64::try_from(size_of::<WatchData>()).map_err(|_| MeasurementError::ClockOverflow)?;
+        bytes = bytes
+            .checked_add(
+                u64::try_from(state.watch.capacity())
+                    .map_err(|_| MeasurementError::ClockOverflow)?
+                    .checked_mul(watch_size)
+                    .ok_or(MeasurementError::CounterOverflow)?,
+            )
+            .ok_or(MeasurementError::CounterOverflow)?;
         Ok(bytes)
     }
 
+    pub fn mark_setup_complete(&self) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        if state.phase() != Phase::Preparation {
+            return Err(MeasurementError::InvalidPhase(
+                "setup can only finish during preparation".into(),
+            ));
+        }
+        let sample = self.sample_now(&mut state)?;
+        state.clock.setup_end_ns = Some(sample.run_ns);
+        Ok(())
+    }
+
+    /// Capture the end of preparation when the run exits before measurement
+    /// starts. Setup failures must not call this method: they leave
+    /// `preparation_ns` null because preparation was never entered.
+    pub(crate) fn mark_preparation_complete(&self) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        if state.clock.preparation_end_ns.is_some() {
+            return Ok(());
+        }
+        if state.phase() != Phase::Preparation || state.clock.setup_end_ns.is_none() {
+            return Err(MeasurementError::InvalidPhase(
+                "preparation can only finish after setup and before measurement".into(),
+            ));
+        }
+        let sample = self.sample_now(&mut state)?;
+        state.clock.preparation_end_ns = Some(sample.run_ns);
+        Ok(())
+    }
+
+    pub fn begin_watch_teardown(&self) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        if state.clock.watch_teardown_start_ns.is_none() {
+            state.clock.watch_teardown_start_ns = Some(sample.run_ns);
+        }
+        if state.phase() == Phase::Drain
+            && state.clock.measurement_start.is_some()
+            && state.clock.drain_end_ns.is_none()
+        {
+            state.clock.drain_end_ns = Some(sample.run_ns);
+        }
+        Ok(())
+    }
+
+    pub fn end_watch_teardown(&self) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        if state.clock.watch_teardown_end_ns.is_none() {
+            state.clock.watch_teardown_end_ns = Some(sample.run_ns);
+        }
+        self.close_active_watch_connections(&mut state, sample)?;
+        Ok(())
+    }
+
+    pub fn mark_drain_timeout(&self) {
+        let mut state = lock_recover(&self.inner.state);
+        state.drain_timed_out = true;
+    }
+
+    fn close_active_watch_connections(
+        &self,
+        state: &mut MeasurementState,
+        sample: ClockSample,
+    ) -> Result<(), MeasurementError> {
+        let Some(measurement_ns) = sample.measurement_ns else {
+            return Ok(());
+        };
+        let cutoff = state
+            .clock
+            .effective_cutoff_ns
+            .unwrap_or(state.clock.configured_cutoff_ns);
+        let measurement_end = measurement_ns.min(cutoff);
+        for watch in &mut state.watch {
+            if watch.measurement_connected_since_ns != WatchData::INACTIVE {
+                watch.storage.observable_duration_ns = watch
+                    .storage
+                    .observable_duration_ns
+                    .checked_add(
+                        measurement_end.saturating_sub(watch.measurement_connected_since_ns),
+                    )
+                    .ok_or(MeasurementError::CounterOverflow)?;
+                watch.measurement_connected_since_ns = WatchData::INACTIVE;
+                watch.storage.connected_since_ns = WatchData::INACTIVE;
+            }
+            if watch.drain_connected_since_ns != WatchData::INACTIVE {
+                watch.drain_connected_since_ns = WatchData::INACTIVE;
+                watch.storage.connected_since_ns = WatchData::INACTIVE;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn watch_created(&self, index: usize) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        let phase = state.phase();
+        let configured_cutoff = state.clock.configured_cutoff_ns;
+        let watch = state.watch.get_mut(index).ok_or_else(|| {
+            MeasurementError::InvalidLayout("watch stream index out of range".into())
+        })?;
+        Self::add(&mut watch.storage.created, 1)?;
+        watch.storage.ready = 1;
+        match phase {
+            Phase::Measurement => {
+                let measurement_ns = sample.measurement_ns.unwrap_or(0);
+                if watch.measurement_connected_since_ns == WatchData::INACTIVE {
+                    watch.measurement_connected_since_ns = measurement_ns;
+                }
+            }
+            Phase::Drain => {
+                if watch.drain_connected_since_ns == WatchData::INACTIVE {
+                    watch.drain_connected_since_ns =
+                        sample.measurement_ns.unwrap_or(configured_cutoff);
+                }
+            }
+            Phase::Preparation | Phase::Finished => {}
+        }
+        watch.storage.connected_since_ns = match phase {
+            Phase::Measurement => watch.measurement_connected_since_ns,
+            Phase::Drain => watch.drain_connected_since_ns,
+            Phase::Preparation | Phase::Finished => WatchData::INACTIVE,
+        };
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_watch_created(phase.as_str());
+        }
+        self.notify_watch_readiness();
+        Ok(())
+    }
+
+    pub fn watch_disconnect(&self, index: usize) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        let phase = state.phase();
+        let cutoff = state
+            .clock
+            .effective_cutoff_ns
+            .unwrap_or(state.clock.configured_cutoff_ns);
+        let measurement_ns = sample.measurement_ns.unwrap_or(0);
+        let watch = state.watch.get_mut(index).ok_or_else(|| {
+            MeasurementError::InvalidLayout("watch stream index out of range".into())
+        })?;
+        if phase == Phase::Preparation {
+            watch.storage.ready = 0;
+        }
+        Self::add(&mut watch.storage.disconnects, 1)?;
+        if phase == Phase::Measurement {
+            if watch.measurement_connected_since_ns != WatchData::INACTIVE {
+                let end = measurement_ns.min(cutoff);
+                watch.storage.observable_duration_ns = watch
+                    .storage
+                    .observable_duration_ns
+                    .checked_add(end.saturating_sub(watch.measurement_connected_since_ns))
+                    .ok_or(MeasurementError::CounterOverflow)?;
+                watch.measurement_connected_since_ns = WatchData::INACTIVE;
+                watch.storage.connected_since_ns = WatchData::INACTIVE;
+            }
+            if measurement_ns < cutoff {
+                watch.measurement_gap = 1;
+            }
+        } else if phase == Phase::Drain {
+            watch.drain_connected_since_ns = WatchData::INACTIVE;
+            watch.storage.connected_since_ns = WatchData::INACTIVE;
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_watch_disconnect(phase.as_str());
+        }
+        self.notify_watch_readiness();
+        Ok(())
+    }
+
+    pub fn watch_terminal(&self, index: usize, code: u64) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        let phase = state.phase();
+        let cutoff = state
+            .clock
+            .effective_cutoff_ns
+            .unwrap_or(state.clock.configured_cutoff_ns);
+        let measurement_ns = sample.measurement_ns.unwrap_or(0);
+        let watch = state.watch.get_mut(index).ok_or_else(|| {
+            MeasurementError::InvalidLayout("watch stream index out of range".into())
+        })?;
+        if phase == Phase::Preparation {
+            watch.storage.ready = 0;
+        }
+        watch.storage.terminal_code = code;
+        if phase == Phase::Measurement {
+            if watch.measurement_connected_since_ns != WatchData::INACTIVE {
+                let end = measurement_ns.min(cutoff);
+                watch.storage.observable_duration_ns = watch
+                    .storage
+                    .observable_duration_ns
+                    .checked_add(end.saturating_sub(watch.measurement_connected_since_ns))
+                    .ok_or(MeasurementError::CounterOverflow)?;
+                watch.measurement_connected_since_ns = WatchData::INACTIVE;
+                watch.storage.connected_since_ns = WatchData::INACTIVE;
+            }
+            if measurement_ns < cutoff {
+                watch.measurement_gap = 1;
+                watch.measurement_terminal = 1;
+            }
+        } else {
+            watch.drain_connected_since_ns = WatchData::INACTIVE;
+            watch.storage.connected_since_ns = WatchData::INACTIVE;
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_watch_terminal(phase.as_str());
+        }
+        self.notify_watch_readiness();
+        Ok(())
+    }
+
+    pub fn watch_context_cancel(&self, index: usize) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        let phase = state.phase();
+        let measurement_ns = sample.measurement_ns.unwrap_or(0);
+        let cutoff = state
+            .clock
+            .effective_cutoff_ns
+            .unwrap_or(state.clock.configured_cutoff_ns);
+        let watch = state.watch.get_mut(index).ok_or_else(|| {
+            MeasurementError::InvalidLayout("watch stream index out of range".into())
+        })?;
+        if phase == Phase::Preparation {
+            watch.storage.ready = 0;
+        }
+        if watch.measurement_connected_since_ns != WatchData::INACTIVE {
+            watch.storage.observable_duration_ns =
+                watch.storage.observable_duration_ns.saturating_add(
+                    measurement_ns
+                        .min(cutoff)
+                        .saturating_sub(watch.measurement_connected_since_ns),
+                );
+            watch.measurement_connected_since_ns = WatchData::INACTIVE;
+        }
+        watch.drain_connected_since_ns = WatchData::INACTIVE;
+        watch.storage.connected_since_ns = WatchData::INACTIVE;
+        watch.storage.terminal_code = WATCH_TERMINAL_CONTEXT_CANCELED;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_watch_terminal(phase.as_str());
+        }
+        self.notify_watch_readiness();
+        Ok(())
+    }
+
+    pub fn watch_response(
+        &self,
+        index: usize,
+        response: &crate::pb::etcdserverpb::WatchResponse,
+    ) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        let phase = if state.phase() == Phase::Measurement
+            && sample.measurement_ns.unwrap_or(0)
+                < state
+                    .clock
+                    .effective_cutoff_ns
+                    .unwrap_or(state.clock.configured_cutoff_ns)
+        {
+            Phase::Measurement
+        } else if state.clock.measurement_start.is_some() {
+            Phase::Drain
+        } else {
+            Phase::Preparation
+        };
+        let events =
+            u64::try_from(response.events.len()).map_err(|_| MeasurementError::CounterOverflow)?;
+        let payload_bytes = response.events.iter().try_fold(0u64, |total, event| {
+            total
+                .checked_add(event.encoded_len() as u64)
+                .ok_or(MeasurementError::CounterOverflow)
+        })?;
+        {
+            let watch = state.watch.get_mut(index).ok_or_else(|| {
+                MeasurementError::InvalidLayout("watch stream index out of range".into())
+            })?;
+            if phase == Phase::Measurement {
+                Self::add(&mut watch.measurement_events, events)?;
+                Self::add(&mut watch.measurement_payload_bytes, payload_bytes)?;
+                Self::add(&mut watch.storage.events, events)?;
+                Self::add(&mut watch.storage.payload_bytes, payload_bytes)?;
+            } else if phase == Phase::Drain {
+                Self::add(&mut watch.drain_events, events)?;
+                Self::add(&mut watch.drain_payload_bytes, payload_bytes)?;
+                Self::add(&mut watch.storage.events, events)?;
+                Self::add(&mut watch.storage.payload_bytes, payload_bytes)?;
+            }
+        }
+        if phase == Phase::Measurement {
+            if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
+                Self::add(&mut bucket.counters.watch_events, events)?;
+                Self::add(&mut bucket.counters.watch_payload_bytes, payload_bytes)?;
+            }
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_watch_events(phase.as_str(), events, payload_bytes);
+        }
+        Ok(())
+    }
+
+    pub fn record_range_result(
+        &self,
+        pages: u64,
+        snapshot_revision: i64,
+        server_count: i64,
+        last_key_bytes: u64,
+        selected: u64,
+        discarded: u64,
+    ) -> Result<(), MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        let sample = self.sample_now(&mut state)?;
+        let phase = match state.phase() {
+            Phase::Preparation => Phase::Preparation,
+            Phase::Measurement
+                if sample.measurement_ns.unwrap_or(0)
+                    < state
+                        .clock
+                        .effective_cutoff_ns
+                        .unwrap_or(state.clock.configured_cutoff_ns) =>
+            {
+                Phase::Measurement
+            }
+            Phase::Measurement => {
+                let cutoff = state
+                    .clock
+                    .effective_cutoff_ns
+                    .unwrap_or(state.clock.configured_cutoff_ns);
+                self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+                Phase::Drain
+            }
+            Phase::Drain | Phase::Finished => Phase::Drain,
+        };
+        let range = &mut state.phase_data_mut(phase).range;
+        Self::add(&mut range.pages, pages)?;
+        range.snapshot_revision = range.snapshot_revision.max(snapshot_revision);
+        range.server_count = server_count;
+        range.last_key_bytes = last_key_bytes;
+        Self::add(&mut range.selected, selected)?;
+        Self::add(&mut range.discarded, discarded)?;
+        Ok(())
+    }
+
+    pub fn set_revision_metric(&self, revision: i64) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.set_revision(revision);
+        }
+    }
+
+    pub fn set_compact_revision_metric(&self, revision: i64) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.set_compact_revision(revision);
+        }
+    }
+
+    pub fn set_compactor_state_metric(&self, state: &'static str) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.set_compactor_state(state);
+        }
+    }
+
+    pub fn record_compactor_error_metric(&self) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_compactor_error();
+        }
+    }
+
+    pub fn record_compactor_recovery_metric(&self) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_compactor_recovery();
+        }
+    }
+
+    pub fn record_range_result_metric(
+        &self,
+        pages: u64,
+        snapshot_revision: i64,
+        server_count: i64,
+        last_key_bytes: u64,
+        selected: u64,
+        discarded: u64,
+    ) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_range_result(
+                pages,
+                snapshot_revision,
+                server_count,
+                last_key_bytes,
+                selected,
+                discarded,
+            );
+        }
+    }
+
+    pub fn finish_without_measurement(&self) -> Result<MeasurementReport, MeasurementError> {
+        if let Some(error) = self.fatal_error_result() {
+            return Err(error);
+        }
+        let mut state = lock_recover(&self.inner.state);
+        if state.clock.measurement_start.is_some() {
+            return Err(MeasurementError::InvalidPhase(
+                "measurement already started".into(),
+            ));
+        }
+        if state.active_tokens != 0 {
+            return Err(MeasurementError::ActiveTokens(state.active_tokens));
+        }
+        if state.active_rpc_attempts != 0 {
+            return Err(MeasurementError::ActiveRpcAttempts(
+                state.active_rpc_attempts,
+            ));
+        }
+        let planned_preparation = state.planned_preparation;
+        let planned_measurement = state.planned_measurement;
+        for (index, (counter, planned)) in state
+            .preparation
+            .logical
+            .iter_mut()
+            .zip(planned_preparation)
+            .enumerate()
+        {
+            let accounted = counter
+                .offered
+                .checked_add(counter.missed_schedule)
+                .and_then(|value| value.checked_add(counter.not_offered_after_stop))
+                .ok_or(MeasurementError::CounterOverflow)?;
+            let remaining = planned.saturating_sub(accounted);
+            Self::add(&mut counter.not_offered_after_stop, remaining)?;
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_logical_not_offered_after_stop("preparation", index, remaining);
+            }
+        }
+        for (index, (counter, planned)) in state
+            .measurement
+            .logical
+            .iter_mut()
+            .zip(planned_measurement)
+            .enumerate()
+        {
+            let accounted = counter
+                .offered
+                .checked_add(counter.missed_schedule)
+                .and_then(|value| value.checked_add(counter.not_offered_after_stop))
+                .ok_or(MeasurementError::CounterOverflow)?;
+            let remaining = planned.saturating_sub(accounted);
+            Self::add(&mut counter.not_offered_after_stop, remaining)?;
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_logical_not_offered_after_stop("measurement", index, remaining);
+            }
+        }
+        self.sample_now(&mut state)?;
+        state.clock.phase = PHASE_FINISHED;
+        Ok(self.build_report(&state))
+    }
+
+    pub(crate) fn try_start_measurement(
+        &self,
+    ) -> Result<Option<MeasurementWindow>, MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        if state.phase() != Phase::Preparation {
+            return Err(MeasurementError::InvalidPhase(
+                "measurement must start from preparation".into(),
+            ));
+        }
+        if state
+            .watch
+            .iter()
+            .any(|watch| watch.storage.ready == 0 || watch.storage.terminal_code != 0)
+        {
+            return Ok(None);
+        }
+        self.start_measurement_locked(&mut state).map(Some)
+    }
+
+    #[cfg(test)]
     pub fn start_measurement(&self) -> Result<MeasurementWindow, MeasurementError> {
         let mut state = lock_recover(&self.inner.state);
+        self.start_measurement_locked(&mut state)
+    }
+
+    fn start_measurement_locked(
+        &self,
+        state: &mut MeasurementState,
+    ) -> Result<MeasurementWindow, MeasurementError> {
         if state.phase() != Phase::Preparation {
             return Err(MeasurementError::InvalidPhase(
                 "measurement must start from preparation".into(),
@@ -897,7 +1480,10 @@ impl MeasurementRecorder {
         }
         // Bucket bounds are fixed metadata, not pressure time. Take the
         // authoritative epoch sample only after all bucket initialization.
-        let sample = self.sample_now(&mut state)?;
+        let sample = self.sample_now(state)?;
+        if state.clock.setup_end_ns.is_none() {
+            state.clock.setup_end_ns = Some(sample.run_ns);
+        }
         state.clock.preparation_end_ns = Some(sample.run_ns);
         let measurement_start = state.clock.last;
         let cutoff = measurement_start
@@ -905,6 +1491,12 @@ impl MeasurementRecorder {
             .ok_or(MeasurementError::ClockOverflow)?;
         state.clock.measurement_start = Some(measurement_start);
         state.clock.phase = PHASE_MEASUREMENT;
+        for watch in &mut state.watch {
+            if watch.storage.ready != 0 && watch.storage.terminal_code == 0 {
+                watch.measurement_connected_since_ns = 0;
+                watch.storage.connected_since_ns = 0;
+            }
+        }
         Ok(MeasurementWindow {
             start: measurement_start,
             cutoff,
@@ -937,6 +1529,9 @@ impl MeasurementRecorder {
     }
 
     pub fn finish(&self) -> Result<MeasurementReport, MeasurementError> {
+        if let Some(error) = self.fatal_error_result() {
+            return Err(error);
+        }
         let mut state = lock_recover(&self.inner.state);
         if state.clock.measurement_start.is_none() {
             return Err(MeasurementError::InvalidPhase(
@@ -960,33 +1555,48 @@ impl MeasurementRecorder {
             ));
         }
         if state.phase() == Phase::Drain {
-            let sample = self.sample_now(&mut state)?;
-            state.clock.drain_end_ns = Some(sample.run_ns);
+            if state.clock.drain_end_ns.is_none() {
+                let sample = self.sample_now(&mut state)?;
+                state.clock.drain_end_ns = Some(sample.run_ns);
+            }
             state.clock.phase = PHASE_FINISHED;
         }
         Ok(self.build_report(&state))
     }
 
-    pub fn report(&self) -> Result<MeasurementReport, MeasurementError> {
-        let state = lock_recover(&self.inner.state);
-        if state.phase() != Phase::Finished {
+    pub fn finish_partial(&self) -> Result<MeasurementReport, MeasurementError> {
+        let mut state = lock_recover(&self.inner.state);
+        if state.clock.measurement_start.is_none() {
             return Err(MeasurementError::InvalidPhase(
-                "call finish after drain and token join before reporting".into(),
+                "measurement has not started".into(),
             ));
         }
-        if state.active_tokens != 0 {
-            return Err(MeasurementError::ActiveTokens(state.active_tokens));
+        if state.phase() == Phase::Measurement {
+            match self.sample_now(&mut state) {
+                Ok(sample) => {
+                    let effective_ns = sample
+                        .measurement_ns
+                        .unwrap_or(0)
+                        .min(state.clock.configured_cutoff_ns);
+                    if self
+                        .freeze_cutoff(&mut state, sample.run_ns, effective_ns)
+                        .is_err()
+                    {
+                        state.arithmetic_overflow = true;
+                    }
+                }
+                Err(_) => state.arithmetic_overflow = true,
+            }
         }
-        if state.active_rpc_attempts != 0 {
-            return Err(MeasurementError::ActiveRpcAttempts(
-                state.active_rpc_attempts,
-            ));
+        if state.phase() == Phase::Drain && state.clock.drain_end_ns.is_none() {
+            if let Ok(sample) = self.sample_now(&mut state) {
+                state.clock.drain_end_ns = Some(sample.run_ns);
+            } else {
+                state.arithmetic_overflow = true;
+            }
         }
+        state.clock.phase = PHASE_FINISHED;
         Ok(self.build_report(&state))
-    }
-
-    pub fn into_report(self) -> Result<MeasurementReport, MeasurementError> {
-        self.report()
     }
 
     pub fn offer(&self, stream: LogicalStreamIdentity) -> Result<OfferResult, MeasurementError> {
@@ -1033,6 +1643,13 @@ impl MeasurementRecorder {
                     &mut state.measurement.logical[index].not_offered_after_stop
                 };
                 Self::add(counter, 1)?;
+                if let Some(metrics) = &self.inner.metrics {
+                    if normal_cutoff {
+                        metrics.record_logical_missed_schedule(phase.as_str(), index, 1);
+                    } else {
+                        metrics.record_logical_not_offered_after_stop(phase.as_str(), index, 1);
+                    }
+                }
                 return Ok(if normal_cutoff {
                     OfferResult::MissedSchedule
                 } else {
@@ -1047,6 +1664,9 @@ impl MeasurementRecorder {
             if measurement_ns >= cutoff {
                 self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
                 Self::add(&mut state.measurement.logical[index].missed_schedule, 1)?;
+                if let Some(metrics) = &self.inner.metrics {
+                    metrics.record_logical_missed_schedule(phase.as_str(), index, 1);
+                }
                 return Ok(OfferResult::MissedSchedule);
             }
         }
@@ -1058,6 +1678,7 @@ impl MeasurementRecorder {
         }))
     }
 
+    #[cfg(test)]
     pub fn record_missed_schedule(
         &self,
         stream: LogicalStreamIdentity,
@@ -1082,6 +1703,13 @@ impl MeasurementRecorder {
                 &mut state.measurement.logical[index].not_offered_after_stop
             };
             Self::add(counter, count)?;
+            if let Some(metrics) = &self.inner.metrics {
+                if normal_cutoff {
+                    metrics.record_logical_missed_schedule("measurement", index, count);
+                } else {
+                    metrics.record_logical_not_offered_after_stop("measurement", index, count);
+                }
+            }
             return Ok(());
         }
         let measurement_ns = sample.measurement_ns.unwrap_or(0);
@@ -1099,8 +1727,18 @@ impl MeasurementRecorder {
                 &mut state.measurement.logical[index].not_offered_after_stop
             };
             Self::add(counter, count)?;
+            if let Some(metrics) = &self.inner.metrics {
+                if normal_cutoff {
+                    metrics.record_logical_missed_schedule("measurement", index, count);
+                } else {
+                    metrics.record_logical_not_offered_after_stop("measurement", index, count);
+                }
+            }
         } else {
             Self::add(&mut state.measurement.logical[index].missed_schedule, count)?;
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_logical_missed_schedule("measurement", index, count);
+            }
         }
         Ok(())
     }
@@ -1124,6 +1762,9 @@ impl MeasurementRecorder {
         }
         let _ = self.sample_now(&mut state)?;
         Self::add(&mut state.measurement.logical[index].missed_schedule, count)?;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_logical_missed_schedule("measurement", index, count);
+        }
         Ok(())
     }
 
@@ -1153,36 +1794,17 @@ impl MeasurementRecorder {
             &mut state.measurement.logical[index].not_offered_after_stop,
             count,
         )?;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_logical_not_offered_after_stop("measurement", index, count);
+        }
         Ok(())
     }
 
-    pub fn record_error(
+    pub fn start_rpc_with_payload(
         &self,
-        stream: LogicalStreamIdentity,
-        code: u64,
-        message: &str,
-    ) -> Result<(), MeasurementError> {
-        let index = stream
-            .measurement_index()
-            .ok_or_else(|| MeasurementError::InvalidLayout("logical stream has no index".into()))?;
-        let mut state = lock_recover(&self.inner.state);
-        Self::set_error(&mut state.measurement, index, code, message);
-        Ok(())
-    }
-
-    pub fn record_preparation_error(
-        &self,
-        stream: PreparationStream,
-        code: u64,
-        message: &str,
-    ) -> Result<(), MeasurementError> {
-        let mut state = lock_recover(&self.inner.state);
-        let index = stream.index();
-        Self::set_error(&mut state.preparation, index, code, message);
-        Ok(())
-    }
-
-    pub fn start_rpc(&self, method: RpcMethod) -> Result<RpcAttempt, MeasurementError> {
+        method: RpcMethod,
+        request_payload_bytes: u64,
+    ) -> Result<RpcAttempt, MeasurementError> {
         let mut state = lock_recover(&self.inner.state);
         let sample = self.sample_now(&mut state)?;
         let (phase, index) = match state.phase() {
@@ -1209,10 +1831,18 @@ impl MeasurementRecorder {
         };
         let counter = &mut state.phase_data_mut(phase).rpc[index];
         Self::add(&mut counter.rpc_started, 1)?;
+        Self::add(&mut counter.request_payload_bytes, request_payload_bytes)?;
+        Self::add(&mut counter.rpc_payload_bytes, request_payload_bytes)?;
         if phase == Phase::Measurement {
             if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
                 Self::add(&mut bucket.counters.rpc_started, 1)?;
+                if method == RpcMethod::Txn {
+                    Self::add(&mut bucket.counters.txn_started, 1)?;
+                }
             }
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_rpc_started(phase.as_str(), method.index(), request_payload_bytes);
         }
         Self::add(&mut state.active_rpc_attempts, 1)?;
         Ok(RpcAttempt {
@@ -1220,6 +1850,7 @@ impl MeasurementRecorder {
             method,
             start_phase: phase,
             start_run_ns: sample.run_ns,
+            request_payload_bytes,
             lifecycle: Mutex::new(RpcLifecycle::Open),
         })
     }
@@ -1265,6 +1896,16 @@ impl MeasurementRecorder {
         if state.clock.effective_cutoff_ns.is_none() {
             state.clock.effective_cutoff_ns = Some(effective_ns);
             state.clock.drain_start_ns = Some(run_ns);
+            for watch in &mut state.watch {
+                if watch.measurement_connected_since_ns != WatchData::INACTIVE {
+                    watch.storage.observable_duration_ns =
+                        watch.storage.observable_duration_ns.saturating_add(
+                            effective_ns.saturating_sub(watch.measurement_connected_since_ns),
+                        );
+                    watch.measurement_connected_since_ns = WatchData::INACTIVE;
+                    watch.storage.connected_since_ns = WatchData::INACTIVE;
+                }
+            }
             state.clock.phase = PHASE_DRAIN;
             for (index, bucket) in state.buckets.iter_mut().enumerate() {
                 let nominal_start = u64::try_from(index)
@@ -1299,6 +1940,97 @@ impl MeasurementRecorder {
         state.buckets.get_mut(index)
     }
 
+    fn watch_report_for_state(&self, state: &MeasurementState, drain: bool) -> WatchReport {
+        let measurement_started = state.clock.measurement_start.is_some();
+        let observed_ns = if measurement_started {
+            state
+                .clock
+                .effective_cutoff_ns
+                .unwrap_or(state.clock.configured_cutoff_ns)
+        } else {
+            0
+        };
+        let mut roots = Vec::<WatchRootReport>::new();
+        let mut root_observable_ns = Vec::<u128>::new();
+        for (index, spec) in self.inner.watch_specs.iter().enumerate() {
+            let Some(watch) = state.watch.get(index) else {
+                continue;
+            };
+            let root_index = if roots
+                .last()
+                .is_some_and(|root| root.root == spec.resource_prefix)
+            {
+                roots.len() - 1
+            } else {
+                roots.push(WatchRootReport {
+                    root: spec.resource_prefix.clone(),
+                    expected_streams: 0,
+                    ready_streams: 0,
+                    observable_stream_ms: 0.0,
+                    observed_measurement_ms: 0.0,
+                    coverage_ratio: None,
+                    observation_complete: false,
+                    streams: Vec::new(),
+                });
+                root_observable_ns.push(0);
+                roots.len() - 1
+            };
+            let observable_ns = watch.storage.observable_duration_ns;
+            let complete = measurement_started
+                && observed_ns > 0
+                && watch.storage.ready != 0
+                && watch.measurement_gap == 0
+                && watch.measurement_terminal == 0
+                && observable_ns >= observed_ns;
+            let events = if drain {
+                watch.drain_events
+            } else {
+                watch.measurement_events
+            };
+            let payload_bytes = if drain {
+                watch.drain_payload_bytes
+            } else {
+                watch.measurement_payload_bytes
+            };
+            roots[root_index].expected_streams =
+                roots[root_index].expected_streams.saturating_add(1);
+            if watch.storage.ready != 0 {
+                roots[root_index].ready_streams = roots[root_index].ready_streams.saturating_add(1);
+            }
+            root_observable_ns[root_index] =
+                root_observable_ns[root_index].saturating_add(u128::from(observable_ns));
+            roots[root_index].streams.push(WatchStreamReport {
+                root: spec.resource_prefix.clone(),
+                stream: spec.name.clone(),
+                ready: watch.storage.ready != 0,
+                observable_duration_ms: observable_ns as f64 / NANOS_PER_MILLISECOND as f64,
+                disconnects: watch.storage.disconnects,
+                terminal: watch_terminal_label(watch.storage.terminal_code),
+                events,
+                payload_bytes,
+                observation_complete: complete,
+            });
+        }
+        let mut observation_complete = measurement_started && observed_ns > 0;
+        for (root_index, root) in roots.iter_mut().enumerate() {
+            let denominator = u128::from(root.expected_streams) * u128::from(observed_ns);
+            let numerator = root_observable_ns[root_index];
+            root.observable_stream_ms = numerator as f64 / NANOS_PER_MILLISECOND as f64;
+            root.observed_measurement_ms = observed_ns as f64 / NANOS_PER_MILLISECOND as f64;
+            root.coverage_ratio = (denominator > 0).then(|| numerator as f64 / denominator as f64);
+            root.observation_complete = !root.streams.is_empty()
+                && root
+                    .streams
+                    .iter()
+                    .all(|stream| stream.observation_complete);
+            observation_complete &= root.observation_complete;
+        }
+        WatchReport {
+            roots,
+            observation_complete,
+        }
+    }
+
     fn build_report(&self, state: &MeasurementState) -> MeasurementReport {
         let preparation = phase_report(
             Phase::Preparation,
@@ -1306,15 +2038,32 @@ impl MeasurementRecorder {
             &state.planned_preparation,
             None,
         );
-        let measurement = phase_report(
+        let mut measurement_phase = phase_report(
             Phase::Measurement,
             &state.measurement,
             &state.planned_measurement,
             Some(&state.drain),
         );
-        let drain_planned = [0u64; MEASUREMENT_LOGICAL_STREAMS];
-        let drain = phase_report(Phase::Drain, &state.drain, &drain_planned, None);
         let effective_ns = state.clock.effective_cutoff_ns;
+        if let Some(duration_ns) = effective_ns.filter(|duration| *duration > 0) {
+            for rpc in &mut measurement_phase.rpc {
+                let denominator = duration_ns as f64;
+                rpc.started_per_second = Some(rpc.started as f64 * 1_000_000_000.0 / denominator);
+                rpc.completed_per_second =
+                    Some(rpc.completed as f64 * 1_000_000_000.0 / denominator);
+            }
+        }
+        let drain_planned = [0u64; MEASUREMENT_LOGICAL_STREAMS];
+        let mut drain = phase_report(Phase::Drain, &state.drain, &drain_planned, None);
+        for (drain_row, measurement_row) in drain
+            .logical
+            .iter_mut()
+            .zip(measurement_phase.logical.iter())
+        {
+            drain_row.canceled_queued = measurement_row.canceled_queued;
+            drain_row.canceled_running = measurement_row.canceled_running;
+        }
+        drain.timed_out = state.drain_timed_out;
         let cutoff_queued = state
             .measurement
             .logical
@@ -1340,7 +2089,7 @@ impl MeasurementRecorder {
         let planned_conserved = preparation
             .logical
             .iter()
-            .chain(measurement.logical.iter())
+            .chain(measurement_phase.logical.iter())
             .all(|row| {
                 row.planned
                     == row
@@ -1351,7 +2100,7 @@ impl MeasurementRecorder {
         let offered_conserved = preparation
             .logical
             .iter()
-            .chain(measurement.logical.iter())
+            .chain(measurement_phase.logical.iter())
             .all(|row| {
                 row.offered
                     == row
@@ -1359,7 +2108,7 @@ impl MeasurementRecorder {
                         .saturating_add(row.dropped_full)
                         .saturating_add(row.dropped_closed)
             });
-        let accepted_cohort_conserved = measurement.logical.iter().all(|row| {
+        let accepted_cohort_conserved = measurement_phase.logical.iter().all(|row| {
             row.accepted
                 == row
                     .succeeded_before_cutoff
@@ -1371,13 +2120,15 @@ impl MeasurementRecorder {
         let result_unknown_subset_failed = preparation
             .logical
             .iter()
-            .chain(measurement.logical.iter())
+            .chain(measurement_phase.logical.iter())
             .all(|row| {
                 row.result_unknown_before_cutoff <= row.failed_before_cutoff
                     && row.result_unknown_after_cutoff <= row.failed_after_cutoff
             });
+        let watch = self.watch_report_for_state(state, false);
+        let drain_watch = self.watch_report_for_state(state, true);
         let timing = TimingReport {
-            setup_ns: None,
+            setup_ns: state.clock.setup_end_ns,
             preparation_ns: state.clock.preparation_end_ns,
             configured_measurement_ns: state
                 .clock
@@ -1388,6 +2139,11 @@ impl MeasurementRecorder {
                 .clock
                 .drain_start_ns
                 .zip(state.clock.drain_end_ns)
+                .map(|(start, end)| end.saturating_sub(start)),
+            watch_teardown_ns: state
+                .clock
+                .watch_teardown_start_ns
+                .zip(state.clock.watch_teardown_end_ns)
                 .map(|(start, end)| end.saturating_sub(start)),
         };
         let cutoff = CutoffReport {
@@ -1402,25 +2158,69 @@ impl MeasurementRecorder {
         let buckets = state
             .buckets
             .iter()
-            .map(|bucket| BucketReport {
-                start_ns: bucket.counters.start_ns,
-                end_ns: bucket.counters.end_ns,
-                logical_offered: bucket.counters.logical_offered,
-                logical_started: bucket.counters.logical_started,
-                logical_completed: bucket.counters.logical_completed,
-                logical_errors: bucket.counters.logical_errors,
-                rpc_started: bucket.counters.rpc_started,
-                rpc_completed: bucket.counters.rpc_completed,
-                watch_events: bucket.counters.watch_events,
-                watch_payload_bytes: bucket.counters.watch_payload_bytes,
-                logical_latency: bucket.logical.view(),
-                queue_latency: bucket.queue.view(),
-                rpc_latency: bucket.rpc.view(),
+            .map(|bucket| {
+                let width_ns = bucket
+                    .counters
+                    .end_ns
+                    .saturating_sub(bucket.counters.start_ns);
+                let txn_started_per_second = (width_ns > 0).then(|| {
+                    bucket.counters.txn_started as f64 * 1_000_000_000.0 / width_ns as f64
+                });
+                let txn_completed_per_second = (width_ns > 0).then(|| {
+                    bucket.counters.txn_completed as f64 * 1_000_000_000.0 / width_ns as f64
+                });
+                BucketReport {
+                    start_ns: bucket.counters.start_ns,
+                    end_ns: bucket.counters.end_ns,
+                    logical_offered: bucket.counters.logical_offered,
+                    logical_started: bucket.counters.logical_started,
+                    logical_completed: bucket.counters.logical_completed,
+                    logical_errors: bucket.counters.logical_errors,
+                    rpc_started: bucket.counters.rpc_started,
+                    rpc_completed: bucket.counters.rpc_completed,
+                    txn_started: bucket.counters.txn_started,
+                    txn_completed: bucket.counters.txn_completed,
+                    txn_started_per_second,
+                    txn_completed_per_second,
+                    watch_events: bucket.counters.watch_events,
+                    watch_payload_bytes: bucket.counters.watch_payload_bytes,
+                    logical_latency: bucket.logical.view(),
+                    queue_latency: bucket.queue.view(),
+                    rpc_latency: bucket.rpc.view(),
+                }
             })
             .collect();
+        let metadata = HistogramMetadata {
+            low_us: 1,
+            significant_digits: HDR_SIGNIFICANT_DIGITS,
+            auto_resize: false,
+            coordinated_omission: false,
+            overflow_is_not_truncated: true,
+            duration_rounding: "max(1, ceil(duration_ns / 1000))".into(),
+            payload_definition:
+                "protobuf message encoded_len; framing, headers and status metadata excluded".into(),
+        };
+        let histogram_overflow = phase_has_histogram_overflow(&state.preparation)
+            || phase_has_histogram_overflow(&state.measurement)
+            || phase_has_histogram_overflow(&state.drain)
+            || state.buckets.iter().any(|bucket| {
+                bucket.logical.metadata.overflow != 0
+                    || bucket.queue.metadata.overflow != 0
+                    || bucket.rpc.metadata.overflow != 0
+            });
+        let observation_complete = watch.observation_complete;
+        let measurement_complete = state.clock.measurement_start.is_some()
+            && effective_ns == Some(state.clock.configured_cutoff_ns)
+            && planned_conserved
+            && offered_conserved
+            && accepted_cohort_conserved
+            && result_unknown_subset_failed
+            && state.active_tokens == 0
+            && state.active_rpc_attempts == 0
+            && !state.arithmetic_overflow;
         MeasurementReport {
             preparation,
-            measurement,
+            measurement: measurement_phase.clone(),
             drain,
             buckets,
             cutoff,
@@ -1432,15 +2232,18 @@ impl MeasurementRecorder {
                 result_unknown_subset_failed,
                 no_active_tokens: state.active_tokens == 0 && state.active_rpc_attempts == 0,
                 no_arithmetic_overflow: !state.arithmetic_overflow,
+                measurement_complete,
+                observation_complete,
+                histogram_overflow,
             },
-            metadata: HistogramMetadata {
-                low_us: 1,
-                significant_digits: HDR_SIGNIFICANT_DIGITS,
-                auto_resize: false,
-                coordinated_omission: false,
-                overflow_is_not_truncated: true,
-                duration_rounding: "max(1, ceil(duration_ns / 1000))".into(),
+            latency: LatencyReport {
+                logical_total: measurement_phase.logical_total.clone(),
+                queue_total: measurement_phase.queue_total.clone(),
+                rpc_total: measurement_phase.rpc_total.clone(),
+                metadata,
             },
+            watch,
+            drain_watch,
         }
     }
 
@@ -1475,6 +2278,21 @@ impl MeasurementRecorder {
                     &mut state.measurement.logical[token.stream.index].not_offered_after_stop
                 };
                 Self::add(counter, 1)?;
+                if let Some(metrics) = &self.inner.metrics {
+                    if normal_cutoff {
+                        metrics.record_logical_missed_schedule(
+                            token.stream.phase.as_str(),
+                            token.stream.index,
+                            1,
+                        );
+                    } else {
+                        metrics.record_logical_not_offered_after_stop(
+                            token.stream.phase.as_str(),
+                            token.stream.index,
+                            1,
+                        );
+                    }
+                }
                 state.active_tokens = state
                     .active_tokens
                     .checked_sub(1)
@@ -1498,6 +2316,10 @@ impl MeasurementRecorder {
         let counter = &mut state.phase_data_mut(token.stream.phase).logical[token.stream.index];
         Self::add(&mut counter.offered, 1)?;
         Self::add(&mut counter.accepted, 1)?;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_logical_offered(token.stream.phase.as_str(), token.stream.index, 1);
+            metrics.record_logical_accepted(token.stream.phase.as_str(), token.stream.index, 1);
+        }
         if token.stream.phase == Phase::Measurement {
             if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
                 Self::add(&mut bucket.counters.logical_offered, 1)?;
@@ -1538,6 +2360,21 @@ impl MeasurementRecorder {
                     &mut state.measurement.logical[token.stream.index].not_offered_after_stop
                 };
                 Self::add(counter, 1)?;
+                if let Some(metrics) = &self.inner.metrics {
+                    if normal_cutoff {
+                        metrics.record_logical_missed_schedule(
+                            token.stream.phase.as_str(),
+                            token.stream.index,
+                            1,
+                        );
+                    } else {
+                        metrics.record_logical_not_offered_after_stop(
+                            token.stream.phase.as_str(),
+                            token.stream.index,
+                            1,
+                        );
+                    }
+                }
                 state.active_tokens = state
                     .active_tokens
                     .checked_sub(1)
@@ -1553,6 +2390,13 @@ impl MeasurementRecorder {
         if reason == DropReason::QueueClosed {
             let counter = &mut state.phase_data_mut(token.stream.phase).logical[token.stream.index];
             Self::add(&mut counter.not_offered_after_stop, 1)?;
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_logical_not_offered_after_stop(
+                    token.stream.phase.as_str(),
+                    token.stream.index,
+                    1,
+                );
+            }
             state.active_tokens = state
                 .active_tokens
                 .checked_sub(1)
@@ -1562,9 +2406,20 @@ impl MeasurementRecorder {
         }
         let counter = &mut state.phase_data_mut(token.stream.phase).logical[token.stream.index];
         Self::add(&mut counter.offered, 1)?;
-        match reason {
-            DropReason::Backpressure => Self::add(&mut counter.dropped_full, 1)?,
-            DropReason::QueueClosed => Self::add(&mut counter.dropped_closed, 1)?,
+        if reason == DropReason::Backpressure {
+            Self::add(&mut counter.dropped_full, 1)?;
+        } else {
+            Self::add(&mut counter.dropped_closed, 1)?;
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_logical_offered(token.stream.phase.as_str(), token.stream.index, 1);
+            if reason == DropReason::Backpressure {
+                metrics.record_logical_dropped_full(
+                    token.stream.phase.as_str(),
+                    token.stream.index,
+                    1,
+                );
+            }
         }
         if token.stream.phase == Phase::Measurement {
             if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
@@ -1606,16 +2461,16 @@ impl MeasurementRecorder {
                 measurement_ns < cutoff,
             )
         };
+        let queue_wait = sample
+            .run_ns
+            .checked_sub(accepted_run_ns)
+            .ok_or(MeasurementError::ClockOverflow)?;
         let counter = &mut state.phase_data_mut(target_phase).logical[token.stream.index];
         if before_cutoff {
             Self::add(&mut counter.started_before_cutoff, 1)?;
         } else {
             Self::add(&mut counter.started_after_cutoff, 1)?;
         }
-        let queue_wait = sample
-            .run_ns
-            .checked_sub(accepted_run_ns)
-            .ok_or(MeasurementError::ClockOverflow)?;
         let phase_data = state.phase_data_mut(target_phase);
         phase_data.queue_histograms[token.stream.index].record_duration(queue_wait)?;
         phase_data.queue_total.record_duration(queue_wait)?;
@@ -1624,6 +2479,14 @@ impl MeasurementRecorder {
                 Self::add(&mut bucket.counters.logical_started, 1)?;
                 bucket.queue.record_duration(queue_wait)?;
             }
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_logical_started(target_phase.as_str(), token.stream.index);
+            metrics.record_queue_wait(
+                target_phase.as_str(),
+                token.stream.index,
+                Duration::from_nanos(queue_wait),
+            );
         }
         *lifecycle = TokenLifecycle::Started {
             accepted_run_ns,
@@ -1674,27 +2537,27 @@ impl MeasurementRecorder {
             .ok_or(MeasurementError::ClockOverflow)?;
         let counter = &mut state.phase_data_mut(target_phase).logical[token.stream.index];
         if before_cutoff {
-            if outcome == Outcome::Success {
+            if outcome.is_success() {
                 Self::add(&mut counter.succeeded_before_cutoff, 1)?;
             } else {
                 Self::add(&mut counter.failed_before_cutoff, 1)?;
-                if outcome == Outcome::Timeout {
+                if outcome.is_timeout() {
                     Self::add(&mut counter.timeout_before_cutoff, 1)?;
                 }
-                if outcome == Outcome::ResultUnknown {
+                if outcome.is_result_unknown() {
                     Self::add(&mut counter.result_unknown_before_cutoff, 1)?;
                 }
             }
         } else {
             Self::add(&mut counter.terminal_after_cutoff, 1)?;
-            if outcome == Outcome::Success {
+            if outcome.is_success() {
                 Self::add(&mut counter.succeeded_after_cutoff, 1)?;
             } else {
                 Self::add(&mut counter.failed_after_cutoff, 1)?;
-                if outcome == Outcome::Timeout {
+                if outcome.is_timeout() {
                     Self::add(&mut counter.timeout_after_cutoff, 1)?;
                 }
-                if outcome == Outcome::ResultUnknown {
+                if outcome.is_result_unknown() {
                     Self::add(&mut counter.result_unknown_after_cutoff, 1)?;
                 }
             }
@@ -1713,7 +2576,7 @@ impl MeasurementRecorder {
         if before_cutoff && target_phase == Phase::Measurement {
             if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
                 Self::add(&mut bucket.counters.logical_completed, 1)?;
-                if outcome != Outcome::Success {
+                if !outcome.is_success() {
                     Self::add(&mut bucket.counters.logical_errors, 1)?;
                 }
                 bucket.logical.record_duration(logical_latency)?;
@@ -1723,37 +2586,16 @@ impl MeasurementRecorder {
             .active_tokens
             .checked_sub(1)
             .ok_or(MeasurementError::CounterOverflow)?;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_logical_completed(
+                target_phase.as_str(),
+                token.stream.index,
+                outcome,
+                Duration::from_nanos(logical_latency),
+            );
+        }
         *lifecycle = TokenLifecycle::Terminal;
         let _ = started_run_ns;
-        Ok(TokenAction::Applied)
-    }
-
-    fn miss_token(&self, token: &MeasurementToken) -> Result<TokenAction, MeasurementError> {
-        let mut lifecycle = lock_recover(&token.lifecycle);
-        if !matches!(*lifecycle, TokenLifecycle::Offered) {
-            return Ok(TokenAction::AlreadyFinalized);
-        }
-        let mut state = lock_recover(&self.inner.state);
-        let sample = self.sample_now(&mut state)?;
-        let index = token.stream.index;
-        let before_cutoff = token.stream.phase == Phase::Measurement
-            && state.phase() == Phase::Measurement
-            && sample.measurement_ns.unwrap_or(0)
-                < state
-                    .clock
-                    .effective_cutoff_ns
-                    .unwrap_or(state.clock.configured_cutoff_ns);
-        let counter = &mut state.measurement.logical[index];
-        if before_cutoff {
-            Self::add(&mut counter.missed_schedule, 1)?;
-        } else {
-            Self::add(&mut counter.not_offered_after_stop, 1)?;
-        }
-        state.active_tokens = state
-            .active_tokens
-            .checked_sub(1)
-            .ok_or(MeasurementError::CounterOverflow)?;
-        *lifecycle = TokenLifecycle::Terminal;
         Ok(TokenAction::Applied)
     }
 
@@ -1772,6 +2614,13 @@ impl MeasurementRecorder {
                         .canceled_queued,
                     1,
                 )?;
+                if let Some(metrics) = &self.inner.metrics {
+                    metrics.record_logical_canceled_queued(
+                        token.stream.phase.as_str(),
+                        token.stream.index,
+                        1,
+                    );
+                }
                 state.active_tokens = state
                     .active_tokens
                     .checked_sub(1)
@@ -1785,6 +2634,13 @@ impl MeasurementRecorder {
                         .canceled_running,
                     1,
                 )?;
+                if let Some(metrics) = &self.inner.metrics {
+                    metrics.record_logical_canceled_running(
+                        token.stream.phase.as_str(),
+                        token.stream.index,
+                        1,
+                    );
+                }
                 state.active_tokens = state
                     .active_tokens
                     .checked_sub(1)
@@ -1827,28 +2683,41 @@ impl MeasurementRecorder {
         };
         let counter = &mut state.phase_data_mut(target_phase).rpc[attempt.method.index()];
         Self::add(&mut counter.rpc_completed, 1)?;
-        if outcome == Outcome::Success {
+        if outcome.is_success() {
             Self::add(&mut counter.rpc_succeeded, 1)?;
         } else {
             Self::add(&mut counter.rpc_failed, 1)?;
-            if outcome == Outcome::Timeout {
+            if outcome.is_timeout() {
                 Self::add(&mut counter.rpc_timeout, 1)?;
             }
-            if outcome == Outcome::ResultUnknown {
+            if outcome.is_result_unknown() {
                 Self::add(&mut counter.rpc_result_unknown, 1)?;
             }
         }
+        Self::add(&mut counter.response_payload_bytes, payload_bytes)?;
         Self::add(&mut counter.rpc_payload_bytes, payload_bytes)?;
         let latency = sample
             .run_ns
             .checked_sub(attempt.start_run_ns)
             .ok_or(MeasurementError::ClockOverflow)?;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.record_rpc_completed(
+                target_phase.as_str(),
+                attempt.method.index(),
+                outcome,
+                payload_bytes,
+                Duration::from_nanos(latency),
+            );
+        }
         let phase_data = state.phase_data_mut(target_phase);
         phase_data.rpc_histograms[attempt.method.index()].record_duration(latency)?;
         phase_data.rpc_total.record_duration(latency)?;
         if before_cutoff && target_phase == Phase::Measurement {
             if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
                 Self::add(&mut bucket.counters.rpc_completed, 1)?;
+                if attempt.method == RpcMethod::Txn {
+                    Self::add(&mut bucket.counters.txn_completed, 1)?;
+                }
                 bucket.rpc.record_duration(latency)?;
             }
         }
@@ -1893,10 +2762,6 @@ impl fmt::Debug for MeasurementToken {
 }
 
 impl MeasurementToken {
-    pub fn miss_before_cutoff(&self) -> Result<TokenAction, MeasurementError> {
-        self.recorder.miss_token(self)
-    }
-
     pub fn accept(&self) -> Result<TokenAction, MeasurementError> {
         self.recorder.accept_token(self, None)
     }
@@ -1930,15 +2795,17 @@ impl MeasurementToken {
             .terminal_token(self, outcome, Some((code, message)))
     }
 
-    pub fn cancel(&self) -> Result<TokenAction, MeasurementError> {
-        self.recorder.cancel_token(self)
+    pub(crate) fn recorder(&self) -> MeasurementRecorder {
+        self.recorder.clone()
     }
 }
 
 impl Drop for MeasurementToken {
     fn drop(&mut self) {
         let recorder = self.recorder.clone();
-        let _ = recorder.cancel_token(self);
+        if let Err(error) = recorder.cancel_token(self) {
+            recorder.record_internal_error(&error);
+        }
     }
 }
 
@@ -1953,6 +2820,7 @@ pub struct RpcAttempt {
     method: RpcMethod,
     start_phase: Phase,
     start_run_ns: u64,
+    request_payload_bytes: u64,
     lifecycle: Mutex<RpcLifecycle>,
 }
 
@@ -1962,6 +2830,7 @@ impl fmt::Debug for RpcAttempt {
             .debug_struct("RpcAttempt")
             .field("method", &self.method)
             .field("start_phase", &self.start_phase)
+            .field("request_payload_bytes", &self.request_payload_bytes)
             .field("start_run_ns", &self.start_run_ns)
             .field("lifecycle", &lock_recover(&self.lifecycle))
             .finish()
@@ -1981,7 +2850,9 @@ impl RpcAttempt {
 impl Drop for RpcAttempt {
     fn drop(&mut self) {
         let recorder = self.recorder.clone();
-        let _ = recorder.abandon_rpc(self);
+        if let Err(error) = recorder.abandon_rpc(self) {
+            recorder.record_internal_error(&error);
+        }
     }
 }
 
@@ -2063,16 +2934,6 @@ fn measurement_identity(index: usize) -> LogicalStreamIdentity {
         },
         _ => panic!("fixed measurement stream index out of range"),
     }
-}
-/// Return the fixed measurement identity at `index`.  The mapping is stable
-/// across runs and retains zero-weight streams so report shape never changes.
-pub fn measurement_stream(index: usize) -> Option<LogicalStreamIdentity> {
-    (index < MEASUREMENT_LOGICAL_STREAMS).then(|| measurement_identity(index))
-}
-
-/// Return the fixed preparation identity at `index`.
-pub fn preparation_stream(index: usize) -> Option<PreparationStream> {
-    (index < PREPARATION_LOGICAL_STREAMS).then(|| preparation_identity(index))
 }
 
 fn preparation_identity(index: usize) -> PreparationStream {
@@ -2206,6 +3067,49 @@ fn logical_report(
     }
 }
 
+fn preparation_resources(logical: &[CounterStorage]) -> Vec<PreparationResourceReport> {
+    [
+        ("pods", 0usize),
+        ("nodes", 1),
+        ("node_leases", 2),
+        ("deployments", 3),
+        ("replicasets", 4),
+        ("daemonsets", 5),
+    ]
+    .into_iter()
+    .map(|(resource, index)| {
+        let counter = logical.get(index).copied().unwrap_or_default();
+        PreparationResourceReport {
+            resource: resource.into(),
+            created: counter.succeeded_before_cutoff,
+            failed: counter.failed_before_cutoff,
+        }
+    })
+    .collect()
+}
+
+fn watch_terminal_label(code: u64) -> Option<String> {
+    match code {
+        0 => None,
+        WATCH_TERMINAL_COMPACTED => Some("compacted".into()),
+        WATCH_TERMINAL_CANCELED => Some("canceled".into()),
+        WATCH_TERMINAL_NO_LEADER => Some("no_leader".into()),
+        WATCH_TERMINAL_SEMANTIC => Some("semantic".into()),
+        WATCH_TERMINAL_PHASE_DEADLINE => Some("phase_deadline".into()),
+        WATCH_TERMINAL_CONTEXT_CANCELED => Some("context_canceled".into()),
+        _ => Some("unknown".into()),
+    }
+}
+
+fn phase_has_histogram_overflow(data: &PhaseData) -> bool {
+    data.logical_histograms
+        .iter()
+        .chain(data.queue_histograms.iter())
+        .chain(data.rpc_histograms.iter())
+        .chain([&data.logical_total, &data.queue_total, &data.rpc_total].into_iter())
+        .any(|histogram| histogram.metadata.overflow != 0)
+}
+
 fn phase_report(
     phase: Phase,
     data: &PhaseData,
@@ -2253,6 +3157,11 @@ fn phase_report(
         .into_iter()
         .map(|method| {
             let counter = &data.rpc[method.index()];
+            let range = if method == RpcMethod::Range {
+                data.range
+            } else {
+                RangeStats::default()
+            };
             RpcReport {
                 method: method.as_str().into(),
                 started: counter.rpc_started,
@@ -2262,7 +3171,16 @@ fn phase_report(
                 timeout: counter.rpc_timeout,
                 result_unknown: counter.rpc_result_unknown,
                 payload_bytes: counter.rpc_payload_bytes,
+                request_payload_bytes: counter.request_payload_bytes,
+                response_payload_bytes: counter.response_payload_bytes,
                 latency: data.rpc_histograms[method.index()].view(),
+                range_pages: range.pages,
+                range_snapshot_revision: range.snapshot_revision,
+                range_server_count: range.server_count,
+                range_last_key_bytes: range.last_key_bytes,
+                range_selected: range.selected,
+                range_discarded: range.discarded,
+                ..Default::default()
             }
         })
         .collect();
@@ -2271,9 +3189,15 @@ fn phase_report(
         logical,
         queue,
         rpc,
+        resources: if phase == Phase::Preparation {
+            preparation_resources(&data.logical)
+        } else {
+            Vec::new()
+        },
         logical_total: data.logical_total.view(),
         queue_total: data.queue_total.view(),
         rpc_total: data.rpc_total.view(),
+        timed_out: false,
     }
 }
 
@@ -2283,6 +3207,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::report::{RunReport, RunStatus};
 
     struct TestClock {
         start: Instant,
@@ -2332,6 +3257,71 @@ mod tests {
 
     fn small_plan() -> CompiledPlan {
         small_plan_with(70, 100, 10)
+    }
+    #[test]
+    fn test_fractional_watch_coverage_and_zero_window_report() {
+        let plan = std::sync::Arc::new(small_plan());
+        let build_report = |clock: Arc<TestClock>, cutoff_ns: u64| {
+            let recorder = MeasurementRecorder::with_clock(
+                &plan,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            )
+            .unwrap();
+            record_preparation(&recorder, &plan);
+            recorder.start_measurement().unwrap();
+            for index in 0..plan.watch_specs().len() {
+                recorder.watch_created(index).unwrap();
+            }
+            clock.set(cutoff_ns);
+            recorder.stop_measurement().unwrap();
+            let measurement = recorder.finish().unwrap();
+            let config = crate::config::RunConfig {
+                plan: plan.clone(),
+                endpoint: "http://fixture".into(),
+                metrics_listen: "127.0.0.1:0".parse().unwrap(),
+                max_message_size: 64 * 1024 * 1024,
+                setup_started_at: Instant::now(),
+            };
+            RunReport::from_measurement(&config, RunStatus::Completed, None, None, measurement)
+        };
+
+        let fractional = build_report(TestClock::new(), 500_000);
+        assert_eq!(fractional.timing.observed_measurement_ms, Some(0.5));
+        assert!(
+            fractional
+                .measurement
+                .watch
+                .roots
+                .iter()
+                .all(|root| root.coverage_ratio == Some(1.0))
+        );
+        assert!(
+            fractional
+                .measurement
+                .watch
+                .roots
+                .iter()
+                .all(|root| root.observable_stream_ms > 0.0)
+        );
+        assert!(
+            fractional
+                .measurement
+                .watch
+                .roots
+                .iter()
+                .flat_map(|root| root.streams.iter())
+                .all(|stream| stream.observable_duration_ms > 0.0)
+        );
+
+        let zero = build_report(TestClock::new(), 0);
+        assert_eq!(zero.timing.observed_measurement_ms, Some(0.0));
+        assert!(
+            zero.measurement
+                .watch
+                .roots
+                .iter()
+                .all(|root| root.coverage_ratio.is_none())
+        );
     }
     fn record_preparation(recorder: &MeasurementRecorder, plan: &CompiledPlan) {
         let planned = [
@@ -2475,6 +3465,94 @@ mod tests {
     }
 
     #[test]
+    fn test_preparation_counters_do_not_pollute_measurement() {
+        let clock = TestClock::new();
+        let plan = small_plan();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        record_preparation(&recorder, &plan);
+        recorder.start_measurement().unwrap();
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+
+        assert!(
+            report
+                .preparation
+                .logical
+                .iter()
+                .any(|row| row.succeeded_before_cutoff > 0)
+        );
+        assert!(
+            report
+                .measurement
+                .logical
+                .iter()
+                .all(|row| row.started_before_cutoff == 0 && row.succeeded_before_cutoff == 0)
+        );
+        assert!(
+            report
+                .measurement
+                .rpc
+                .iter()
+                .all(|row| row.started == 0 && row.completed == 0)
+        );
+    }
+    #[test]
+    fn test_preparation_disconnect_clears_historical_ready() {
+        let clock = TestClock::new();
+        let plan = small_plan();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        record_preparation(&recorder, &plan);
+        for index in 0..plan.watch_specs().len() {
+            recorder.watch_created(index).unwrap();
+        }
+
+        // The first stream disconnects during preparation and does not
+        // reconnect before the measurement window starts.
+        clock.set(10_000_000);
+        recorder.watch_disconnect(0).unwrap();
+        clock.set(20_000_000);
+        recorder.start_measurement().unwrap();
+        clock.set(120_000_000);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+
+        let stream = report
+            .watch
+            .roots
+            .iter()
+            .flat_map(|root| root.streams.iter())
+            .find(|stream| stream.stream == "pods")
+            .expect("pods watch report");
+        assert!(!stream.ready);
+        assert_eq!(stream.observable_duration_ms, 0.0);
+        assert!(!stream.observation_complete);
+        assert!(!report.watch.observation_complete);
+    }
+
+    #[test]
+    fn test_drain_timing_excludes_watch_teardown() {
+        let clock = TestClock::new();
+        let recorder = make_recorder(&clock);
+        recorder.start_measurement().unwrap();
+
+        clock.set(100_000_000);
+        recorder.stop_measurement().unwrap();
+        clock.set(150_000_000);
+        recorder.begin_watch_teardown().unwrap();
+        clock.set(350_000_000);
+        recorder.end_watch_teardown().unwrap();
+        clock.set(900_000_000);
+        let report = recorder.finish().unwrap();
+
+        assert_eq!(report.timing.drain_ns, Some(50_000_000));
+        assert_eq!(report.timing.watch_teardown_ns, Some(200_000_000));
+    }
+
+    #[test]
     fn test_cutoff_classify() {
         let clock = TestClock::new();
         let plan = small_plan_with(10, 100, 10);
@@ -2512,6 +3590,40 @@ mod tests {
         assert_eq!(row.cutoff_running, 0);
         assert!(report.accounting.planned_conserved);
         assert!(report.accounting.accepted_cohort_conserved);
+    }
+    #[test]
+    fn test_rpc_payload_and_completion_phase_cross_cutoff() {
+        let clock = TestClock::new();
+        let plan = small_plan_with(10, 100, 10);
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        record_preparation(&recorder, &plan);
+        recorder.start_measurement().unwrap();
+
+        clock.set(99_000_000);
+        let attempt = recorder.start_rpc_with_payload(RpcMethod::Txn, 11).unwrap();
+        clock.set(100_000_000);
+        assert_eq!(
+            recorder.stop_measurement().unwrap().effective_ns,
+            100_000_000
+        );
+        clock.set(101_000_000);
+        attempt.finish(Outcome::Success, 13).unwrap();
+
+        let report = recorder.finish().unwrap();
+        let measurement_rpc = &report.measurement.rpc[RpcMethod::Txn.index()];
+        let drain_rpc = &report.drain.rpc[RpcMethod::Txn.index()];
+        assert_eq!(measurement_rpc.started, 1);
+        assert_eq!(measurement_rpc.completed, 0);
+        assert_eq!(measurement_rpc.request_payload_bytes, 11);
+        assert_eq!(measurement_rpc.response_payload_bytes, 0);
+        assert_eq!(drain_rpc.started, 0);
+        assert_eq!(drain_rpc.completed, 1);
+        assert_eq!(drain_rpc.request_payload_bytes, 0);
+        assert_eq!(drain_rpc.response_payload_bytes, 13);
+        assert_eq!(drain_rpc.payload_bytes, 13);
+        assert_eq!(drain_rpc.latency.sample_count, 1);
     }
 
     #[test]
