@@ -17,242 +17,139 @@ cargo run --release -p etcd_proxy -- \
 
 Use `cargo run -p etcd_proxy -- --help` for all logging and transport options.
 
-## What etcd_k8s_bench models
+## Synthetic benchmark
 
-The benchmark is a Kubernetes-shaped **synthetic pressure generator** for
-etcd, aligned with the observable wire shapes used by Kubernetes v1.35.5:
+`etcd_k8s_bench` applies rule-driven, timed, open-loop pressure. It models six
+resource domains and Kubernetes-shaped etcd requests, not a Kubernetes control
+plane or a replay of observed production traffic. Values are synthetic bytes,
+not API objects. No real rollout, watch cache, controller causality, or native
+TTL lifecycle is simulated. Results are not a conversion to Kubernetes capacity.
 
-- linearizable point and prefix `Range`, including snapshot pagination;
-- ModRevision CAS `Txn` for create and update, plus the retained low-level
-  point-delete transaction shape;
-- resource-root `Watch` with `prev_kv`, `progress_notify`, and require-leader
-  metadata;
-- Event and internal masterlease native-lease attachment through
-  `LeaseGrant` followed by `Txn Put.lease`;
-- logical `Compact` coordinated through `compact_rev_key`;
-- `Maintenance/Status`.
-
-The profile supplies exact topology, resource formulas, synthetic value sizes,
-write amplification, Range mix, Watch subscriptions, and a real-time
-timeline. The benchmark creates every planned object, waits for the global
-creation barrier, and then schedules the configured successful logical
-updates. These are pressure targets, not a controller implementation: there is
-no kube-apiserver, watch-cache, controller topology, object-causal state
-machine, or event-by-event trace replay, and `rolling-update` does not perform
-real rollout deletion/replacement. The resulting pressure must not be read as
-a calibrated Kubernetes capacity or topology claim.
-
-## Run the benchmark
-
-Use a dedicated empty etcd. Before entering the scheduler, the benchmark
-performs a full-keyspace, count-only preflight and refuses to run when any key
-exists. Configuration, exporter, connection, initial `Status`, and preflight
-errors are outside the scheduler result protocol and are reported on stderr
-with exit status 1.
+### Build and inspect the plan
 
 ```sh
-cargo run --release -p etcd_k8s_bench -- run \
-  --profile k8s \
-  --endpoint 'http://127.0.0.1:2379' \
-  --nodes 2000 \
-  --pods 40000 \
-  --pod-size 4096 \
-  --metrics-listen '127.0.0.1:9898'
+cargo build --release --workspace
+./target/release/etcd_k8s_bench plan
+./target/release/etcd_k8s_bench plan --config etcd_k8s_bench/verify/synthetic-small.json
+./target/release/etcd_k8s_bench run --help
 ```
 
-`k8s` is the default and includes one Coordination NodeLease per Node. To
-omit NodeLease traffic explicitly:
+`plan` does not contact a backend. `plan` and `run` consume the same complete
+JSON configuration and scalar overrides, applied before validation. The embedded
+[default configuration](etcd_k8s_bench/workloads/synthetic-k8s.json) is the only
+default workload. `--config` replaces that input; it is not a partial overlay.
+Unknown configuration fields are rejected. Duration must be a positive integral
+number of milliseconds; `--seed 0` is valid.
+
+| Default | Value |
+| --- | --- |
+| Nodes / Pods / namespaces | 2,000 / 40,000 / 100 |
+| DaemonSets / Deployments / ReplicaSets | 10 / 200 / 200 |
+| Ordinary NodeLease keys | 2,000 |
+| Total resource keys | 44,410 |
+| Application logical updates | 10,000/s for 600s: 6,000,000 planned |
+| Active reads | 1:20 relative to updates: 300,000 planned |
+| Update weights: Pod / Deployment / ReplicaSet / DaemonSet | 95 / 2 / 2 / 1 |
+| Point / bounded-list read weights; list limit | 90 / 10; 100 |
+| Workers / total bounded queue capacity | 128 / 4,096 |
+| RPC / logical-operation timeout | 5s / 10s |
+| Preparation / drain / Watch teardown timeout | 180s / 10s / 5s |
+| Report bucket / observation memory budget | 1s / 128MiB |
+
+NodeLease renewals run every 10s with deterministic 5% jitter; Node status every
+300s, Status every 10s, and compaction coordination every 60s. These periodic
+streams are **additional** to application updates and active reads. NodeLease
+means an ordinary KV object under `/registry/leases/kube-node-lease`, not an etcd
+native lease. All resource values default to 4,096 bytes except NodeLease (512).
+
+### Run against a dedicated empty backend
+
+The benchmark writes data. Supply a dedicated disposable etcd endpoint; never
+point these examples at a production cluster. Status and a full-keyspace
+count-only preflight must succeed, and any existing key causes rejection.
+Neither benchmark nor verification tooling clears the backend or changes quota.
+Use a new empty instance/data directory for every run.
 
 ```sh
-cargo run --release -p etcd_k8s_bench -- run \
-  --profile k8s-no-node-lease \
-  --endpoint 'http://127.0.0.1:2379'
+./target/release/etcd_k8s_bench run \
+  --config etcd_k8s_bench/verify/synthetic-small.json \
+  --endpoint http://127.0.0.1:12379 \
+  --metrics-listen 127.0.0.1:19898
 ```
 
-`--config <path>` loads a reviewed custom profile and is mutually exclusive
-with an explicit `--profile`.
+Preparation creates all six resource domains, applies NodeReady updates, and
+waits for every Watch to be currently ready after Created. Preparation is outside
+the measurement window. Application and periodic work is offered at **1ms tick
+granularity**. A delayed scheduler skips expired slots: it does not catch up or
+wait for a success quota. Within-tick batches are expected. Full queues drop
+work explicitly; queues are bounded.
 
-The profile uses one real-time clock: timeline durations, Range RPS, periodic
-intervals, and native lease TTLs are not rescaled. Change explicit profile
-durations, rates, or update targets to adjust pressure. Updates are dispatched
-over the first 95% of the hard **application update-phase** deadline; the
-remaining 5% is only the successful-update completion margin, not a whole-run
-wall-clock cap. After the timeline, accepted background work drains under its
-own `operation_timeout`, then Watch teardown runs under its own
-`operation_timeout`. A Watch terminal or worker error aborts active dispatch/
-update supervision; a Watch terminal observed during normal post-timeline
-drain is collected during teardown and still makes `achieved=false`. Queue
-backpressure can delay dispatch and produce catch-up bursts, so dispatch is
-not promised to be strictly uniform.
+The measurement window is `[start, effective_cutoff)`. An event exactly at the
+cutoff belongs to drain. Accepted work can execute during bounded drain; Watch
+teardown follows. The final report is emitted after owned tasks are joined.
+Ordinary request errors, overload, and measurement-time semantic Watch gaps do
+not shorten an otherwise normal configured window.
 
-Each default profile has one Watch RPC stream/subscription for each of these
-nine resource roots: `pods`, `events`, `replicasets`, `deployments`, `leases`,
-`daemonsets`, `services`, `endpointslices`, and `minions`. The `masterleases`
-resource is intentionally not a default Watch root. Every configured entry
-creates its own stream/subscription; duplicate prefixes are not merged. These
-streams reuse the benchmark's shared client transport and do not imply one new
-TCP connection per entry. This is synthetic subscription-establishment and
-event-fanout pressure, not a trace-derived connection count or an
-apiserver/watch-cache topology. The wider subscription set is not equivalent
-to the former single-Pod-Watch profile.
+### Interpret the result
 
-The defaults use `start_revision=0`, `prev_kv=true`, and
-`progress_notify=true`. For this current Watch, the first Created header is
-stored separately as the recovery baseline; if no event or progress has been
-delivered before a disconnect, recovery starts from that Created revision.
-For an explicitly configured historical `start_revision=r>0`, Created does
-not advance the historical start: before any delivery, recovery starts again
-at `r`. Once either Watch has delivered an event or progress response, both
-forms recover from the last delivered revision plus one. The benchmark does
-not send an explicit RequestProgress on open and does not enable fragments.
+`run` emits one JSON report with nine top-level fields: `schema_version`,
+`experiment`, `resolved_config`, `plan`, `timing`, `preparation`, `measurement`,
+`drain`, and `accounting`. Configuration/argument errors have no report.
 
-Kubernetes documentation defines the resource relationships, but not
-universal Service, Event, or controller-object ratios. Those values are
-explicit profile inputs. EndpointSlice ideal packing is a deterministic
-pressure model; real controller history can leave additional non-full slices.
+| Exit | Meaning |
+| --- | --- |
+| 0 | Experiment completed; **not** proof of target pressure or complete Watch observation |
+| 1 | Execution/setup/lifecycle failure |
+| 2 | Invalid arguments or configuration |
+| 130 | Interruption |
 
-The benchmark makes no throughput or latency guarantee. A successful run is
-an achieved accounting result for the selected synthetic profile.
+Compare planned, offered, missed-schedule, dropped-full, accepted, completed,
+and canceled work separately. A logical update may cause multiple physical Txn
+attempts; a list can issue multiple Range pages. **Logical update/s is not
+physical Txn/s.** RPC starts and completions are classified by their own event
+phase, so a single phase need not have equal starts and completions. Timeout and
+result-unknown counts are overlapping subsets of failed work, not additive error
+categories. Canceled RPCs do not fabricate completion or latency samples.
 
-## Exact default shape
+Watch observation completeness and per-root coverage are separate from workload
+accounting; reconnecting does not erase an earlier gap. HDR latency metadata,
+overflow, samples, and censored work must be read together. Protobuf payload
+bytes are not wire/TLS/network byte counts. Online Prometheus summaries and
+sampled CPU/RSS are supporting observations, not substitutes for the final
+per-run report. Avoid full request logging at high pressure; scrape roughly once
+per second. Sampled peak RSS is not an exact process maximum.
 
-The built-in `k8s` and `k8s-no-node-lease` profiles share the same application
-objects, Range mix, timing, and Watch roots; only Coordination NodeLease
-traffic differs:
+### Capture repeatable evidence
 
-- 2,000 Nodes and 40,000 total Pod keys;
-- 40,000 Event keys (`basis=pods`, scale `1/1`);
-- Pod update amplification 10: every Pod must be updated successfully exactly
-  10 times;
-- one DaemonSet covering 2,000 eligible Nodes; those Pods are included in the
-  40,000 Pod total;
-- 100 Services with 100 selected backends each;
-- 100 ideal-packed EndpointSlices at 100 endpoints per slice;
-- trace-derived fixed controller-object counts, update amplification, Range
-  mix, and periodic cadence.
-
-## Resource behavior and leases
-
-The JSON `behavior` field has exactly four schedulable values:
-
-| `behavior` | Pressure semantics |
-|---|---|
-| `create_only` | Create the object; no scheduled update quota. |
-| `guaranteed_update` | ModRevision CAS update; the failed Txn branch returns the current KV for the next CAS attempt. |
-| `event` | Create with a native etcd lease from its configured pool; if `update_amplification > 0`, scheduled updates also use native-lease storage CAS (the built-in profiles use 0); there is no Event/controller outer retry loop. |
-| `master_lease` | Internal masterlease create and periodic update traffic using its native lease pool; it is auxiliary traffic, not the application target. |
-
-The former `retry_policy` field and the `conditional_delete` configuration
-value are rejected; there is no compatibility alias. The low-level
-ConditionalDelete Txn builder remains for protocol coverage, but no active
-resource behavior schedules it. Storage CAS retries use the failure-branch KV,
-the same operation deadline, and the existing attempt budget. Node heartbeat
-status and NodeLease retry limits remain explicit profile limits.
-
-Do not conflate these lease paths:
-
-- an API Lease is the `/registry/leases/...` resource and uses ordinary
-  ModRevision CAS with `Put.lease=0`;
-- a Coordination NodeLease is `/registry/leases/kube-node-lease/...`, created
-  and renewed as a Kubernetes object, also without a native etcd lease;
-- an internal masterlease is `/registry/masterleases/...` and is driven by
-  the `master_lease` behavior;
-- Event and masterlease TTLs are native etcd leases, reused or granted by the
-  configured pool. Native TTL expiry is real etcd behavior, not a controller
-  retry simulation.
-
-CAS and mutable-request outcomes remain distinct: `conflict`, `not_found`,
-`timeout`, and `result_unknown` are not interchangeable. A mutable
-`result_unknown` may already have reached etcd and is never blindly replayed.
-
-## Generate a DaemonSet-update pressure profile
+Python 3.10+ standard-library tools capture raw stdout/stderr, commands, binary
+SHA256, environment, backend status/keyspace, metrics, and process observations.
+The backend must already be running. The output directory must not exist.
 
 ```sh
-cargo run --release -p etcd_k8s_bench -- gen_profile \
-  --nodes 10000 \
-  --batch-size 500 \
-  --txn-rps 2000 \
-  --name rolling-update
+python3 etcd_k8s_bench/verify/run_synthetic.py \
+  --binary ./target/release/etcd_k8s_bench \
+  --etcdctl /usr/local/bin/etcdctl \
+  --endpoint http://127.0.0.1:12379 \
+  --config etcd_k8s_bench/verify/synthetic-small.json \
+  --metrics-listen 127.0.0.1:19898 \
+  --output-dir /tmp/synthetic-evidence-new \
+  --timeout-seconds 240
+
+python3 etcd_k8s_bench/verify/check_report.py \
+  --report /tmp/synthetic-evidence-new/run.stdout.json \
+  --exit-code 0 \
+  --plan /tmp/synthetic-evidence-new/plan.stdout.json
 ```
 
-The generated profile uses one Pod per Node, four successful Pod updates per
-key, three Event objects per Node, and two DaemonSet updates per configured
-wave. `--txn-rps` derives the hard update-phase duration from that operation
-budget; the written timeline remains the runtime source of truth. Existing
-files are never overwritten. `gen_profile` rejects `--pods` because this
-shape derives Pod count from Node count.
+Pass the actual child exit code to the checker, not an assumed zero. Optional
+`--keyspace PATH` checks the captured final etcdctl keys-only JSON.
+Checker exit 0 means supplied evidence is consistent, not that the experiment
+succeeded; omitted plan/keyspace checks are reported as unchecked. The runner's
+`--timeout-seconds` is an external watchdog, not measurement duration. Optional
+`--interrupt-after-seconds` is measured from child startup, including preparation.
+Optional `--backend-metrics-url` captures backend metrics. Collection failures and
+forced termination remain distinct from benchmark results.
 
-Watch entries are filtered from the original Watch array rather than
-reconstructed: entries whose existing `ResourceSpec.key_pattern` matches a
-retained resource prefix (with a path-boundary match) are kept, `minions` is
-kept for Node status, and `leases` is additionally kept when NodeLease is
-enabled. All retained fields and duplicate entries remain intact. An
-explicit Watch for a retained `masterleases` resource may survive; the
-generator never adds that root automatically. The default generated profile
-therefore has `pods`, `events`, `daemonsets`, `minions`, and `leases` (five
-roots); with NodeLease disabled and no application `leases` resource, it has
-four. Other resource quantities, TTLs, Range proportions, and periodic
-cadence are unchanged. This is a pressure-shape generator, not a real
-rolling-update state machine.
-
-Run it with:
-
-```sh
-cargo run --release -p etcd_k8s_bench -- run \
-  --config etcd_k8s_bench/workloads/rolling-update.json
-```
-
-## Metrics and result accounting
-
-Prometheus metrics are exposed at `/metrics`. Key layers:
-
-- `etcd_k8s_bench_resource_objects{resource,state="planned|succeeded|deficit"}`;
-- `etcd_k8s_bench_resource_updates{resource,state="target|succeeded|deficit"}`;
-- `etcd_k8s_bench_operations_total`: logical operation outcomes;
-- `etcd_k8s_bench_requests_total`: physical RPC outcomes;
-- `etcd_k8s_bench_txn_total` and `etcd_k8s_bench_cas_retries_total`;
-- `etcd_k8s_bench_range_requests_total{shape,outcome}`;
-- Watch, lease, heartbeat, revision, compactor, inflight, and drop metrics.
-
-Queue waiting and RPC latency are separate measurements:
-`etcd_k8s_bench_queue_wait_seconds{work_class}` measures accepted enqueue to
-worker dequeue, while
-`etcd_k8s_bench_request_duration_seconds{rpc}` measures the physical RPC.
-Accepted work canceled before an execution result is `unfinished`; it is not
-silently counted as success and does not prove that etcd did not commit.
-Keys, IDs, endpoints, and error text are not metric labels.
-
-Once the scheduler has started, it prints exactly one JSON line to stdout.
-The top-level fields are `achieved`, `interrupted`, `schedule_complete`,
-`scope` (the literal `"scheduler"`), `termination_error`, `targets`,
-`work_items`, and `accounting_invariants`. `targets` contains
-`bootstrap`, `application.creates`, `application.updates`, and
-`range_requests`. `work_items` contains the fixed classes `bootstrap`,
-`create`, `update`, `range`, `master_lease`, `heartbeat`, `status`, and
-`compact`; each entry contains `work_class`, nullable `target`, `offered`,
-`accepted`, `completed`, `succeeded`, `failed`, `result_unknown`, `dropped`,
-`dropped_full`, `dropped_closed`, `unfinished`, `unissued`,
-nullable `target_deficit`, and bounded `first_error`. For a finite target,
-`target_deficit` is `target - succeeded`; auxiliary classes without a fixed
-target report `null` for both `target` and `target_deficit`.
-
-The report obeys these accounting equations:
-`offered = accepted + dropped + unissued`;
-`completed = succeeded + failed`;
-`accepted = completed + unfinished`;
-`dropped = dropped_full + dropped_closed`; and
-`result_unknown` is a subset of `failed`. Background work-item failures are
-collected while scheduling continues; they are not silently ignored. `achieved`
-is true only when the schedule is complete, not interrupted, termination has
-no error, all invariants hold, every finite target is met, and no work item is
-failed, dropped, unfinished, or unissued. A scheduler run that does not
-achieve this exits 1. Configuration/connect/Status/preflight failures occur
-before this JSON protocol and also exit 1. Do not use exit 0, a final metrics
-scrape, or successful physical RPCs as a substitute for this logical result.
-
-CAS conflicts, retries, result-unknown outcomes, and queue drops do not
-consume successful update quota.
-
-See [`etcd_k8s_bench/DESIGN_zh.md`](etcd_k8s_bench/DESIGN_zh.md) for the
-detailed design and [README_zh.md](README_zh.md) for Chinese usage.
-
+See [access patterns](etcd_k8s_bench/docs/access-patterns.md) for keys, CAS,
+pagination and Watch semantics, and [design (中文)](etcd_k8s_bench/DESIGN_zh.md)
+for lifecycle and accounting invariants.

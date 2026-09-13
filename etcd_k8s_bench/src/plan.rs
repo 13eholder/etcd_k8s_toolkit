@@ -1705,6 +1705,17 @@ mod tests {
             "\"daemonsets\""
         );
         assert_eq!(plan.resource_counts.total(), 44_410);
+        assert_eq!(
+            plan.resource_counts,
+            SyntheticResourceCounts {
+                pods: 40_000,
+                nodes: 2_000,
+                node_leases: 2_000,
+                deployments: 200,
+                replicasets: 200,
+                daemonsets: 10,
+            }
+        );
         assert_eq!(plan.update_rounding_deficit, 0);
         assert_eq!(plan.read_rounding_deficit, 0);
         assert_eq!(
@@ -1736,6 +1747,73 @@ mod tests {
             (pair[0].at_ns, pair[0].kind, pair[0].node, pair[0].ordinal)
                 <= (pair[1].at_ns, pair[1].kind, pair[1].node, pair[1].ordinal)
         }));
+    }
+
+    #[test]
+    fn test_plan_rejects_zero_nodes() {
+        let mut config = default_config();
+        config.topology.node_count = 0;
+        let error = CompiledPlan::compile(config, 64 * 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("topology.node_count"));
+    }
+
+    #[test]
+    fn test_plan_rejects_zero_pod_value_size() {
+        let mut config = default_config();
+        config.value_size_bytes.pods = 0;
+        let error = CompiledPlan::compile(config, 64 * 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("value_size_bytes.pods"));
+    }
+
+    #[test]
+    fn test_node_lease_jitter_boundaries() {
+        for (jitter, lower, upper) in [
+            (0u8, 10_000_000_000, 10_000_000_000),
+            (99u8, 100_000_000, 19_900_000_000),
+        ] {
+            let mut config = default_config();
+            config.topology.node_count = 1;
+            config.controllers.daemonset_count = 1;
+            config.controllers.pods_per_deployment = 1;
+            config.topology.pod_count = 2;
+            config.topology.namespace_count = 1;
+            config.load.duration_ms = 31_000;
+            config.periodic.node_lease_interval_ms = 10_000;
+            config.periodic.node_lease_jitter_percent = jitter;
+            config.periodic.node_status_interval_ms = 300_000;
+            config.periodic.status_interval_ms = 300_000;
+            config.periodic.compact_interval_ms = 300_000;
+            let plan = CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap();
+            let leases: Vec<_> = plan
+                .periodic_events
+                .iter()
+                .filter(|event| event.kind == PeriodicKind::NodeLease && event.node == Some(0))
+                .collect();
+            assert!(
+                !leases.is_empty(),
+                "jitter {jitter} produced no lease events"
+            );
+            let mut previous = 0;
+            for (ordinal, event) in leases.iter().enumerate() {
+                let interval = event.at_ns - previous;
+                assert!(
+                    (lower..=upper).contains(&interval),
+                    "jitter {jitter} lease {ordinal} interval {interval}ns outside bounds"
+                );
+                previous = event.at_ns;
+            }
+        }
+
+        let mut invalid = default_config();
+        invalid.periodic.node_lease_jitter_percent = 100;
+        let error = CompiledPlan::compile(invalid, 64 * 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("0..99"));
     }
 
     #[test]

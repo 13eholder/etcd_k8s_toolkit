@@ -395,6 +395,75 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_rejects_zero_values() {
+        for (flag, value) in [
+            ("--nodes", "0"),
+            ("--pods", "0"),
+            ("--namespaces", "0"),
+            ("--pod-size", "0B"),
+            ("--update-rps", "0"),
+            ("--duration", "0ms"),
+            ("--workers", "0"),
+            ("--queue-capacity", "0"),
+            ("--max-message-size", "0B"),
+            ("--request-timeout", "0ms"),
+            ("--operation-timeout", "0ms"),
+        ] {
+            let error = Cli::try_parse_from(["bench", "plan", flag, value])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(flag.trim_start_matches("--")),
+                "{flag} zero error omitted field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_nodes_option_only() {
+        let cli = Cli::try_parse_from(["bench", "run", "--nodes", "7"]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.base.nodes, Some(7));
+        assert!(Cli::try_parse_from(["bench", "run", "7"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_rejects_deleted_parameters() {
+        for args in [
+            ["bench", "plan", "--profile", "k8s"],
+            ["bench", "run", "--profile", "k8s"],
+            ["bench", "run", "--rate-scale", "2"],
+            ["bench", "run", "--time-scale", "2"],
+            ["bench", "run", "--max-qps", "100"],
+            ["bench", "run", "--name", "legacy"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "deleted CLI parameter was accepted: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_missing_config_path_error() {
+        let (path, _cleanup) = temporary_config("missing");
+        let path_string = path.to_str().unwrap();
+        let error = plan_config(&["--config", path_string]).unwrap_err();
+        match error {
+            ConfigError::Io {
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(error_path, path_string);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected ConfigError::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_run_and_plan_share_resolved_config() {
         let args = [
             "--nodes",

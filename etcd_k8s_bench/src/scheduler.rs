@@ -1758,6 +1758,21 @@ fn dispatch_application_item(
         OfferedMeasurement::MissedSchedule => return Ok(DispatchOutcome::MissedToken),
         OfferedMeasurement::NotOfferedAfterStop => return Ok(DispatchOutcome::Stopped),
     };
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(())) => {
+            token
+                .drop_for(DropReason::Backpressure)
+                .map_err(|error| error.to_string())?;
+            return Ok(DispatchOutcome::Dropped);
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            token
+                .drop_for(DropReason::QueueClosed)
+                .map_err(|error| error.to_string())?;
+            return Err("measurement worker queue closed".into());
+        }
+    };
     let item = match stream.work_class {
         LogicalWorkClass::Update => {
             let key = plan.resource_key(stream.resource, ordinal, plan.config.seed);
@@ -1784,17 +1799,6 @@ fn dispatch_application_item(
             },
             token,
         },
-    };
-    let permit = match sender.try_reserve() {
-        Ok(permit) => permit,
-        Err(mpsc::error::TrySendError::Full(())) => {
-            item.drop_for(DropReason::Backpressure)?;
-            return Ok(DispatchOutcome::Dropped);
-        }
-        Err(mpsc::error::TrySendError::Closed(())) => {
-            item.drop_for(DropReason::QueueClosed)?;
-            return Err("measurement worker queue closed".into());
-        }
     };
     match item.accept_for_tick(tick_end_ns)? {
         TokenAction::Applied => {
@@ -3046,6 +3050,33 @@ mod tests {
         let recorder = MeasurementRecorder::new(&plan).unwrap();
         recorder.start_measurement().unwrap();
         recorder
+    }
+
+    fn record_test_preparation(recorder: &MeasurementRecorder, plan: &CompiledPlan) {
+        for kind in ResourceKind::ALL {
+            let stream = PreparationStream::Create(kind);
+            for _ in 0..resource_count(plan, kind) {
+                let token = match recorder.offer_preparation(stream).unwrap() {
+                    OfferResult::Token(token) => token,
+                    other => panic!("unexpected preparation offer result: {other:?}"),
+                };
+                token.accept().unwrap();
+                token.started().unwrap();
+                token.terminal(Outcome::Success).unwrap();
+            }
+        }
+        for _ in 0..plan.resource_counts.nodes {
+            let token = match recorder
+                .offer_preparation(PreparationStream::NodeReady)
+                .unwrap()
+            {
+                OfferResult::Token(token) => token,
+                other => panic!("unexpected NodeReady offer result: {other:?}"),
+            };
+            token.accept().unwrap();
+            token.started().unwrap();
+            token.terminal(Outcome::Success).unwrap();
+        }
     }
 
     fn finish_executor_recorder(recorder: &MeasurementRecorder) {
@@ -4692,6 +4723,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_compact_missing_failure_key_recovers_next_tick() {
+        let missing = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 10,
+                ..Default::default()
+            }),
+            succeeded: false,
+            ..Default::default()
+        };
+        let recovered = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 11,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let active = TxnResponse {
+            header: Some(ResponseHeader {
+                revision: 12,
+                ..Default::default()
+            }),
+            succeeded: true,
+            ..Default::default()
+        };
+        let (client, txn_requests, compact_requests, shutdown, server) = serve_compact_fixture(
+            vec![Ok(missing), Ok(recovered), Ok(active)],
+            vec![Ok(CompactionResponse::default())],
+        )
+        .await;
+        let recorder = executor_recorder();
+        let mut compactor = CompactorState::default();
+        let latest_revision = Arc::new(AtomicI64::new(0));
+
+        let first = execute_compact_tick(
+            &client,
+            &mut compactor,
+            Duration::from_secs(1),
+            latest_revision.clone(),
+            &recorder,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.outcome, Outcome::GrpcError);
+        assert!(compact_requests.lock().unwrap().is_empty());
+
+        let second = execute_compact_tick(
+            &client,
+            &mut compactor,
+            Duration::from_secs(1),
+            latest_revision.clone(),
+            &recorder,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.outcome, Outcome::Success);
+        assert!(compact_requests.lock().unwrap().is_empty());
+
+        let third = execute_compact_tick(
+            &client,
+            &mut compactor,
+            Duration::from_secs(1),
+            latest_revision,
+            &recorder,
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.outcome, Outcome::Success);
+
+        finish_executor_recorder(&recorder);
+        let requests = txn_requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let expected_versions = [0, 0, 1];
+        let expected_values: [&[u8]; 3] = [b"0", b"10", b"11"];
+        for index in 0..3 {
+            assert_eq!(
+                requests[index].compare[0].target_union,
+                Some(crate::pb::etcdserverpb::compare::TargetUnion::Version(
+                    expected_versions[index],
+                ))
+            );
+            let Some(crate::pb::etcdserverpb::request_op::Request::RequestPut(put)) =
+                requests[index].success[0].request.as_ref()
+            else {
+                panic!("compact coordination request {index} did not contain a Put");
+            };
+            assert_eq!(put.value, expected_values[index]);
+        }
+        drop(requests);
+        let compact_requests = compact_requests.lock().unwrap();
+        assert_eq!(compact_requests.len(), 1);
+        assert_eq!(compact_requests[0].revision, 11);
+        drop(compact_requests);
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_worker_loop_executes_real_txn_and_finishes_token() {
         let (client, _requests, shutdown, server) = serve_txn_fixture(Vec::new()).await;
         let plan = Arc::new(small_plan());
@@ -5203,6 +5333,136 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "preparation deadline exceeded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prepare_pending_reserve_deadline_and_cancel() {
+        for cancel_case in [false, true] {
+            let plan = Arc::new(small_plan());
+            let recorder = MeasurementRecorder::new(&plan).unwrap();
+            let (sender, _receiver) = mpsc::channel::<WorkItem>(1);
+            let held_permit = sender.reserve().await.unwrap();
+            let make_item = || {
+                let token = match recorder
+                    .offer_preparation(PreparationStream::Create(ResourceKind::Pods))
+                    .unwrap()
+                {
+                    OfferResult::Token(token) => token,
+                    other => panic!("unexpected preparation offer result: {other:?}"),
+                };
+                WorkItem::Txn {
+                    key: plan.resource(ResourceKind::Pods).key(0),
+                    operation: ResourceOperation::Create,
+                    value: plan.resource(ResourceKind::Pods).value(0, 0),
+                    token,
+                    preparation: None,
+                }
+            };
+            let item = make_item();
+            let deadline = TokioInstant::now() + Duration::from_millis(1);
+            let error = if cancel_case {
+                let (cancel, receiver) = oneshot::channel();
+                let mut ctrl_c: CtrlCFuture = Box::pin(async move {
+                    receiver
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
+                        })
+                        .map(|_| ())
+                });
+                let mut enqueue = Box::pin(enqueue_preparation_item(
+                    &sender,
+                    item,
+                    deadline,
+                    &mut ctrl_c,
+                ));
+                assert_pending(enqueue.as_mut()).await;
+                cancel.send(()).unwrap();
+                enqueue.await.unwrap_err()
+            } else {
+                let mut ctrl_c = pending_ctrl_c();
+                let mut enqueue = Box::pin(enqueue_preparation_item(
+                    &sender,
+                    item,
+                    deadline,
+                    &mut ctrl_c,
+                ));
+                assert_pending(enqueue.as_mut()).await;
+                time::advance(Duration::from_millis(1)).await;
+                enqueue.await.unwrap_err()
+            };
+            assert!(if cancel_case {
+                matches!(error, ControlFailure::Interrupted(_))
+            } else {
+                matches!(error, ControlFailure::ExecutionFailure(_))
+            });
+            drop(held_permit);
+            drop(sender);
+            let report = recorder.finish_without_measurement().unwrap();
+            let row =
+                &report.preparation.logical[PreparationStream::Create(ResourceKind::Pods).index()];
+            assert_eq!(row.offered, 0);
+            assert_eq!(row.accepted, 0);
+            assert_eq!(row.not_offered_after_stop, plan.resource_counts.pods);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prepare_success_deficit_blocks_run() {
+        let plan = Arc::new(small_plan());
+        let recorder = MeasurementRecorder::new(&plan).unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(128);
+        let senders = vec![sender.clone()];
+        let first_success = Arc::new(Notify::new());
+        let worker_success = first_success.clone();
+        let worker = tokio::spawn(async move {
+            let mut skipped_completion = false;
+            while let Some(item) = receiver.recv().await {
+                let preparation = item
+                    .preparation()
+                    .cloned()
+                    .expect("preparation item tracker");
+                item.started().unwrap();
+                item.terminal(Outcome::Success).unwrap();
+                if skipped_completion {
+                    preparation.complete(Outcome::Success);
+                } else {
+                    skipped_completion = true;
+                    worker_success.notify_one();
+                }
+            }
+        });
+        let deadline = TokioInstant::now() + Duration::from_millis(1);
+        let mut ctrl_c = pending_ctrl_c();
+        let mut preparation = Box::pin(run_preparation(
+            plan.clone(),
+            &recorder,
+            &senders,
+            deadline,
+            &mut ctrl_c,
+        ));
+        tokio::select! {
+            result = &mut preparation => {
+                panic!("preparation completed before success deficit was observed: {result:?}");
+            }
+            _ = first_success.notified() => {}
+        }
+        let error = preparation.await.unwrap_err();
+        assert!(matches!(error, ControlFailure::ExecutionFailure(_)));
+        assert!(TokioInstant::now() >= deadline);
+        drop(senders);
+        drop(sender);
+        worker.await.unwrap();
+        let report = recorder.finish_without_measurement().unwrap();
+        assert!(report.timing.preparation_ns.is_none());
+        assert!(!report.accounting.measurement_complete);
+        assert!(
+            report
+                .preparation
+                .logical
+                .iter()
+                .any(|row| row.succeeded_before_cutoff > 0)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6194,7 +6454,7 @@ mod tests {
         let identity = stream_identity(stream);
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
-        let error = dispatch_application_item(
+        let result = dispatch_application_item(
             &plan,
             &recorder,
             stream,
@@ -6203,9 +6463,8 @@ mod tests {
             TokioInstant::now() + Duration::from_secs(1),
             TokioInstant::now() + Duration::from_secs(1),
             1_000_000,
-        )
-        .unwrap_err();
-        assert_eq!(error, "measurement worker queue closed");
+        );
+        assert!(result.is_err());
         drop(sender);
         recorder.stop_measurement().unwrap();
         let report = recorder.finish().unwrap();
@@ -6495,5 +6754,171 @@ mod tests {
                 .await;
         assert!(!interrupted);
         assert!(result.unwrap_err().contains("worker failed"));
+    }
+    #[tokio::test]
+    async fn test_worker_late_dequeue_runs_once_in_drain() {
+        let (client, requests, _range_requests, gate, _created, _load_observed, shutdown, server) =
+            serve_controlled_run_fixture(0).await;
+        let plan = Arc::new(small_plan());
+        let clock = ExecutorPhaseClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        recorder.start_measurement().unwrap();
+        let stream = plan
+            .logical_streams
+            .iter()
+            .find(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let identity = stream_identity(stream);
+        let make_item = |ordinal| WorkItem::Txn {
+            key: plan.resource_key(stream.resource, ordinal, plan.config.seed),
+            operation: ResourceOperation::GuaranteedUpdate,
+            value: plan.resource_value(stream.resource, ordinal, plan.config.seed, ordinal),
+            token: accepted_worker_token(&recorder, identity),
+            preparation: None,
+        };
+        let first = make_item(0);
+        let second = make_item(1);
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(first).await.unwrap();
+        let worker = tokio::spawn(worker_loop(
+            receiver,
+            client.clone(),
+            plan.clone(),
+            Duration::from_secs(1),
+            Arc::new(AtomicI64::new(0)),
+        ));
+        sender.send(second).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gate.observed.notified())
+            .await
+            .expect("first RPC was not observed");
+        drop(sender);
+
+        clock.set_millis(20);
+        recorder.stop_measurement().unwrap();
+        clock.set_millis(25);
+        gate.release.notify_one();
+        worker.await.unwrap().unwrap();
+        join_remote_tasks(&gate).await;
+        assert_eq!(gate.inflight.load(AtomicOrdering::Acquire), 0);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let keys = requests.iter().filter_map(txn_put_key).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                plan.resource_key(stream.resource, 0, plan.config.seed),
+                plan.resource_key(stream.resource, 1, plan.config.seed),
+            ]
+        );
+        drop(requests);
+
+        let report = recorder.finish().unwrap();
+        let measurement = &report.measurement.logical[identity.measurement_index().unwrap()];
+        let drain = &report.drain.logical[identity.measurement_index().unwrap()];
+        assert_eq!(measurement.accepted, 2);
+        assert_eq!(measurement.started_before_cutoff, 1);
+        assert_eq!(measurement.started_after_cutoff, 1);
+        assert_eq!(measurement.terminal_after_cutoff, 2);
+        assert_eq!(measurement.cutoff_queued, 1);
+        assert_eq!(measurement.cutoff_running, 1);
+        assert_eq!(drain.started_after_cutoff, 1);
+        assert_eq!(drain.terminal_after_cutoff, 2);
+        let measurement_rpc = &report.measurement.rpc[crate::measurement::RpcMethod::Txn.index()];
+        let drain_rpc = &report.drain.rpc[crate::measurement::RpcMethod::Txn.index()];
+        assert_eq!(measurement_rpc.started, 1);
+        assert_eq!(measurement_rpc.completed, 0);
+        assert_eq!(drain_rpc.started, 1);
+        assert_eq!(drain_rpc.completed, 2);
+        assert!(report.accounting.accepted_cohort_conserved);
+
+        drop(client);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dispatch_resume_skips_old_ticks() {
+        let mut config = small_plan().config;
+        config.load.duration_ms = 20;
+        config.load.update_rps = 1_000;
+        config.load.read_ratio.numerator = 0;
+        let plan = Arc::new(CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap());
+        let clock = ExecutorPhaseClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        record_test_preparation(&recorder, &plan);
+        recorder.start_measurement().unwrap();
+        let stream_index = plan
+            .logical_streams
+            .iter()
+            .position(|stream| stream.work_class == LogicalWorkClass::Update)
+            .unwrap();
+        let stream = &plan.logical_streams[stream_index];
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(64);
+        let senders = vec![sender.clone()];
+        let mut worker_tasks = JoinSet::new();
+        let mut watch_tasks = JoinSet::new();
+        let mut ctrl_c = pending_ctrl_c();
+        let started = TokioInstant::now();
+        let cutoff = started + run_duration(&plan);
+        let mut dispatch = Box::pin(dispatch_until(
+            &plan,
+            &recorder,
+            &senders,
+            &mut worker_tasks,
+            &mut watch_tasks,
+            started,
+            cutoff,
+            &mut ctrl_c,
+        ));
+        assert_pending(dispatch.as_mut()).await;
+        let collect_keys = |receiver: &mut mpsc::Receiver<WorkItem>| {
+            let mut keys = Vec::new();
+            while let Ok(item) = receiver.try_recv() {
+                match &item {
+                    WorkItem::Txn { key, .. } => keys.push(key.clone()),
+                    other => panic!("paused dispatcher emitted unexpected item: {other:?}"),
+                }
+                drop(item);
+            }
+            keys
+        };
+        assert_eq!(
+            collect_keys(&mut receiver),
+            vec![plan.resource_key(stream.resource, 0, plan.config.seed)]
+        );
+
+        time::advance(Duration::from_millis(5)).await;
+        assert_pending(dispatch.as_mut()).await;
+        assert_eq!(
+            collect_keys(&mut receiver),
+            vec![plan.resource_key(stream.resource, 5, plan.config.seed)]
+        );
+
+        time::advance(Duration::from_millis(20)).await;
+        let state = match dispatch.await {
+            DispatchExit::Completed(state) => state,
+            DispatchExit::Interrupted(_) => panic!("dispatcher was interrupted"),
+            DispatchExit::Failed(error, _) => panic!("dispatcher failed: {error}"),
+        };
+        assert!(collect_keys(&mut receiver).is_empty());
+        assert_eq!(state.next_ordinals[stream_index], stream.planned);
+        drop(senders);
+        drop(sender);
+        drop(receiver);
+
+        clock.set_millis(20);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let row = &report.measurement.logical[stream_identity(stream).measurement_index().unwrap()];
+        assert_eq!(row.offered, 2);
+        assert_eq!(row.accepted, 2);
+        assert_eq!(row.missed_schedule, stream.planned - 2);
+        assert_eq!(row.canceled_queued, 2);
+        assert!(report.accounting.planned_conserved);
     }
 }

@@ -504,10 +504,11 @@ fn record_reconnect(state: &mut WatchState) {
 }
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
 
-    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
     use super::*;
     use crate::measurement::MeasurementRecorder;
@@ -650,6 +651,7 @@ mod tests {
     struct DelayedCreatedClient {
         responses: Arc<Mutex<Option<mpsc::Receiver<Result<WatchResponse, Status>>>>>,
         opened: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        processed: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     }
 
     #[tonic::async_trait]
@@ -669,7 +671,44 @@ mod tests {
                 .await
                 .take()
                 .expect("response stream requested once");
-            Ok(Box::pin(ReceiverStream::new(response_rx)))
+            Ok(Box::pin(AcknowledgeFirstResponseStream {
+                inner: ReceiverStream::new(response_rx),
+                first_delivered: false,
+                processed: self.processed.lock().await.take(),
+            }))
+        }
+    }
+
+    struct AcknowledgeFirstResponseStream {
+        inner: ReceiverStream<Result<WatchResponse, Status>>,
+        first_delivered: bool,
+        processed: Option<oneshot::Sender<()>>,
+    }
+
+    impl Stream for AcknowledgeFirstResponseStream {
+        type Item = Result<WatchResponse, Status>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    this.first_delivered = true;
+                    Poll::Ready(Some(item))
+                }
+                Poll::Pending if this.first_delivered => {
+                    if let Some(processed) = this.processed.take() {
+                        let _ = processed.send(());
+                    }
+                    Poll::Pending
+                }
+                Poll::Ready(None) if this.first_delivered => {
+                    if let Some(processed) = this.processed.take() {
+                        let _ = processed.send(());
+                    }
+                    Poll::Ready(None)
+                }
+                other => other,
+            }
         }
     }
 
@@ -824,6 +863,102 @@ mod tests {
                 Code::Unavailable,
                 ETCD_NO_LEADER_MESSAGE,
             )))))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StatusPath {
+        Open,
+        Stream,
+    }
+
+    #[derive(Clone)]
+    struct StatusClient {
+        path: StatusPath,
+        code: Code,
+        observed: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl WatchConnector for StatusClient {
+        async fn open_watch<S>(&self, requests: S) -> Result<WatchResponseStream, Status>
+        where
+            S: Stream<Item = WatchRequest> + Send + 'static,
+        {
+            tokio::pin!(requests);
+            let _ = requests.next().await.expect("create request");
+            self.observed.notify_one();
+            let status = Status::new(self.code, "watch status");
+            match self.path {
+                StatusPath::Open => Err(status),
+                StatusPath::Stream => Ok(Box::pin(tokio_stream::once(Err(status)))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watch_status_entrypoints() {
+        let statuses = [
+            (Code::Unavailable, true),
+            (Code::Unknown, true),
+            (Code::DeadlineExceeded, true),
+            (Code::Cancelled, false),
+            (Code::InvalidArgument, false),
+            (Code::NotFound, false),
+            (Code::AlreadyExists, false),
+            (Code::PermissionDenied, false),
+            (Code::ResourceExhausted, false),
+            (Code::FailedPrecondition, false),
+            (Code::Aborted, false),
+            (Code::OutOfRange, false),
+            (Code::Unimplemented, false),
+            (Code::Internal, false),
+            (Code::DataLoss, false),
+            (Code::Unauthenticated, false),
+        ];
+
+        for path in [StatusPath::Open, StatusPath::Stream] {
+            for (code, recoverable) in statuses {
+                let observed = Arc::new(Notify::new());
+                let client = StatusClient {
+                    path,
+                    code,
+                    observed: Arc::clone(&observed),
+                };
+                let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+                let (ready_tx, ready_rx) = oneshot::channel();
+                let recorder = test_recorder();
+                let task = tokio::spawn(run_with_recorder(
+                    client,
+                    spec(),
+                    shutdown_rx,
+                    ready_tx,
+                    recorder.clone(),
+                    0,
+                    WatchDeadline::new(),
+                ));
+
+                observed.notified().await;
+                if recoverable {
+                    shutdown
+                        .send(true)
+                        .expect("recoverable watch shutdown receiver exists");
+                }
+                let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .expect("watch status classification completes")
+                    .expect("watch status task joins")
+                    .expect("watch status outcome");
+                if recoverable {
+                    assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
+                    assert_eq!(outcome.state.reconnects, 1);
+                } else {
+                    assert_eq!(outcome.terminal, WatchTerminal::Semantic);
+                    assert_eq!(outcome.state.reconnects, 0);
+                }
+                assert!(ready_rx.await.is_err());
+                finish_test_recorder(&recorder);
+            }
         }
     }
 
@@ -1147,6 +1282,7 @@ mod tests {
         let client = DelayedCreatedClient {
             responses: Arc::new(Mutex::new(Some(response_rx))),
             opened: Arc::new(Mutex::new(Some(opened_tx))),
+            processed: Arc::new(Mutex::new(None)),
         };
         let recorder = test_recorder();
         let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
@@ -1181,6 +1317,100 @@ mod tests {
         let outcome = task.await.expect("watch task join").expect("watch outcome");
         assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
         finish_test_recorder(&recorder);
+    }
+
+    #[tokio::test]
+    async fn test_watch_created_ordering() {
+        for (label, first, expected_events) in [
+            (
+                "progress",
+                WatchResponse {
+                    header: Some(ResponseHeader {
+                        revision: 9,
+                        ..Default::default()
+                    }),
+                    watch_id: 1,
+                    ..Default::default()
+                },
+                0,
+            ),
+            (
+                "event",
+                WatchResponse {
+                    header: Some(ResponseHeader {
+                        revision: 9,
+                        ..Default::default()
+                    }),
+                    watch_id: 1,
+                    events: vec![mvccpb::Event {
+                        kv: Some(mvccpb::KeyValue {
+                            mod_revision: 8,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                1,
+            ),
+        ] {
+            let (response_tx, response_rx) = mpsc::channel(2);
+            let (opened_tx, opened_rx) = oneshot::channel();
+            let (processed_tx, processed_rx) = oneshot::channel();
+            let client = DelayedCreatedClient {
+                responses: Arc::new(Mutex::new(Some(response_rx))),
+                opened: Arc::new(Mutex::new(Some(opened_tx))),
+                processed: Arc::new(Mutex::new(Some(processed_tx))),
+            };
+            let recorder = test_recorder();
+            let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+            let (ready_tx, mut ready_rx) = oneshot::channel();
+            let task = tokio::spawn(run_with_recorder(
+                client,
+                spec(),
+                shutdown_rx,
+                ready_tx,
+                recorder.clone(),
+                0,
+                WatchDeadline::new(),
+            ));
+
+            opened_rx.await.expect("watch RPC established");
+            assert!(
+                ready_rx.try_recv().is_err(),
+                "{label} opened watch became ready"
+            );
+            response_tx
+                .send(Ok(first))
+                .await
+                .expect("first response receiver exists");
+            processed_rx
+                .await
+                .expect("consumer processed first response");
+            assert!(
+                ready_rx.try_recv().is_err(),
+                "{label} became ready before Created response"
+            );
+            response_tx
+                .send(Ok(WatchResponse {
+                    header: Some(ResponseHeader {
+                        revision: 10,
+                        ..Default::default()
+                    }),
+                    watch_id: 1,
+                    created: true,
+                    ..Default::default()
+                }))
+                .await
+                .expect("created response receiver exists");
+            ready_rx.await.expect("created response releases readiness");
+
+            shutdown.send(true).expect("watch shutdown receiver exists");
+            let outcome = task.await.expect("watch task join").expect("watch outcome");
+            assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
+            assert_eq!(outcome.state.event_count, expected_events);
+            finish_test_recorder(&recorder);
+        }
     }
 
     #[tokio::test]

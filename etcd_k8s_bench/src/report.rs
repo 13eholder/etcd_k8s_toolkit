@@ -342,6 +342,7 @@ impl RunReport {
             empty_measurement(&config.plan, Some(setup_ns)),
         )
     }
+
     pub fn record_exporter_failure(&mut self, error: impl Into<String>) {
         let error = bound_error(format!("metrics exporter: {}", error.into()));
         if self.experiment.first_error.is_none() {

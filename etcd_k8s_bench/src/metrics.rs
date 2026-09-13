@@ -835,9 +835,8 @@ async fn metrics_response(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use tokio::sync::oneshot;
-
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
 
     use super::*;
 

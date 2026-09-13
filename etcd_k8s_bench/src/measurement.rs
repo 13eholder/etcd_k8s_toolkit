@@ -3754,4 +3754,543 @@ mod tests {
         assert!(report.accounting.planned_conserved);
         assert!(report.accounting.accepted_cohort_conserved);
     }
+    #[test]
+    fn test_cutoff_boundaries() {
+        let cutoff_ns = 100_000_000;
+        let stream = LogicalStreamIdentity::Application {
+            work_class: LogicalWorkClass::Update,
+            resource: ResourceKind::Pods,
+        };
+
+        for (label, at_ns, admitted) in [
+            ("before", cutoff_ns - 1, true),
+            ("exact", cutoff_ns, false),
+            ("after", cutoff_ns + 1, false),
+        ] {
+            let clock = TestClock::new();
+            let plan = small_plan_with(10, 100, 10);
+            let recorder = MeasurementRecorder::with_clock(
+                &plan,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            )
+            .unwrap();
+            recorder.start_measurement().unwrap();
+
+            clock.set(at_ns);
+            let offered = recorder.offer(stream).unwrap();
+            if admitted {
+                let token = match offered {
+                    OfferResult::Token(token) => token,
+                    other => panic!("{label} offer was not admitted: {other:?}"),
+                };
+                token.accept().unwrap();
+                token.started().unwrap();
+                token.terminal(Outcome::Success).unwrap();
+            } else {
+                assert!(matches!(offered, OfferResult::MissedSchedule));
+            }
+
+            if at_ns < cutoff_ns {
+                clock.set(cutoff_ns);
+            }
+            recorder.stop_measurement().unwrap();
+            let report = recorder.finish().unwrap();
+            let row = &report.measurement.logical[stream.measurement_index().unwrap()];
+            assert_eq!(report.cutoff.effective_ns, Some(cutoff_ns), "{label}");
+            if admitted {
+                assert_eq!(row.offered, 1, "{label}");
+                assert_eq!(row.accepted, 1, "{label}");
+                assert_eq!(row.started_before_cutoff, 1, "{label}");
+                assert_eq!(row.succeeded_before_cutoff, 1, "{label}");
+                assert_eq!(row.missed_schedule, 0, "{label}");
+            } else {
+                assert_eq!(row.offered, 0, "{label}");
+                assert_eq!(row.accepted, 0, "{label}");
+                assert_eq!(row.started_before_cutoff, 0, "{label}");
+                assert_eq!(row.missed_schedule, 1, "{label}");
+            }
+        }
+
+        for (label, at_ns, before_cutoff) in [
+            ("before", cutoff_ns - 1, true),
+            ("exact", cutoff_ns, false),
+            ("after", cutoff_ns + 1, false),
+        ] {
+            let clock = TestClock::new();
+            let plan = small_plan_with(10, 100, 10);
+            let recorder = MeasurementRecorder::with_clock(
+                &plan,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            )
+            .unwrap();
+            recorder.start_measurement().unwrap();
+            let token = match recorder.offer(stream).unwrap() {
+                OfferResult::Token(token) => token,
+                other => panic!("{label} lifecycle offer failed: {other:?}"),
+            };
+            token.accept().unwrap();
+            clock.set(at_ns);
+            token.started().unwrap();
+            token.terminal(Outcome::Success).unwrap();
+            if at_ns < cutoff_ns {
+                clock.set(cutoff_ns);
+            }
+            recorder.stop_measurement().unwrap();
+            let report = recorder.finish().unwrap();
+            let measurement = &report.measurement.logical[stream.measurement_index().unwrap()];
+            let drain = &report.drain.logical[stream.measurement_index().unwrap()];
+            if before_cutoff {
+                assert_eq!(measurement.started_before_cutoff, 1, "{label}");
+                assert_eq!(measurement.succeeded_before_cutoff, 1, "{label}");
+                assert_eq!(measurement.terminal_after_cutoff, 0, "{label}");
+                assert_eq!(drain.started_after_cutoff, 0, "{label}");
+                assert_eq!(drain.terminal_after_cutoff, 0, "{label}");
+            } else {
+                assert_eq!(measurement.started_before_cutoff, 0, "{label}");
+                assert_eq!(measurement.succeeded_before_cutoff, 0, "{label}");
+                assert_eq!(measurement.terminal_after_cutoff, 1, "{label}");
+                assert_eq!(drain.started_after_cutoff, 1, "{label}");
+                assert_eq!(drain.terminal_after_cutoff, 1, "{label}");
+            }
+        }
+
+        for (label, at_ns, completed_before_cutoff) in [
+            ("before", cutoff_ns - 1, true),
+            ("exact", cutoff_ns, false),
+            ("after", cutoff_ns + 1, false),
+        ] {
+            let clock = TestClock::new();
+            let plan = small_plan_with(10, 100, 10);
+            let recorder = MeasurementRecorder::with_clock(
+                &plan,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            )
+            .unwrap();
+            recorder.start_measurement().unwrap();
+            let attempt = recorder.start_rpc_with_payload(RpcMethod::Txn, 7).unwrap();
+            clock.set(at_ns);
+            attempt.finish(Outcome::Success, 9).unwrap();
+            if at_ns < cutoff_ns {
+                clock.set(cutoff_ns);
+            }
+            recorder.stop_measurement().unwrap();
+            let report = recorder.finish().unwrap();
+            let measurement = &report.measurement.rpc[RpcMethod::Txn.index()];
+            let drain = &report.drain.rpc[RpcMethod::Txn.index()];
+            assert_eq!(measurement.started, 1, "{label}");
+            if completed_before_cutoff {
+                assert_eq!(measurement.completed, 1, "{label}");
+                assert_eq!(drain.completed, 0, "{label}");
+            } else {
+                assert_eq!(measurement.completed, 0, "{label}");
+                assert_eq!(drain.started, 0, "{label}");
+                assert_eq!(drain.completed, 1, "{label}");
+                assert_eq!(drain.response_payload_bytes, 9, "{label}");
+            }
+        }
+        for (label, at_ns, admitted) in [
+            ("before", cutoff_ns - 1, true),
+            ("exact", cutoff_ns, false),
+            ("after", cutoff_ns + 1, false),
+        ] {
+            let clock = TestClock::new();
+            let plan = small_plan_with(10, 100, 10);
+            let recorder = MeasurementRecorder::with_clock(
+                &plan,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            )
+            .unwrap();
+            recorder.start_measurement().unwrap();
+            let token = match recorder.offer(stream).unwrap() {
+                OfferResult::Token(token) => token,
+                other => panic!("{label} final-admission offer failed: {other:?}"),
+            };
+            clock.set(at_ns);
+            let action = token.accept_for_tick(cutoff_ns).unwrap();
+            if admitted {
+                assert_eq!(action, TokenAction::Applied, "{label}");
+                token.started().unwrap();
+                token.terminal(Outcome::Success).unwrap();
+            } else {
+                assert_eq!(action, TokenAction::RejectedAfterCutoff, "{label}");
+            }
+
+            if at_ns < cutoff_ns {
+                clock.set(cutoff_ns);
+            }
+            recorder.stop_measurement().unwrap();
+            let report = recorder.finish().unwrap();
+            let row = &report.measurement.logical[stream.measurement_index().unwrap()];
+            assert_eq!(report.cutoff.effective_ns, Some(cutoff_ns), "{label}");
+            if admitted {
+                assert_eq!(row.offered, 1, "{label}");
+                assert_eq!(row.accepted, 1, "{label}");
+                assert_eq!(row.succeeded_before_cutoff, 1, "{label}");
+                assert_eq!(row.missed_schedule, 0, "{label}");
+            } else {
+                assert_eq!(row.offered, 0, "{label}");
+                assert_eq!(row.accepted, 0, "{label}");
+                assert_eq!(row.missed_schedule, 1, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cutoff_queued_running() {
+        let stream = LogicalStreamIdentity::Application {
+            work_class: LogicalWorkClass::Update,
+            resource: ResourceKind::Pods,
+        };
+        for running in [false, true] {
+            let clock = TestClock::new();
+            let plan = small_plan_with(10, 100, 10);
+            let recorder = MeasurementRecorder::with_clock(
+                &plan,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+            )
+            .unwrap();
+            recorder.start_measurement().unwrap();
+            let token = match recorder.offer(stream).unwrap() {
+                OfferResult::Token(token) => token,
+                other => panic!("cutoff token was not offered: {other:?}"),
+            };
+            token.accept().unwrap();
+            if running {
+                token.started().unwrap();
+            }
+            clock.set(100_000_000);
+            recorder.stop_measurement().unwrap();
+            drop(token);
+
+            let report = recorder.finish().unwrap();
+            let row = &report.measurement.logical[stream.measurement_index().unwrap()];
+            assert_eq!(row.accepted, 1);
+            assert_eq!(row.canceled_queued, u64::from(!running));
+            assert_eq!(row.canceled_running, u64::from(running));
+            assert_eq!(row.cutoff_queued, u64::from(!running));
+            assert_eq!(row.cutoff_running, u64::from(running));
+            assert!(report.accounting.accepted_cohort_conserved);
+        }
+    }
+
+    #[test]
+    fn test_bucket_boundaries_partial() {
+        let clock = TestClock::new();
+        let plan = small_plan_with(120, 25, 10);
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        record_preparation(&recorder, &plan);
+        recorder.start_measurement().unwrap();
+        let stream = LogicalStreamIdentity::Application {
+            work_class: LogicalWorkClass::Update,
+            resource: ResourceKind::Pods,
+        };
+        for at_ns in [9_999_999, 10_000_000, 24_999_999] {
+            clock.set(at_ns);
+            let token = match recorder.offer(stream).unwrap() {
+                OfferResult::Token(token) => token,
+                other => panic!("bucket offer failed at {at_ns}: {other:?}"),
+            };
+            token.accept().unwrap();
+            token.started().unwrap();
+            token.terminal(Outcome::Success).unwrap();
+        }
+        clock.set(25_000_000);
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+
+        assert_eq!(report.buckets.len(), 3);
+        assert_eq!(
+            report
+                .buckets
+                .iter()
+                .map(|bucket| (bucket.start_ns, bucket.end_ns))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 10_000_000),
+                (10_000_000, 20_000_000),
+                (20_000_000, 25_000_000),
+            ]
+        );
+        for bucket in &report.buckets {
+            assert_eq!(bucket.logical_offered, 1);
+            assert_eq!(bucket.logical_started, 1);
+            assert_eq!(bucket.logical_completed, 1);
+            assert_eq!(bucket.logical_errors, 0);
+        }
+        assert!(report.accounting.measurement_complete);
+    }
+
+    #[test]
+    fn test_run_isolation_keeps_observations() {
+        let mut config = small_plan_with(100, 10, 10).config;
+        config.execution.drain_timeout_ms = 1;
+        let plan = Arc::new(CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap());
+        let stream = LogicalStreamIdentity::Application {
+            work_class: LogicalWorkClass::Update,
+            resource: ResourceKind::Pods,
+        };
+
+        let clock_a = TestClock::new();
+        let recorder_a =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock_a) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        recorder_a.start_measurement().unwrap();
+        recorder_a.watch_created(0).unwrap();
+        let token_a = match recorder_a.offer(stream).unwrap() {
+            OfferResult::Token(token) => token,
+            other => panic!("run A offer failed: {other:?}"),
+        };
+        token_a.accept().unwrap();
+        let rpc_a = recorder_a
+            .start_rpc_with_payload(RpcMethod::Txn, 11)
+            .unwrap();
+        clock_a.set(1_000_000);
+        recorder_a
+            .watch_response(
+                0,
+                &crate::pb::etcdserverpb::WatchResponse {
+                    events: vec![crate::pb::mvccpb::Event {
+                        kv: Some(crate::pb::mvccpb::KeyValue {
+                            key: b"run-a".to_vec(),
+                            value: b"value".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        clock_a.set(10_000_000);
+        recorder_a.stop_measurement().unwrap();
+        clock_a.set(1_000_000_000);
+        token_a.started().unwrap();
+        token_a
+            .terminal_with_error(Outcome::GrpcError, 41, "run-a failure")
+            .unwrap();
+        rpc_a.finish(Outcome::ResultUnknown, 13).unwrap();
+        let report_a = recorder_a.finish().unwrap();
+
+        let clock_b = TestClock::new();
+        let recorder_b =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock_b) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        recorder_b.start_measurement().unwrap();
+        let token_b = match recorder_b.offer(stream).unwrap() {
+            OfferResult::Token(token) => token,
+            other => panic!("run B offer failed: {other:?}"),
+        };
+        token_b.accept().unwrap();
+        token_b.started().unwrap();
+        token_b.terminal(Outcome::Success).unwrap();
+        let rpc_b = recorder_b
+            .start_rpc_with_payload(RpcMethod::Status, 3)
+            .unwrap();
+        rpc_b.finish(Outcome::Success, 4).unwrap();
+        clock_b.set(10_000_000);
+        recorder_b.stop_measurement().unwrap();
+        let report_b = recorder_b.finish().unwrap();
+
+        let row_a = &report_a.measurement.logical[stream.measurement_index().unwrap()];
+        let row_b = &report_b.measurement.logical[stream.measurement_index().unwrap()];
+        assert_eq!(row_a.accepted, 1);
+        assert_eq!(row_a.failed_after_cutoff, 1);
+        assert_eq!(row_a.first_error.as_deref(), Some("run-a failure"));
+        assert_eq!(row_b.accepted, 1);
+        assert_eq!(row_b.succeeded_before_cutoff, 1);
+        assert!(row_b.first_error.is_none());
+
+        let txn_a = &report_a.measurement.rpc[RpcMethod::Txn.index()];
+        let txn_a_drain = &report_a.drain.rpc[RpcMethod::Txn.index()];
+        assert_eq!(txn_a.request_payload_bytes, 11);
+        assert_eq!(txn_a.completed, 0);
+        assert_eq!(txn_a_drain.response_payload_bytes, 13);
+        assert_eq!(txn_a_drain.result_unknown, 1);
+        let status_b = &report_b.measurement.rpc[RpcMethod::Status.index()];
+        assert_eq!(status_b.started, 1);
+        assert_eq!(status_b.completed, 1);
+        assert_eq!(status_b.succeeded, 1);
+        assert_eq!(status_b.failed, 0);
+        assert_eq!(status_b.timeout, 0);
+        assert_eq!(status_b.result_unknown, 0);
+        assert_eq!(status_b.payload_bytes, 7);
+        assert_eq!(status_b.request_payload_bytes, 3);
+        assert_eq!(status_b.response_payload_bytes, 4);
+        assert_eq!(status_b.latency.sample_count, 1);
+        let txn_b = &report_b.measurement.rpc[RpcMethod::Txn.index()];
+        let txn_b_drain = &report_b.drain.rpc[RpcMethod::Txn.index()];
+        for txn in [txn_b, txn_b_drain] {
+            assert_eq!(txn.started, 0);
+            assert_eq!(txn.completed, 0);
+            assert_eq!(txn.succeeded, 0);
+            assert_eq!(txn.failed, 0);
+            assert_eq!(txn.timeout, 0);
+            assert_eq!(txn.result_unknown, 0);
+            assert_eq!(txn.payload_bytes, 0);
+            assert_eq!(txn.request_payload_bytes, 0);
+            assert_eq!(txn.response_payload_bytes, 0);
+            assert_eq!(txn.latency.sample_count, 0);
+        }
+        assert_eq!(report_b.measurement.rpc_total.sample_count, 1);
+        assert_eq!(report_b.drain.rpc_total.sample_count, 0);
+        assert_eq!(
+            report_b
+                .buckets
+                .iter()
+                .map(|bucket| bucket.rpc_started)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            report_b
+                .buckets
+                .iter()
+                .map(|bucket| bucket.rpc_completed)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            report_b
+                .buckets
+                .iter()
+                .map(|bucket| bucket.txn_started)
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            report_b
+                .buckets
+                .iter()
+                .map(|bucket| bucket.txn_completed)
+                .sum::<u64>(),
+            0
+        );
+
+        assert!(report_a.accounting.histogram_overflow);
+        assert!(!report_b.accounting.histogram_overflow);
+        assert_eq!(report_a.buckets[0].watch_events, 1);
+        assert_eq!(report_b.buckets[0].watch_events, 0);
+        assert_eq!(
+            report_b
+                .buckets
+                .iter()
+                .map(|bucket| bucket.watch_events)
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            report_b
+                .buckets
+                .iter()
+                .map(|bucket| bucket.watch_payload_bytes)
+                .sum::<u64>(),
+            0
+        );
+        let watch_a = report_a
+            .watch
+            .roots
+            .iter()
+            .flat_map(|root| root.streams.iter())
+            .find(|stream| stream.stream == "pods")
+            .unwrap();
+        let watch_b = report_b
+            .watch
+            .roots
+            .iter()
+            .flat_map(|root| root.streams.iter())
+            .find(|stream| stream.stream == "pods")
+            .unwrap();
+        assert_eq!(watch_a.events, 1);
+        assert_eq!(watch_b.events, 0);
+    }
+    #[test]
+    fn test_watch_subscriptions_preserve_gap_coverage() {
+        let mut config = small_plan_with(10, 100, 10).config;
+        config.watch.subscriptions_per_root = 2;
+        let plan = CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap();
+        let clock = TestClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
+        recorder.start_measurement().unwrap();
+        for index in 0..plan.watch_specs().len() {
+            recorder.watch_created(index).unwrap();
+        }
+
+        let event = |revision| crate::pb::etcdserverpb::WatchResponse {
+            header: Some(crate::pb::etcdserverpb::ResponseHeader {
+                revision,
+                ..Default::default()
+            }),
+            events: vec![crate::pb::mvccpb::Event {
+                kv: Some(crate::pb::mvccpb::KeyValue {
+                    mod_revision: revision,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        clock.set(10_000_000);
+        recorder.watch_response(0, &event(11)).unwrap();
+        clock.set(20_000_000);
+        recorder.watch_disconnect(0).unwrap();
+        clock.set(30_000_000);
+        recorder.watch_created(0).unwrap();
+        clock.set(40_000_000);
+        recorder.watch_terminal(1, WATCH_TERMINAL_SEMANTIC).unwrap();
+        clock.set(50_000_000);
+        recorder.watch_response(0, &event(12)).unwrap();
+        clock.set(100_000_000);
+        recorder.stop_measurement().unwrap();
+        clock.set(150_000_000);
+        recorder.watch_disconnect(0).unwrap();
+        let report = recorder.finish().unwrap();
+
+        let pods = report
+            .watch
+            .roots
+            .iter()
+            .find(|root| root.root == "/registry/pods")
+            .unwrap();
+        assert_eq!(pods.expected_streams, 2);
+        assert_eq!(pods.ready_streams, 2);
+        assert_eq!(pods.observable_stream_ms, 130.0);
+        assert_eq!(pods.observed_measurement_ms, 100.0);
+        assert!(
+            (pods.coverage_ratio.unwrap() - 0.65).abs() < 1e-9,
+            "unexpected pod coverage: {:?}",
+            pods.coverage_ratio
+        );
+        assert!(!pods.observation_complete);
+        let pods_zero = pods
+            .streams
+            .iter()
+            .find(|stream| stream.stream == "pods-0")
+            .unwrap();
+        assert_eq!(pods_zero.disconnects, 2);
+        assert_eq!(pods_zero.events, 2);
+        assert!(!pods_zero.observation_complete);
+        let pods_one = pods
+            .streams
+            .iter()
+            .find(|stream| stream.stream == "pods-1")
+            .unwrap();
+        assert_eq!(pods_one.terminal.as_deref(), Some("semantic"));
+        assert_eq!(pods_one.events, 0);
+        assert!(!pods_one.observation_complete);
+
+        let minions = report
+            .watch
+            .roots
+            .iter()
+            .find(|root| root.root == "/registry/minions")
+            .unwrap();
+        assert_eq!(minions.expected_streams, 2);
+        assert_eq!(minions.coverage_ratio, Some(1.0));
+        assert!(minions.observation_complete);
+        assert!(!report.watch.observation_complete);
+    }
 }
