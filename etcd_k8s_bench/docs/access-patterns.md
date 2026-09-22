@@ -2,6 +2,8 @@
 
 本文区分官方协议事实与 benchmark 的合成选择。压力参数来自 [synthetic-k8s.json](../workloads/synthetic-k8s.json)，不来自历史 trace 或真实集群统计；这些模式不能换算 Kubernetes 容量。
 
+参数级当前支持范围及 K8s/benchmark/proxy 区别见 [领域 API 子集](../../.agents/domain/api-subset.md)；当前目标与验收要求见 [领域设计目标](../../.agents/domain/design-goals.md)。本文保留访问模式解释与官方出处，不单独扩大当前负载范围。
+
 ## 六类 key 域
 
 | 对象 | benchmark 固定根 | 范围 |
@@ -19,7 +21,7 @@ key 的具体名称由当前 plan 确定性生成；NodeLease 与对应 Node 名
 
 ## 写入：ModRevision CAS
 
-官方 Kubernetes etcd storage 实现通过底层客户端执行 create、guaranteed update 及有条件删除，乐观并发由 revision 表达。benchmark 的 Create 使用 `ModRevision == 0`，成功分支 Put，失败分支点 Range；更新比较已知 ModRevision，冲突返回当前 KV 后重建下一次请求的 revision 和 value。Create 冲突不是可盲重试的 transport 错误。
+官方 Kubernetes etcd storage 实现通过底层客户端执行 create、guaranteed update 及有条件删除，乐观并发由 revision 表达。benchmark 的 Create 使用 `ModRevision == 0`，成功分支 Put，失败分支为空；更新比较已知 ModRevision，失败分支为点 Range，冲突返回当前 KV 后重建下一次请求的 revision 和 value。Create 冲突不是可盲重试的 transport 错误。
 
 单次逻辑操作可产生多个 Txn RPC attempt。已发送的可变操作遇到 timeout/连接丢失时，客户端可能不知道服务端是否已提交；benchmark 将此类结果标记 result_unknown，不原样重放。该标记与 timeout 可以重叠。客户端取消只证明本地等待结束，不证明远端未提交。
 

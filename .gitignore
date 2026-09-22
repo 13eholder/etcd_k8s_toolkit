@@ -1,9 +1,14 @@
 /target
 .vscode
 *.jsonl
+.omp
 
 ref/
 docs/
+
+# Agent 知识库需要版本管理；其他 docs/ 忽略范围保持不变
+!/.agents/docs/
+!/.agents/docs/**
 
 # 采样与审计原始产物：仓库只提交代码与 markdown 文档，原始证据仅保留本机
 perf.data
