@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: etcd-k8s-bench
+    orgId: 1
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: ${BENCH_MONITORING_DIR}/grafana/dashboards

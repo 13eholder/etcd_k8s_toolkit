@@ -1,0 +1,311 @@
+{
+  "uid": "etcd-k8s-bench",
+  "title": "etcd_k8s_bench",
+  "description": "Local benchmark observation. Final per-run JSON is authoritative; data remains in Prometheus after the exporter exits.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": [
+    "etcd",
+    "benchmark"
+  ],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Application updates: target / offered / accepted",
+      "description": "Logical updates, not physical Txn/s. NodeLease and other periodic operations are excluded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bench-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_k8s_bench_target_update_rps{job=\"etcd-k8s-bench\"}",
+          "legendFormat": "target",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(etcd_k8s_bench_logical_offered_total{job=\"etcd-k8s-bench\",phase=\"measurement\",work_class=\"update\"}[5s]))",
+          "legendFormat": "offered",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(etcd_k8s_bench_logical_accepted_total{job=\"etcd-k8s-bench\",phase=\"measurement\",work_class=\"update\"}[5s]))",
+          "legendFormat": "accepted",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Measurement losses / logical errors (cumulative)",
+      "description": "Missed schedule is generator loss; dropped-full is bounded-queue backpressure. Errors are logical failures, not RPC attempt errors.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bench-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(etcd_k8s_bench_logical_missed_schedule_total{job=\"etcd-k8s-bench\",phase=\"measurement\"})",
+          "legendFormat": "missed schedule",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "sum(etcd_k8s_bench_logical_dropped_full_total{job=\"etcd-k8s-bench\",phase=\"measurement\"})",
+          "legendFormat": "queue full",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "sum(etcd_k8s_bench_logical_errors_total{job=\"etcd-k8s-bench\",phase=\"measurement\"})",
+          "legendFormat": "logical errors",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "RPC completions / errors",
+      "description": "RPC attempts completed in measurement. Failed attempts can still lead to a successful retried logical operation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bench-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (rpc) (rate(etcd_k8s_bench_rpc_completed_total{job=\"etcd-k8s-bench\",phase=\"measurement\",outcome=\"success\"}[5s]))",
+          "legendFormat": "{{rpc}} success",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (rpc) (rate(etcd_k8s_bench_rpc_completed_total{job=\"etcd-k8s-bench\",phase=\"measurement\",outcome!=\"success\"}[5s]))",
+          "legendFormat": "{{rpc}} errors",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "RPC latency: mean / cumulative maximum",
+      "description": "Online metrics expose sums/counts and maxima, not quantiles. p50/p99 are in the final JSON report; do not interpret these curves as p99.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bench-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (rpc) (rate(etcd_k8s_bench_rpc_duration_microseconds_phase_total{job=\"etcd-k8s-bench\",phase=\"measurement\"}[5s])) / sum by (rpc) (rate(etcd_k8s_bench_rpc_duration_samples_phase_total{job=\"etcd-k8s-bench\",phase=\"measurement\"}[5s])) / 1000",
+          "legendFormat": "{{rpc}} mean",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "etcd_k8s_bench_rpc_duration_max_microseconds_phase{job=\"etcd-k8s-bench\",phase=\"measurement\"} / 1000",
+          "legendFormat": "{{rpc}} maximum",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Watch event rate / disconnects",
+      "description": "Watch event count differs from logical update and RPC count. Inspect final report for per-root coverage and observation completeness.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bench-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(etcd_k8s_bench_watch_events_phase_total{job=\"etcd-k8s-bench\",phase=\"measurement\"}[5s])",
+          "legendFormat": "events/s",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "etcd_k8s_bench_watch_disconnect_total{job=\"etcd-k8s-bench\",phase=\"measurement\"}",
+          "legendFormat": "disconnects (cumulative)",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Dedicated etcd database / quota",
+      "description": "Optional dedicated etcd metrics listener on 127.0.0.1:12381. Absent listener means no backend data, not a zero-sized database.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bench-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mvcc_db_total_size_in_bytes{job=\"bench-etcd\"}",
+          "legendFormat": "database",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "etcd_server_quota_backend_bytes{job=\"bench-etcd\"}",
+          "legendFormat": "quota",
+          "range": true
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": []
+  }
+}

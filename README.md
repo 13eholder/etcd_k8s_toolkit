@@ -84,6 +84,14 @@ granularity**. A delayed scheduler skips expired slots: it does not catch up or
 wait for a success quota. Within-tick batches are expected. Full queues drop
 work explicitly; queues are bounded.
 
+Pacing waits at high resolution on `Runtime::block_on`'s caller thread, avoiding
+both Tokio's millisecond rounding and a separate timer thread's wakeup handoff.
+Each sleep request is at most 1ms, followed by a cooperative yield; no busy-wait.
+Actual OS/executor stalls still count as `missed_schedule`; zero loss is not a
+hard-real-time guarantee. The Tokio executor defaults to 4 threads and honors
+`TOKIO_WORKER_THREADS`; this is separate from the 128 logical workers. gRPC uses
+adaptive HTTP/2 receive windows. RPC timeouts still use Tokio.
+
 The measurement window is `[start, effective_cutoff)`. An event exactly at the
 cutoff belongs to drain. Accepted work can execute during bounded drain; Watch
 teardown follows. The final report is emitted after owned tasks are joined.
@@ -118,6 +126,16 @@ bytes are not wire/TLS/network byte counts. Online Prometheus summaries and
 sampled CPU/RSS are supporting observations, not substitutes for the final
 per-run report. Avoid full request logging at high pressure; scrape roughly once
 per second. Sampled peak RSS is not an exact process maximum.
+
+### Minimal Prometheus + Grafana dashboard
+
+The [local monitoring guide](etcd_k8s_bench/monitoring/README.md) includes native
+Prometheus/Grafana startup, automatic datasource/dashboard provisioning, metric
+semantics, and cleanup. Six panels cover target/offered/accepted updates, losses
+and errors, RPC throughput and mean/maximum latency, Watch, and etcd size/quota.
+Online metrics do not provide p99; use final JSON for exact quantiles. The exporter
+stops with the benchmark; Prometheus retains scraped history until retention or
+explicit storage-directory cleanup.
 
 ### Capture repeatable evidence
 

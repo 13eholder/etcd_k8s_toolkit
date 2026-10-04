@@ -1744,6 +1744,7 @@ fn dispatch_application_item(
     recorder: &MeasurementRecorder,
     stream: &crate::plan::LogicalStreamPlan,
     ordinal: u64,
+    key: Vec<u8>,
     sender: &mpsc::Sender<WorkItem>,
     tick_deadline: TokioInstant,
     _cutoff_deadline: TokioInstant,
@@ -1775,7 +1776,6 @@ fn dispatch_application_item(
     };
     let item = match stream.work_class {
         LogicalWorkClass::Update => {
-            let key = plan.resource_key(stream.resource, ordinal, plan.config.seed);
             let value = plan.resource_value(stream.resource, ordinal, plan.config.seed, ordinal);
             WorkItem::Txn {
                 key,
@@ -2006,7 +2006,7 @@ fn dispatch_tick(
     tick_deadline: TokioInstant,
     _cutoff_deadline: TokioInstant,
 ) -> Result<(), String> {
-    let mut targets = Vec::with_capacity(plan.logical_streams.len());
+    let mut targets = [0; crate::measurement::MEASUREMENT_STREAM_COUNT];
     for (index, stream) in plan.logical_streams.iter().enumerate() {
         let start = planned_at(stream, tick_start_ns)?;
         let end = planned_at(stream, tick_end_ns)?;
@@ -2018,7 +2018,7 @@ fn dispatch_tick(
             )?;
             state.next_ordinals[index] = start;
         }
-        targets.push(end);
+        targets[index] = end;
     }
 
     let periodic_start = periodic_event_lower_bound(plan, tick_start_ns);
@@ -2050,6 +2050,7 @@ fn dispatch_tick(
                 recorder,
                 stream,
                 ordinal,
+                key,
                 &senders[shard],
                 tick_deadline,
                 _cutoff_deadline,
@@ -2135,11 +2136,12 @@ enum ScheduleControl {
     Interrupted,
 }
 
-async fn wait_for_schedule_event(
+async fn wait_for_schedule_event<F: Future<Output = ()>>(
     worker_tasks: &mut JoinSet<Result<(), String>>,
     watch_tasks: &mut JoinSet<WatchTaskOutput>,
     deadline: TokioInstant,
     ctrl_c: &mut CtrlCFuture,
+    sleep_until: &impl Fn(TokioInstant) -> F,
 ) -> Result<ScheduleControl, String> {
     tokio::select! {
         biased;
@@ -2163,7 +2165,7 @@ async fn wait_for_schedule_event(
                 None => Err("all watch tasks exited before the run ended".into()),
             }
         }
-        _ = time::sleep_until(deadline) => Ok(ScheduleControl::Tick),
+        _ = sleep_until(deadline) => Ok(ScheduleControl::Tick),
     }
 }
 fn mark_remaining_missed(
@@ -2198,7 +2200,7 @@ enum DispatchExit {
     Failed(String, DispatchState),
 }
 
-async fn dispatch_until(
+async fn dispatch_until<F: Future<Output = ()>>(
     plan: &CompiledPlan,
     recorder: &MeasurementRecorder,
     senders: &[mpsc::Sender<WorkItem>],
@@ -2207,6 +2209,7 @@ async fn dispatch_until(
     started: TokioInstant,
     cutoff: TokioInstant,
     ctrl_c: &mut CtrlCFuture,
+    sleep_until: impl Fn(TokioInstant) -> F,
 ) -> DispatchExit {
     let duration_ns = match nanos(run_duration(plan)) {
         Ok(value) => value,
@@ -2226,6 +2229,7 @@ async fn dispatch_until(
                 watch_tasks,
                 wait_deadline.min(cutoff),
                 ctrl_c,
+                &sleep_until,
             )
             .await
             {
@@ -2279,7 +2283,8 @@ async fn dispatch_until(
         if TokioInstant::now() >= cutoff {
             break;
         }
-        match wait_for_schedule_event(worker_tasks, watch_tasks, cutoff, ctrl_c).await {
+        match wait_for_schedule_event(worker_tasks, watch_tasks, cutoff, ctrl_c, &sleep_until).await
+        {
             Ok(ScheduleControl::Interrupted) => return DispatchExit::Interrupted(state),
             Ok(ScheduleControl::Supervisor | ScheduleControl::Tick) => {}
             Err(error) => return DispatchExit::Failed(error, state),
@@ -2693,6 +2698,7 @@ pub(crate) async fn run_with_ctrl_c(
 ) -> RunResult {
     let run_config = config.clone();
     let plan = config.plan.clone();
+    ::metrics::gauge!(metrics::TARGET_UPDATE_RPS).set(plan.config.load.update_rps as f64);
     let recorder = match MeasurementRecorder::new_with_metrics_at(
         &plan,
         metrics::RunMetrics::new(),
@@ -2842,6 +2848,7 @@ pub(crate) async fn run_with_ctrl_c(
         dispatch_started,
         dispatch_cutoff,
         &mut ctrl_c,
+        crate::pacing::sleep_until,
     )
     .await
     {
@@ -5658,6 +5665,7 @@ mod tests {
             started,
             cutoff,
             &mut ctrl_c,
+            time::sleep_until,
         )
         .await;
         let mut state = match exit {
@@ -6151,6 +6159,7 @@ mod tests {
             started,
             cutoff,
             &mut ctrl_c,
+            time::sleep_until,
         )
         .await;
         let mut state = match exit {
@@ -6223,6 +6232,7 @@ mod tests {
             started,
             cutoff,
             &mut ctrl_c,
+            time::sleep_until,
         ));
         assert_pending(dispatch.as_mut()).await;
         let initial = receiver.len();
@@ -6274,6 +6284,7 @@ mod tests {
             started,
             cutoff,
             &mut ctrl_c,
+            time::sleep_until,
         )
         .await;
         let mut state = match exit {
@@ -6376,6 +6387,7 @@ mod tests {
             &recorder,
             stream,
             0,
+            plan.resource_key(stream.resource, 0, plan.config.seed),
             &sender,
             TokioInstant::now() + Duration::from_secs(1),
             TokioInstant::now() + Duration::from_secs(1),
@@ -6426,6 +6438,7 @@ mod tests {
             &recorder,
             stream,
             0,
+            plan.resource_key(stream.resource, 0, plan.config.seed),
             &sender,
             TokioInstant::now() + Duration::from_secs(1),
             TokioInstant::now() + Duration::from_secs(1),
@@ -6459,6 +6472,7 @@ mod tests {
             &recorder,
             stream,
             0,
+            plan.resource_key(stream.resource, 0, plan.config.seed),
             &sender,
             TokioInstant::now() + Duration::from_secs(1),
             TokioInstant::now() + Duration::from_secs(1),
@@ -6737,6 +6751,7 @@ mod tests {
             &mut watches,
             TokioInstant::now() + Duration::from_secs(60),
             &mut pending_ctrl_c(),
+            &time::sleep_until,
         )
         .await
         .unwrap_err();
@@ -6874,6 +6889,7 @@ mod tests {
             started,
             cutoff,
             &mut ctrl_c,
+            time::sleep_until,
         ));
         assert_pending(dispatch.as_mut()).await;
         let collect_keys = |receiver: &mut mpsc::Receiver<WorkItem>| {
@@ -6919,6 +6935,72 @@ mod tests {
         assert_eq!(row.accepted, 2);
         assert_eq!(row.missed_schedule, stream.planned - 2);
         assert_eq!(row.canceled_queued, 2);
+        assert!(report.accounting.planned_conserved);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_precise_ticks_offer_entire_update_budget() {
+        let mut config = small_plan().config;
+        config.load.update_rps = 2_000;
+        config.load.read_ratio.numerator = 0;
+        let plan = CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap();
+        let clock = ExecutorPhaseClock::new();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, clock.clone() as Arc<dyn MonotonicClock>)
+                .unwrap();
+        record_test_preparation(&recorder, &plan);
+        recorder.start_measurement().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkItem>(64);
+        let senders = vec![sender];
+        let mut workers = JoinSet::new();
+        let mut watches = JoinSet::new();
+        let mut ctrl_c = pending_ctrl_c();
+        let started = TokioInstant::now();
+        let cutoff = started + run_duration(&plan);
+        // Drive exact timer wakeups through the production dispatcher.
+        let mut dispatch = Box::pin(dispatch_until(
+            &plan,
+            &recorder,
+            &senders,
+            &mut workers,
+            &mut watches,
+            started,
+            cutoff,
+            &mut ctrl_c,
+            |deadline| {
+                std::future::poll_fn(move |_| {
+                    if TokioInstant::now() >= deadline {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+            },
+        ));
+        let mut offered = 0;
+        for tick in 0..plan.config.load.duration_ms {
+            clock.set_millis(tick);
+            assert_pending(dispatch.as_mut()).await;
+            while let Ok(item) = receiver.try_recv() {
+                offered += 1;
+                drop(item);
+            }
+            time::advance(crate::plan::PACING_TICK).await;
+        }
+        clock.set_millis(plan.config.load.duration_ms);
+        assert!(matches!(dispatch.await, DispatchExit::Completed(_)));
+        recorder.stop_measurement().unwrap();
+        let report = recorder.finish().unwrap();
+        let updates = report
+            .measurement
+            .logical
+            .iter()
+            .find(|row| row.work_class == "update")
+            .unwrap();
+        assert_eq!(offered, 40);
+        assert_eq!(updates.offered, updates.planned);
+        assert_eq!(updates.missed_schedule, 0);
+        assert_eq!(updates.dropped_full, 0);
         assert!(report.accounting.planned_conserved);
     }
 }

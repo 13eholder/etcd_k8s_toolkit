@@ -4,6 +4,7 @@ mod config;
 mod heartbeat;
 mod measurement;
 mod metrics;
+mod pacing;
 mod pb;
 mod plan;
 mod report;
@@ -54,9 +55,23 @@ impl fmt::Display for AppError {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    // The event-driven client does not need one executor thread per host CPU.
+    // Honor Tokio's existing override instead of adding a second configuration.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        builder.worker_threads(4);
+    }
+    let runtime = match builder.enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("etcd_k8s_bench: runtime setup failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let result = runtime.block_on(run());
+    drop(runtime);
+    if let Err(error) = result {
         eprintln!("etcd_k8s_bench: {error}");
         std::process::exit(error.exit_code());
     }

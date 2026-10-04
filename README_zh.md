@@ -62,6 +62,8 @@ NodeLease 每 10s 更新，带确定性 5% jitter；Node status 每 300s，Statu
 
 准备阶段建立六类资源、执行 NodeReady，并等待全部 Watch 收到 Created 且当前仍 ready。准备不计入测量窗口。投放粒度为 **1ms**；调度迟到会跳过过期 slots，不补发追赶、不等待成功配额。单 tick 内可以批量投放。队列满明确丢弃，不扩大队列掩盖过载。
 
+投放直接在 `Runtime::block_on` 的调用线程上高分辨率等待，避免 Tokio 毫秒取整和额外定时线程的跨线程唤醒。单次 sleep 请求不超过 1ms，随后协作式 yield；不忙等。共享主机上的 OS/执行器迟到仍如实计入 `missed_schedule`；不承诺硬实时零漏投。默认 Tokio 执行器为 4 个线程，仍可用 `TOKIO_WORKER_THREADS` 覆盖；它与配置中的 128 个逻辑 worker 不同。gRPC 使用自适应 HTTP/2 接收窗口；RPC timeout 等继续使用 Tokio。
+
 测量窗口为 `[start, effective_cutoff)`，正好截止的事件属于 drain。已接受任务可以在有界 drain 中执行，随后单独回收 Watch；所有自有任务 join 后输出最终报告。普通请求失败、过载和测量期间 semantic Watch gap 不提前结束正常配置窗口。
 
 ### 正确解读结果
@@ -78,6 +80,10 @@ NodeLease 每 10s 更新，带确定性 5% jitter；Node status 每 300s，Statu
 分别核对 planned、offered、missed_schedule、dropped_full、accepted、completed 和 canceled。一次逻辑更新可能产生多个 Txn attempt，一次列表可能包含多个 Range page，**逻辑 update/s 不等于物理 Txn/s**。RPC start 和 completion 按实际事件阶段计数，单阶段不要求相等。timeout 与 result_unknown 可以重叠，均为 failed 的子集，不能相加当总失败。取消不能伪造 RPC 完成或延迟样本。
 
 Watch coverage、observation_complete 与工作量守恒分开判断，重连不抹掉历史缺口。HDR 的元数据、样本、overflow 和 censored 必须一起解读。protobuf payload 字节不等于 wire/TLS/网络字节。在线 Prometheus 和低频 CPU/RSS 是辅助观测，不能替代最终 per-run 报告；建议约 1s 抓取一次，高压不启用全量请求日志。采样 RSS 峰值不是精确进程最大值。
+
+### 最小 Prometheus + Grafana 看板
+
+[运行指南与配置](etcd_k8s_bench/monitoring/README.md)提供本机原生 Prometheus 和 Grafana 的启动、看板自动加载、指标口径及清理命令。六个面板覆盖更新目标/实际投放、漏投/丢弃/错误、RPC 吞吐与平均/最大延迟、Watch、etcd 空间/quota。在线指标不提供 p99；准确分位数读取最终 JSON。bench 退出后 exporter 关闭，历史抓取由 Prometheus 保留，直到 retention 或显式清理存储目录。
 
 ### 采集可重复证据
 

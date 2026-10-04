@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 1s
+  scrape_timeout: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  - job_name: etcd-k8s-bench
+    static_configs:
+      - targets: ['127.0.0.1:19898']
+  # Optional dedicated etcd metrics listener; never use a production endpoint.
+  - job_name: bench-etcd
+    static_configs:
+      - targets: ['127.0.0.1:12381']

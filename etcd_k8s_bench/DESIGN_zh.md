@@ -13,8 +13,9 @@
 | `config.rs` / `cli.rs` | 唯一完整 synthetic JSON、CLI 覆盖、边界验证、plan/run 入口 |
 | `plan.rs` | 六类资源、确定性 key/value、速率有理数、周期事件、Watch 计划、容量预算 |
 | `scheduler.rs` | 严格准备、1ms 开环投放、有界队列、worker、阶段控制和自有任务回收 |
+| `pacing.rs` | 在投放调用线程上高分辨率等待；单次 sleep 请求至多 1ms 后协作式 yield，无额外定时线程、不忙等 |
 | `workload.rs` | Txn/CAS 请求与响应状态转换 |
-| `client.rs` | 共用连接、实际 RPC、typed transport 错误、只读 preflight |
+| `client.rs` | 共用连接、自适应 HTTP/2 接收窗口、实际 RPC、typed transport 错误、只读 preflight |
 | `watch.rs` | Created、revision、当前就绪、恢复与 terminal 分类 |
 | `measurement.rs` | 单调时钟事件归属、token/cohort、计数、桶、HDR、Watch coverage |
 | `metrics.rs` | 有界在线观测、exporter 连接与后台任务回收 |
@@ -41,6 +42,8 @@
 
 准备、measurement、drain、Watch teardown 独立计时。中断和致命生命周期错误可以提前截止；普通 RPC 失败、后端过载和测量期 Watch semantic gap 不缩短完整配置窗口。过载正常完成仍 exit0，不能用 exit0 宣称压力达标。
 
+1ms 投放窗口不能依赖 Tokio 向上取整的毫秒定时轮等待。投放在 `Runtime::block_on` 调用线程上直接等待，去掉独立定时线程加 Notify 的二次唤醒；单次 sleep 请求至多一个 tick 后协作式 yield，RPC timeout 等继续使用 Tokio。OS 实际睡眠可能超过请求时长，真正的调度停顿仍跳过过期 slots，不改变计划、计数或截止以伪装目标达标。CLI 默认使用 4 个 Tokio 执行器线程，保留 `TOKIO_WORKER_THREADS` 覆盖；不等同于配置的 128 个逻辑 worker。tick 目标使用固定有界栈空间，更新 key 复用分片计算结果，避免每 tick 分配和每更新重复构造。
+
 ## 事件归属与守恒
 
 measurement 为半开窗口 `[start, effective_cutoff)`，正好截止归 drain。admission、logical start/terminal、RPC start/completion 分别按真实事件时间归属，不能用一次入口时间代表后续事件。跨窗 RPC 在 measurement 开始、drain 完成是合法情况；阶段 starts/completions 不强行相等。
@@ -58,6 +61,7 @@ timeout 与 result_unknown 是可重叠的 failed 子集。外层逻辑 deadline
 - Watch coverage 累计窗口内各订阅真实可用区间；当前 ready 与曾经 ready 不同，重连不抹掉缺口，截止后 teardown 不反写窗口缺口。
 - Prometheus 使用有限在线投影，不保留无限原始延迟样本。抓取和 CPU/RSS 采样有成本，建议约 1s；采样峰值不等于精确最大值。
 - 高压默认直连，不经全量请求日志代理。后端与生成器共享机器时必须记录资源竞争，不能把局部协议 fixture 当真实后端吞吐。
+- [本机 Prometheus + Grafana](monitoring/README.md)复用在线指标，额外导出无标签 `etcd_k8s_bench_target_update_rps` gauge 表示当前应用更新配置目标。看板只显示已有 sum/count 派生均值与最大值，不冒充 HDR 分位数；Prometheus 保留已抓取历史，与 exporter 生命周期分离。
 
 ## 报告与退出
 

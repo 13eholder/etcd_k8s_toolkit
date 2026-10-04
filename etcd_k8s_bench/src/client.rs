@@ -175,6 +175,9 @@ impl ClientBundle {
             .map_err(|error| ClientError::Transport(error.into()))?
             .connect_timeout(request_timeout)
             .timeout(request_timeout)
+            // Large prev_kv Watch streams need BDP-sized receive windows.
+            // https://docs.rs/tonic/0.14.6/tonic/transport/struct.Endpoint.html#method.http2_adaptive_window
+            .http2_adaptive_window(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
         let channel = endpoint.connect().await.map_err(ClientError::Transport)?;
         let kv = KvClient::new(channel.clone())

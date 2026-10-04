@@ -179,6 +179,7 @@ fn logical_labels_for_phase(phase: usize, index: usize) -> (&'static str, Option
 }
 
 pub const LOGICAL_STARTED_TOTAL: &str = "etcd_k8s_bench_logical_started_total";
+pub const TARGET_UPDATE_RPS: &str = "etcd_k8s_bench_target_update_rps";
 pub const LOGICAL_COMPLETED_TOTAL: &str = "etcd_k8s_bench_logical_completed_total";
 pub const LOGICAL_ERRORS_TOTAL: &str = "etcd_k8s_bench_logical_errors_total";
 pub const LOGICAL_OFFERED_TOTAL: &str = "etcd_k8s_bench_logical_offered_total";
