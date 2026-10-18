@@ -79,7 +79,9 @@ NodeLease 每 10s 更新，带确定性 5% jitter；Node status 每 300s，Statu
 
 分别核对 planned、offered、missed_schedule、dropped_full、accepted、completed 和 canceled。一次逻辑更新可能产生多个 Txn attempt，一次列表可能包含多个 Range page，**逻辑 update/s 不等于物理 Txn/s**。RPC start 和 completion 按实际事件阶段计数，单阶段不要求相等。timeout 与 result_unknown 可以重叠，均为 failed 的子集，不能相加当总失败。取消不能伪造 RPC 完成或延迟样本。
 
-Watch coverage、observation_complete 与工作量守恒分开判断，重连不抹掉历史缺口。HDR 的元数据、样本、overflow 和 censored 必须一起解读。protobuf payload 字节不等于 wire/TLS/网络字节。在线 Prometheus 和低频 CPU/RSS 是辅助观测，不能替代最终 per-run 报告；建议约 1s 抓取一次，高压不启用全量请求日志。采样 RSS 峰值不是精确进程最大值。
+`dropped_full` 是目标 key shard 的队列满，不代表所有 worker 队列都满。`cutoff_queued/running` 是最终 accepted cohort 推导的截止残差，包含可能早于截止发生的取消，不是实时队列快照；完整公式见[事件归属与守恒](etcd_k8s_bench/DESIGN_zh.md#事件归属与守恒)。
+
+Watch coverage、observation_complete 与工作量守恒分开判断，重连不抹掉历史缺口。HDR 的 `sample_count + overflow` 才是已观测数量；取消另列 censored，不加入完成样本。成功和错误共用 HDR，timeout 延迟不表示后端实际完成时间。HDR 向上取整到至少1µs，在线微秒 sum/count/max 向下截断，两者不是同一舍入口径。protobuf payload 字节不等于 wire/TLS/网络字节；在线 Prometheus 和低频 CPU/RSS 不能替代最终报告，采样 RSS 峰值不是精确进程最大值。
 
 ### 最小 Prometheus + Grafana 看板
 
@@ -107,4 +109,8 @@ python3 etcd_k8s_bench/verify/check_report.py \
 
 必须传真实子进程退出码，不能假定为 0。可选 `--keyspace PATH` 检查采集的最终 etcdctl keys-only JSON。checker 返回 0 仅表示所提供证据一致，不代表实验成功；未提供 plan/keyspace 时明确列为未检查。runner 的 `--timeout-seconds` 是外部 watchdog，不是测量时长；`--interrupt-after-seconds` 从子进程启动计时，包含准备阶段。可选 `--backend-metrics-url` 采集后端指标。采集错误、watchdog 和强杀不能伪装正常完成。
 
-协议详见 [访问模式](etcd_k8s_bench/docs/access-patterns.md)，实现边界见 [设计说明](etcd_k8s_bench/DESIGN_zh.md)。
+runner 将收到的 SIGINT/SIGTERM 转为当前子进程的一次优雅 SIGINT，并保留原始信号与真实子进程退出码；正常优雅中断仍为130。plan 失败，或输出打开后的最终启动门禁发现已锁存取消，不会启动 run；未执行原因写入 `run-invocation.json`，不生成假报告，`check.json` 标明未检查。进入启动操作后才到来的取消按已执行子进程处理，不承诺原子撤回启动。采样/后置采集被取消时保存跳过原因；watchdog 在已有 SIGINT 后仍有强杀期限，工具故障优先返回1。
+
+checker 核对可见计数、类型范围和算式，不以 `accounting=true` 代替核验；内部历史算术溢出状态不能由最终摘要完全证明。修复范围、reviewer 批准和本次验证见[修复计划](tasks/plan.md)。
+
+协议详见 [API 子集](.agents/domain/api-subset.md)，实现边界见 [设计说明](etcd_k8s_bench/DESIGN_zh.md)。

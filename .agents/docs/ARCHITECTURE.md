@@ -2,7 +2,7 @@
 
 ## 权威设计与系统边界
 
-**已确立规范**：bench 的模块职责、生命周期及观测边界由 [DESIGN_zh.md](../../etcd_k8s_bench/DESIGN_zh.md) 维护；请求形状由 [访问模式](../../etcd_k8s_bench/docs/access-patterns.md) 维护。本页只提供代码导航，不复制完整契约。设计与历史决策见 [设计索引](design-docs/index.md)。
+**已确立规范**：bench 的模块职责、生命周期及观测边界由 [DESIGN_zh.md](../../etcd_k8s_bench/DESIGN_zh.md) 维护；请求形状和参数边界由 [API 子集](../domain/api-subset.md) 维护。本页只提供代码导航，不复制完整契约。设计与历史决策见 [设计索引](design-docs/index.md)。
 
 **现有实践**：[Cargo.toml](../../Cargo.toml)定义两个独立二进制 crate，没有互相声明 Cargo 依赖。它们共享 proto 输入，不共享一个 Rust library crate。proxy 是可选代理而非 benchmark 运行必经层；高压默认直连的原因与边界见 DESIGN 的观测章节。
 

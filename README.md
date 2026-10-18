@@ -119,13 +119,19 @@ phase, so a single phase need not have equal starts and completions. Timeout and
 result-unknown counts are overlapping subsets of failed work, not additive error
 categories. Canceled RPCs do not fabricate completion or latency samples.
 
+`dropped_full` is saturation of the target key shard, not proof that every worker
+queue is full. `cutoff_queued/running` are residuals derived from the final
+accepted cohort, including possible pre-cutoff cancellations; they are not live
+queue snapshots. See the [accounting design](etcd_k8s_bench/DESIGN_zh.md#事件归属与守恒).
+
 Watch observation completeness and per-root coverage are separate from workload
-accounting; reconnecting does not erase an earlier gap. HDR latency metadata,
-overflow, samples, and censored work must be read together. Protobuf payload
-bytes are not wire/TLS/network byte counts. Online Prometheus summaries and
-sampled CPU/RSS are supporting observations, not substitutes for the final
-per-run report. Avoid full request logging at high pressure; scrape roughly once
-per second. Sampled peak RSS is not an exact process maximum.
+accounting; reconnecting does not erase an earlier gap. HDR `sample_count + overflow`
+is the observed count; cancellations are censored separately and do not create
+completion samples. Success and error terminals share HDR summaries, and a timeout
+latency is not the backend's actual completion time. HDR rounds up to at least 1µs;
+online microsecond sum/count/max truncate downward. Protobuf payload bytes are not
+wire/TLS/network bytes. Online metrics and sampled CPU/RSS are supporting evidence,
+not substitutes for the final report; sampled peak RSS is not an exact maximum.
 
 ### Minimal Prometheus + Grafana dashboard
 
@@ -168,6 +174,20 @@ succeeded; omitted plan/keyspace checks are reported as unchecked. The runner's
 Optional `--backend-metrics-url` captures backend metrics. Collection failures and
 forced termination remain distinct from benchmark results.
 
-See [access patterns](etcd_k8s_bench/docs/access-patterns.md) for keys, CAS,
+The runner latches SIGINT/SIGTERM and sends at most one graceful SIGINT per child,
+retaining the original signal and actual child return code. A graceful benchmark
+interruption remains 130. A failed plan or cancellation latched at the final gate
+after output files open prevents `run`. Cancellation after launch begins is handled
+as an executed child, not an atomic rollback of process creation. A skipped run
+has `executed:false`, a null exit code and a reason in its invocation metadata;
+it has no fabricated report, and `check.json` explicitly says not checked. Skipped
+sampling/post-run collection also records its reason. The watchdog still has a
+bounded kill deadline after an earlier SIGINT; tool failures return 1.
+
+The checker verifies observable counts, type ranges and arithmetic rather than
+trusting accounting flags. A final summary cannot independently prove all internal
+arithmetic history. See the [repair plan and verification](tasks/plan.md).
+
+See the [API subset](.agents/domain/api-subset.md) for keys, CAS,
 pagination and Watch semantics, and [design (中文)](etcd_k8s_bench/DESIGN_zh.md)
 for lifecycle and accounting invariants.

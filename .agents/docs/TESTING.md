@@ -45,7 +45,7 @@
 
 ## 现有测试组织
 
-**现有实践**：Rust 测试内联在各 `src/*.rs` 的测试模块中；bench 的 [client](../../etcd_k8s_bench/src/client.rs)、[watch](../../etcd_k8s_bench/src/watch.rs)、[scheduler](../../etcd_k8s_bench/src/scheduler.rs) 使用协议 fixture 验证客户端和生命周期。[Python 测试](../../etcd_k8s_bench/verify/test_verify.py) 覆盖离线报告检查及采集器进程行为。fixture 不证明真实 etcd 性能。
+**现有实践**：bench 的 Rust 行为测试位于 `etcd_k8s_bench/tests/unit/*.rs`，由对应 `src` 模块通过 `#[path]` 引入；proxy 仍有内联测试。bench 的 [client 测试](../../etcd_k8s_bench/tests/unit/client.rs)、[watch 测试](../../etcd_k8s_bench/tests/unit/watch.rs)、[scheduler 测试](../../etcd_k8s_bench/tests/unit/scheduler.rs) 使用协议 fixture 验证客户端与生命周期。[Python 测试](../../etcd_k8s_bench/verify/test_verify.py) 覆盖离线报告检查及采集器真实进程/信号行为。fixture 不证明真实 etcd 性能。
 
 真实实验的前置条件和解释口径以 [使用说明](../../README_zh.md)、[设计说明](../../etcd_k8s_bench/DESIGN_zh.md) 为准；历史运行记录见 [Stage 006 VERIFY](../stages/006-rule-driven-timed-pressure/VERIFY.md)。历史通过数不是本次运行结果。
 
@@ -63,6 +63,8 @@
 | `./target/release/etcd_k8s_bench plan --config etcd_k8s_bench/verify/synthetic-small.json` | 已构建 release binary；README | 无后端计划 smoke |
 
 真实 `run`、`run_synthetic.py` 与 `check_report.py` 完整参数沿用 README，不在这里复制。必须显式指定专用可丢弃空后端、已有 etcdctl、全新输出目录；checker 传实际子进程退出码。工具不管理后端、不清库、不调整 quota。报告一致不等于实验成功。
+
+对抗审查修复的计划批准、受控时钟/信号回归和本次实际执行结果集中于 [修复计划](../../tasks/plan.md)。executor 使用 Tokio 单调时钟，纯 CAS 只接收同域转换值；网络 I/O 与 paused-clock 的自动推进不能混作完成同步。测试通过数以该执行记录为准，不覆盖上表保留的初始化历史声明。
 
 ## 文档验证
 
