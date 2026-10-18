@@ -2,7 +2,7 @@
 
 ## bench 已确立行为
 
-权威维护位置为 [设计说明](../../etcd_k8s_bench/DESIGN_zh.md)“生命周期”“事件归属与守恒”“报告与退出”和 [访问模式](../../etcd_k8s_bench/docs/access-patterns.md) 的 CAS、分页、Watch 章节。这里只给变更导航：
+权威维护位置为 [设计说明](../../etcd_k8s_bench/DESIGN_zh.md)“生命周期”“事件归属与守恒”“报告与退出”和 [API 子集](../domain/api-subset.md) 的 CAS、分页、Watch 章节。这里只给变更导航：
 
 - 参数/配置错误退出 2，不输出运行报告；执行/setup/生命周期失败退出 1；中断 130；正常完成 0 不代表压力达标或 Watch 观察完整。
 - 普通请求失败、队列满与测量期 Watch semantic gap 不提前结束普通配置窗口。准备失败不能开启测量。
@@ -14,6 +14,8 @@
 **现有实践**：[client.rs](../../etcd_k8s_bench/src/client.rs) 的 `ClientError` 保留 Transport source 或 tonic Status；`is_timeout` 根据 `DeadlineExceeded` 或 source chain 的 `tonic::TimeoutExpired` 判断，不从文字猜 timeout。`retry_decision(method, disposition)` 结合 Range/Status 与 Txn/Compact 的可变性，以及有结构化证据的 NotSent/Unknown，返回 Retry、NotSent、ResultUnknown 或 Stop。
 
 该分类函数不等于调用方已实施重试。修改重试必须继续检查 [scheduler.rs](../../etcd_k8s_bench/src/scheduler.rs) 中实际循环、预算和取消边界；CAS 响应转换在 [workload.rs](../../etcd_k8s_bench/src/workload.rs)，Watch 重连/终止在 [watch.rs](../../etcd_k8s_bench/src/watch.rs)。错误向 CLI/报告的转换沿 [cli.rs](../../etcd_k8s_bench/src/cli.rs)、[report.rs](../../etcd_k8s_bench/src/report.rs) 核验，不只检查错误 enum。
+
+Watch open 同样复用 typed TimeoutExpired source 判断，进入有界恢复；不是把全部 Cancelled 都当作 timeout。dispatch/drain 用 ControlFailure 和结构化超时事实传递信号是否已消费、Interrupted/SignalFailure 及 worker 首因，不能匹配错误正文决定后续是否 poll signal future。runner 的 SIGINT/SIGTERM 转发、plan 启动门禁及未执行证据见 [使用说明](../../README_zh.md#采集可重复证据)。
 
 ## proxy 现有行为及缺口
 

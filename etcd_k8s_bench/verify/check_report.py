@@ -15,6 +15,9 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+U64_MAX = (1 << 64) - 1
+U128_MAX = (1 << 128) - 1
+
 
 class InputError(Exception):
     """The checker could not read or parse one of its input artifacts."""
@@ -24,6 +27,11 @@ class Validator:
     def __init__(self) -> None:
         self.errors: list[str] = []
         self.checks: dict[str, bool] = {}
+        self.arithmetic_valid = True
+
+    def arithmetic_error(self, path: str, message: str) -> None:
+        self.arithmetic_valid = False
+        self.error(path, message)
 
     def error(self, path: str, message: str) -> None:
         self.errors.append(f"{path}: {message}")
@@ -401,12 +409,15 @@ def _array(value: Any, path: str, v: Validator) -> list[Any] | None:
     return value
 
 
-def _uint(value: Any, path: str, v: Validator, *, positive: bool = False) -> int | None:
+def _uint(value: Any, path: str, v: Validator, *, positive: bool = False, maximum: int = U64_MAX) -> int | None:
     if type(value) is not int:
         v.error(path, "must be an integer (booleans are not integers)")
         return None
-    if value < 0 or (positive and value == 0):
-        v.error(path, "must be positive" if positive else "must be non-negative")
+    if positive and value == 0:
+        v.error(path, "must be positive")
+        return None
+    if not 0 <= value <= maximum:
+        v.arithmetic_error(path, f"outside unsigned {maximum.bit_length()}-bit range")
         return None
     return value
 
@@ -414,6 +425,9 @@ def _uint(value: Any, path: str, v: Validator, *, positive: bool = False) -> int
 def _integer(value: Any, path: str, v: Validator) -> int | None:
     if type(value) is not int:
         v.error(path, "must be an integer (booleans are not integers)")
+        return None
+    if not -(1 << 63) <= value < (1 << 63):
+        v.arithmetic_error(path, "exceeds signed 64-bit range")
         return None
     return value
 
@@ -457,8 +471,11 @@ def _eq(v: Validator, path: str, actual: Any, expected: Any) -> bool:
     return True
 
 
-def _sum(values: Iterable[int]) -> int:
-    return sum(values)
+def _checked_sum(values: Iterable[int], v: Validator, path: str) -> int:
+    total = sum(values)
+    if not 0 <= total <= U64_MAX:
+        v.arithmetic_error(path, "sum exceeds unsigned 64-bit range")
+    return total
 
 
 def _validate_config(value: Any, v: Validator, path: str, *, runtime: bool) -> dict[str, Any] | None:
@@ -745,8 +762,8 @@ def _validate_plan_fields(
             rate = _object(obj.get("rate"), f"{stream_path}.rate", {"numerator", "denominator"}, v)
             planned = _uint(obj.get("planned"), f"{stream_path}.planned", v)
             if rate is not None:
-                numerator = _uint(rate.get("numerator"), f"{stream_path}.rate.numerator", v)
-                denominator = _uint(rate.get("denominator"), f"{stream_path}.rate.denominator", v, positive=True)
+                numerator = _uint(rate.get("numerator"), f"{stream_path}.rate.numerator", v, maximum=U128_MAX)
+                denominator = _uint(rate.get("denominator"), f"{stream_path}.rate.denominator", v, positive=True, maximum=U128_MAX)
             else:
                 numerator = denominator = None
             if expected_streams is not None and index < len(expected_streams):
@@ -844,7 +861,7 @@ def _validate_histogram(value: Any, v: Validator, path: str, expected_high: int 
         for field in quantile_fields:
             if histogram.get(field) is None:
                 v.error(f"{path}.{field}", "missing for a non-empty representable histogram")
-    if samples == 0:
+    if samples == 0 and overflow == 0:
         for field in quantile_fields + ["max_us", "exact_max_us"]:
             if histogram.get(field) is not None:
                 v.error(f"{path}.{field}", "must be null when sample_count is zero")
@@ -853,6 +870,8 @@ def _validate_histogram(value: Any, v: Validator, path: str, expected_high: int 
     if any(left > right for left, right in zip(ordered, ordered[1:])):
         v.error(path, "quantiles must be monotonic")
     exact_max = histogram.get("exact_max_us")
+    if (samples > 0 or overflow > 0) and exact_max is None:
+        v.error(f"{path}.exact_max_us", "is required for a non-empty histogram")
     if (samples > 0 or overflow > 0) and histogram.get("max_us") != exact_max:
         v.error(path, "max_us must equal exact_max_us")
     if samples and not overflow and type(exact_max) is int and type(low) is int and type(digits) is int:
@@ -866,7 +885,7 @@ def _validate_histogram(value: Any, v: Validator, path: str, expected_high: int 
                 )
     if overflow and histogram.get("exact_max_us") is None:
         v.error(f"{path}.exact_max_us", "is required when overflow is present")
-    return samples
+    return _checked_sum((samples, overflow), v, path)
 
 
 def _validate_logical(
@@ -885,6 +904,7 @@ def _validate_logical(
     _string(obj.get("work_class"), f"{path}.work_class", v)
     _string(obj.get("resource"), f"{path}.resource", v, allow_none=True)
     _string(obj.get("first_error"), f"{path}.first_error", v, allow_none=True)
+    _eq(v, f"{path}.dropped_closed", obj.get("dropped_closed"), 0)
     logical_samples = _validate_histogram(obj.get("logical_latency"), v, f"{path}.logical_latency", expected_high)
     queue_samples = _validate_histogram(obj.get("queue_latency"), v, f"{path}.queue_latency", expected_high)
     terminal_before = (obj.get("succeeded_before_cutoff", 0) if type(obj.get("succeeded_before_cutoff")) is int else 0) + (obj.get("failed_before_cutoff", 0) if type(obj.get("failed_before_cutoff")) is int else 0)
@@ -903,17 +923,14 @@ def _validate_logical(
         expected_logical = (
             (obj.get("succeeded_before_cutoff", 0) if type(obj.get("succeeded_before_cutoff")) is int else 0)
             + (obj.get("failed_before_cutoff", 0) if type(obj.get("failed_before_cutoff")) is int else 0)
-            + (obj.get("timeout_before_cutoff", 0) if type(obj.get("timeout_before_cutoff")) is int else 0)
         )
         expected_queue = obj.get("started_before_cutoff", 0) if type(obj.get("started_before_cutoff")) is int else 0
     elif phase in {"preparation", "drain"}:
         expected_logical = (
             (obj.get("succeeded_before_cutoff", 0) if type(obj.get("succeeded_before_cutoff")) is int else 0)
             + (obj.get("failed_before_cutoff", 0) if type(obj.get("failed_before_cutoff")) is int else 0)
-            + (obj.get("timeout_before_cutoff", 0) if type(obj.get("timeout_before_cutoff")) is int else 0)
             + (obj.get("succeeded_after_cutoff", 0) if type(obj.get("succeeded_after_cutoff")) is int else 0)
             + (obj.get("failed_after_cutoff", 0) if type(obj.get("failed_after_cutoff")) is int else 0)
-            + (obj.get("timeout_after_cutoff", 0) if type(obj.get("timeout_after_cutoff")) is int else 0)
         )
         expected_queue = (
             (obj.get("started_before_cutoff", 0) if type(obj.get("started_before_cutoff")) is int else 0)
@@ -926,9 +943,9 @@ def _validate_logical(
             + (obj.get("started_after_cutoff", 0) if type(obj.get("started_after_cutoff")) is int else 0)
         )
     if type(logical_samples) is int and logical_samples != expected_logical:
-        v.error(f"{path}.logical_latency.sample_count", "must equal terminal outcome samples")
+        v.error(f"{path}.logical_latency", "sample_count + overflow must equal terminal outcomes")
     if type(queue_samples) is int and queue_samples != expected_queue:
-        v.error(f"{path}.queue_latency.sample_count", "must equal started outcome samples")
+        v.error(f"{path}.queue_latency", "sample_count + overflow must equal started outcomes")
     return obj
 
 
@@ -939,10 +956,11 @@ def _validate_queue(value: Any, v: Validator, path: str, expected_high: int | No
     _string(obj.get("work_class"), f"{path}.work_class", v)
     _string(obj.get("resource"), f"{path}.resource", v, allow_none=True)
     declared_samples = _uint(obj.get("sample_count"), f"{path}.sample_count", v)
-    samples = _validate_histogram(obj.get("latency"), v, f"{path}.latency", expected_high)
-    if declared_samples is not None and declared_samples != samples:
-        v.error(f"{path}.sample_count", "must equal latency.sample_count")
-    return samples
+    observations = _validate_histogram(obj.get("latency"), v, f"{path}.latency", expected_high)
+    latency = obj.get("latency")
+    if declared_samples is not None and isinstance(latency, dict):
+        _eq(v, f"{path}.sample_count", declared_samples, latency.get("sample_count"))
+    return observations
 
 
 def _validate_rpc(value: Any, v: Validator, path: str, expected_high: int | None) -> dict[str, Any] | None:
@@ -961,18 +979,18 @@ def _validate_rpc(value: Any, v: Validator, path: str, expected_high: int | None
     completed = obj.get("completed") if type(obj.get("completed")) is int else 0
     succeeded = obj.get("succeeded") if type(obj.get("succeeded")) is int else 0
     failed = obj.get("failed") if type(obj.get("failed")) is int else 0
-    if completed != succeeded + failed:
+    if completed != _checked_sum((succeeded, failed), v, path):
         v.error(path, "completed must equal succeeded + failed")
     if type(obj.get("timeout")) is int and obj["timeout"] > failed:
         v.error(f"{path}.timeout", "must be a failed subset")
     if type(obj.get("result_unknown")) is int and obj["result_unknown"] > failed:
         v.error(f"{path}.result_unknown", "must be a failed subset")
     if type(obj.get("payload_bytes")) is int and type(obj.get("request_payload_bytes")) is int and type(obj.get("response_payload_bytes")) is int:
-        if obj["payload_bytes"] != obj["request_payload_bytes"] + obj["response_payload_bytes"]:
+        if obj["payload_bytes"] != _checked_sum((obj["request_payload_bytes"], obj["response_payload_bytes"]), v, f"{path}.payload_bytes"):
             v.error(f"{path}.payload_bytes", "must equal request_payload_bytes + response_payload_bytes")
-    samples = _validate_histogram(obj.get("latency"), v, f"{path}.latency", expected_high)
-    if type(obj.get("completed")) is int and samples != obj["completed"]:
-        v.error(f"{path}.latency.sample_count", "must equal completed RPCs")
+    observations = _validate_histogram(obj.get("latency"), v, f"{path}.latency", expected_high)
+    if type(obj.get("completed")) is int and observations != obj["completed"]:
+        v.error(f"{path}.latency", "sample_count + overflow must equal completed RPCs")
     _ = method
     return obj
 
@@ -1091,6 +1109,8 @@ def _validate_plan_measurement_drain(
         "timeout_after_cutoff",
         "result_unknown_after_cutoff",
         "terminal_after_cutoff",
+        "canceled_queued",
+        "canceled_running",
     ]
     for identity, measurement_row in measurement_by_identity.items():
         drain_row = drain_by_identity.get(identity)
@@ -1107,6 +1127,43 @@ def _validate_plan_measurement_drain(
             v.error("report.drain.logical", f"has extra identity {identity!r}")
             ok = False
     return ok
+
+def _validate_histogram_total(total: Any, members: Iterable[Any], v: Validator, path: str) -> None:
+    if not isinstance(total, dict):
+        return
+    histograms = [item for item in members if isinstance(item, dict)]
+    for field in ["sample_count", "overflow"]:
+        counts = [item.get(field) for item in histograms]
+        if all(type(count) is int for count in counts):
+            expected = _checked_sum(counts, v, f"{path}.{field}")
+            _eq(v, f"{path}.{field}", total.get(field), expected)
+    maxima = [item["exact_max_us"] for item in histograms if type(item.get("exact_max_us")) is int]
+    expected_max = max(maxima, default=None)
+    for field in ["max_us", "exact_max_us"]:
+        _eq(v, f"{path}.{field}", total.get(field), expected_max)
+
+
+def _validate_phase_histograms(phase: Mapping[str, Any], v: Validator, path: str) -> None:
+    logical = phase.get("logical")
+    queue = phase.get("queue")
+    rpc = phase.get("rpc")
+    if isinstance(logical, list) and isinstance(queue, list):
+        for index, (row, queued) in enumerate(zip(logical, queue)):
+            if isinstance(row, dict) and isinstance(queued, dict):
+                _eq(v, f"{path}.queue[{index}].latency", queued.get("latency"), row.get("queue_latency"))
+    for rows, field, total in [
+        (logical, "logical_latency", "logical_total"),
+        (queue, "latency", "queue_total"),
+        (rpc, "latency", "rpc_total"),
+    ]:
+        if isinstance(rows, list):
+            _validate_histogram_total(
+                phase.get(total),
+                (row.get(field) for row in rows if isinstance(row, dict)),
+                v,
+                f"{path}.{total}",
+            )
+
 
 def _validate_phase_arrays(
     value: Any,
@@ -1171,29 +1228,7 @@ def _validate_phase_arrays(
     _validate_histogram(phase_obj.get("queue_total"), v, f"{path}.queue_total", logical_high)
     _validate_histogram(phase_obj.get("rpc_total"), v, f"{path}.rpc_total", rpc_high)
     timed_out = _boolean(phase_obj.get("timed_out"), f"{path}.timed_out", v)
-    if logical is not None and isinstance(phase_obj.get("logical_total"), dict):
-        total = phase_obj["logical_total"].get("sample_count")
-        stream_total = sum(
-            item.get("logical_latency", {}).get("sample_count", 0)
-            for item in logical
-            if isinstance(item, dict) and isinstance(item.get("logical_latency"), dict)
-        )
-        if type(total) is int and total != stream_total:
-            v.error(f"{path}.logical_total.sample_count", "must equal logical stream histogram samples")
-    if queue is not None and isinstance(phase_obj.get("queue_total"), dict):
-        total = phase_obj["queue_total"].get("sample_count")
-        stream_total = sum(item.get("sample_count", 0) for item in queue if isinstance(item, dict) and type(item.get("sample_count")) is int)
-        if type(total) is int and total != stream_total:
-            v.error(f"{path}.queue_total.sample_count", "must equal queue stream histogram samples")
-    if rpc is not None and isinstance(phase_obj.get("rpc_total"), dict):
-        total = phase_obj["rpc_total"].get("sample_count")
-        stream_total = sum(
-            item.get("latency", {}).get("sample_count", 0)
-            for item in rpc
-            if isinstance(item, dict) and isinstance(item.get("latency"), dict)
-        )
-        if type(total) is int and total != stream_total:
-            v.error(f"{path}.rpc_total.sample_count", "must equal RPC histogram samples")
+    _validate_phase_histograms(phase_obj, v, path)
     _ = timed_out
     return phase_obj
 
@@ -1435,8 +1470,14 @@ def _validate_bucket(value: Any, v: Validator, path: str, logical_high: int, rpc
         ("queue_latency", logical_high),
         ("rpc_latency", rpc_high),
     ]
+    events = {
+        "logical_latency": "logical_completed",
+        "queue_latency": "logical_started",
+        "rpc_latency": "rpc_completed",
+    }
     for field, expected_high in histogram_values:
-        _validate_histogram(bucket.get(field), v, f"{path}.{field}", expected_high)
+        observations = _validate_histogram(bucket.get(field), v, f"{path}.{field}", expected_high)
+        _eq(v, f"{path}.{field}.observations", observations, bucket.get(events[field]))
     if end <= start:
         for field in counter_fields:
             if type(bucket.get(field)) is int and bucket[field] != 0:
@@ -1473,11 +1514,11 @@ def _phase_conserved(rows: Sequence[Any], v: Validator, path: str) -> bool:
         full = row.get("dropped_full")
         closed = row.get("dropped_closed")
         if all(type(item) is int for item in [planned, offered, missed, not_offered]):
-            if planned != offered + missed + not_offered:
+            if planned != _checked_sum((offered, missed, not_offered), v, f"{path}[{index}].planned"):
                 v.error(f"{path}[{index}]", "planned != offered + missed_schedule + not_offered_after_stop")
                 ok = False
         if all(type(item) is int for item in [offered, accepted, full, closed]):
-            if offered != accepted + full + closed:
+            if offered != _checked_sum((accepted, full, closed), v, f"{path}[{index}].offered"):
                 v.error(f"{path}[{index}]", "offered != accepted + dropped_full + dropped_closed")
                 ok = False
     return ok
@@ -1485,25 +1526,35 @@ def _phase_conserved(rows: Sequence[Any], v: Validator, path: str) -> bool:
 
 def _cohort_conserved(rows: Sequence[Any], v: Validator, path: str) -> bool:
     ok = True
+    keys = [
+        "accepted", "started_before_cutoff", "started_after_cutoff",
+        "succeeded_before_cutoff", "failed_before_cutoff", "terminal_after_cutoff",
+        "canceled_queued", "canceled_running", "cutoff_queued", "cutoff_running",
+    ]
     for index, row in enumerate(rows):
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or not all(type(row.get(key)) is int for key in keys):
             continue
-        fields = [row.get(key) for key in ["accepted", "succeeded_before_cutoff", "failed_before_cutoff", "terminal_after_cutoff", "canceled_queued", "canceled_running"]]
-        if all(type(item) is int for item in fields):
-            if fields[0] != sum(fields[1:]):
-                v.error(f"{path}[{index}]", "accepted cohort is not conserved")
-                ok = False
-        cutoff_queued = row.get("cutoff_queued")
-        cutoff_running = row.get("cutoff_running")
-        if all(type(item) is int for item in [row.get("accepted"), row.get("started_before_cutoff"), cutoff_queued]):
-            if cutoff_queued != max(0, row["accepted"] - row["started_before_cutoff"]):
-                v.error(f"{path}[{index}].cutoff_queued", "does not match accepted - started_before_cutoff")
-                ok = False
-        terminal_before = (row.get("succeeded_before_cutoff", 0) if type(row.get("succeeded_before_cutoff")) is int else 0) + (row.get("failed_before_cutoff", 0) if type(row.get("failed_before_cutoff")) is int else 0)
-        if all(type(item) is int for item in [row.get("started_before_cutoff"), cutoff_running]):
-            if cutoff_running != max(0, row["started_before_cutoff"] - terminal_before):
-                v.error(f"{path}[{index}].cutoff_running", "does not match started_before_cutoff - terminal_before_cutoff")
-                ok = False
+        at = f"{path}[{index}]"
+        accepted = row["accepted"]
+        started = row["started_before_cutoff"]
+        after_started = row["started_after_cutoff"]
+        terminal = _checked_sum((row["succeeded_before_cutoff"], row["failed_before_cutoff"]), v, at)
+        after_terminal = row["terminal_after_cutoff"]
+        canceled_queued = row["canceled_queued"]
+        canceled_running = row["canceled_running"]
+        if not 0 <= terminal <= started <= accepted:
+            v.error(at, "requires terminal_before_cutoff <= started_before_cutoff <= accepted")
+            ok = False
+        if not 0 <= after_started <= accepted - started:
+            v.error(at, "started_after_cutoff exceeds the accepted unstarted cohort")
+            ok = False
+        outcomes = _checked_sum((terminal, after_terminal, canceled_queued, canceled_running), v, at)
+        ok = _eq(v, f"{at}.accepted", accepted, outcomes) and ok
+        starts = _checked_sum((started, after_started), v, at)
+        running_outcomes = _checked_sum((terminal, after_terminal, canceled_running), v, at)
+        ok = _eq(v, f"{at}.started_cohort", starts, running_outcomes) and ok
+        ok = _eq(v, f"{at}.cutoff_queued", row["cutoff_queued"], accepted - started) and ok
+        ok = _eq(v, f"{at}.cutoff_running", row["cutoff_running"], started - terminal) and ok
     return ok
 
 
@@ -1634,6 +1685,11 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
         _validate_histogram(measurement.get("queue_total"), v, "report.measurement.queue_total", logical_high)
         _validate_histogram(measurement.get("rpc_total"), v, "report.measurement.rpc_total", rpc_high)
         _validate_latency(measurement.get("latency"), v, "report.measurement.latency", logical_high, rpc_high)
+        _validate_phase_histograms(measurement, v, "report.measurement")
+        latency = measurement.get("latency")
+        if isinstance(latency, dict):
+            for field in ["logical_total", "queue_total", "rpc_total"]:
+                _eq(v, f"report.measurement.latency.{field}", latency.get(field), measurement.get(field))
         txn_started_rate = _number(measurement.get("txn_started_per_second"), "report.measurement.txn_started_per_second", v, allow_none=True)
         txn_completed_rate = _number(measurement.get("txn_completed_per_second"), "report.measurement.txn_completed_per_second", v, allow_none=True)
         cutoff = _object(measurement.get("cutoff"), "report.measurement.cutoff", CUTOFF_KEYS, v)
@@ -1658,8 +1714,14 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
                     expected_ns = None
                 if expected_ns is not None:
                     _eq(v, "report.measurement.cutoff.configured_ns", configured_ns, expected_ns)
-            expected_queued = sum(row.get("cutoff_queued", 0) for row in measurement_rows if isinstance(row, dict) and type(row.get("cutoff_queued")) is int)
-            expected_running = sum(row.get("cutoff_running", 0) for row in measurement_rows if isinstance(row, dict) and type(row.get("cutoff_running")) is int)
+            expected_queued = _checked_sum(
+                (row.get("cutoff_queued", 0) for row in measurement_rows if isinstance(row, dict) and type(row.get("cutoff_queued")) is int),
+                v, "report.measurement.cutoff.queued",
+            )
+            expected_running = _checked_sum(
+                (row.get("cutoff_running", 0) for row in measurement_rows if isinstance(row, dict) and type(row.get("cutoff_running")) is int),
+                v, "report.measurement.cutoff.running",
+            )
             _eq(v, "report.measurement.cutoff.queued", queued, expected_queued)
             _eq(v, "report.measurement.cutoff.running", running, expected_running)
         observed_ms = 0.0
@@ -1722,10 +1784,12 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
                 if bucket_sum(field) != expected:
                     v.error(f"report.measurement.buckets.{field}", "bucket sum does not match measurement report")
             for field, total_field in [("logical_latency", "logical_total"), ("queue_latency", "queue_total"), ("rpc_latency", "rpc_total")]:
-                total = measurement.get(total_field, {}).get("sample_count") if isinstance(measurement.get(total_field), dict) else None
-                samples = sum(row.get(field, {}).get("sample_count", 0) for row in bucket_rows if isinstance(row.get(field), dict))
-                if type(total) is int and samples != total:
-                    v.error(f"report.measurement.buckets.{field}", "bucket histogram samples do not match aggregate")
+                _validate_histogram_total(
+                    measurement.get(total_field),
+                    (row.get(field) for row in bucket_rows),
+                    v,
+                    f"report.measurement.buckets.{field}",
+                )
             if isinstance(measurement.get("rpc"), list):
                 txn_rpc = next(
                     (
@@ -1778,6 +1842,7 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
         _validate_histogram(drain.get("logical_total"), v, "report.drain.logical_total", logical_high)
         _validate_histogram(drain.get("queue_total"), v, "report.drain.queue_total", logical_high)
         _validate_histogram(drain.get("rpc_total"), v, "report.drain.rpc_total", rpc_high)
+        _validate_phase_histograms(drain, v, "report.drain")
         _validate_watch(drain.get("watch"), config_info["config"] if config_info else {}, (float(timing.get("observed_measurement_ms")) if timing and isinstance(timing.get("observed_measurement_ms"), (int, float)) else 0.0), v, "report.drain.watch")
         _validate_rpc_rates(
             drain_rpc,
@@ -1816,7 +1881,13 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
                 v.error(f"report.rpc.{method}", "completed RPCs exceed started RPCs across phases")
                 rpc_balanced = False
     no_active = cohort_ok and rpc_balanced
-    no_arithmetic = True
+    accounting = _object(root.get("accounting"), "report.accounting", ACCOUNTING_KEYS, v)
+    no_arithmetic = (
+        _boolean(accounting.get("no_arithmetic_overflow"), "report.accounting.no_arithmetic_overflow", v)
+        if accounting is not None else None
+    )
+    if no_arithmetic is False and status != "failed":
+        v.error("report.accounting.no_arithmetic_overflow", "false requires a failed experiment")
     overflow = False
     for phase_obj in [preparation, measurement, drain]:
         if not isinstance(phase_obj, dict):
@@ -1863,7 +1934,6 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
         and no_active
         and no_arithmetic
     )
-    accounting = _object(root.get("accounting"), "report.accounting", ACCOUNTING_KEYS, v)
     if accounting is not None:
         expected_accounting = {
             "planned_conserved": planned_ok,
@@ -1871,7 +1941,6 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
             "accepted_cohort_conserved": cohort_ok,
             "result_unknown_subset_failed": unknown_ok,
             "no_active_tokens": no_active,
-            "no_arithmetic_overflow": no_arithmetic,
             "measurement_complete": measurement_complete,
             "observation_complete": observation_complete,
             "histogram_overflow": overflow,
@@ -1908,6 +1977,7 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
                 )
     plan_checked = False
     if plan_doc is not None:
+        before_plan_errors = len(v.errors)
         plan_root = _object(plan_doc, "plan", PLAN_OUTPUT_KEYS, v)
         if plan_root is not None:
             plan_config_info = _validate_config(plan_root.get("resolved_config"), v, "plan.resolved_config", runtime=False)
@@ -1927,7 +1997,7 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
                     v.error("report.plan.update_rounding_deficit", "does not match optional plan artifact")
                 if report_plan.get("read_rounding_deficit") != plan_root.get("logical_plan", {}).get("read_rounding_deficit"):
                     v.error("report.plan.read_rounding_deficit", "does not match optional plan artifact")
-            plan_checked = not v.errors
+            plan_checked = len(v.errors) == before_plan_errors
     keyspace_checked = False
     keyspace_applicable = measurement_started and (
         isinstance(timing, dict) and timing.get("prepare_ms") is not None
@@ -1947,6 +2017,7 @@ def _validate_report(report: Any, exit_code: int, plan_doc: Any | None, keyspace
     v.check("schema", not any("unknown field" in error or "missing field" in error for error in v.errors))
     v.check("identity", not any(".work_class:" in error or ".resource:" in error or ".method:" in error for error in v.errors))
     v.check("conservation", planned_ok and offered_ok and cohort_ok and unknown_ok and rpc_balanced)
+    v.check("arithmetic", v.arithmetic_valid)
     v.check("cutoff", not any("cutoff" in error for error in v.errors))
     v.check("buckets", not any(".buckets" in error for error in v.errors))
     v.check("rates", not any("per_second" in error or ".rate" in error for error in v.errors))

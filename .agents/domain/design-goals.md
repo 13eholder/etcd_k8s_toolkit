@@ -96,12 +96,12 @@
 
 ## 结果可信性要求
 
-- 计划、投放、接受 cohort、阶段事件、桶和 HDR 样本分别可对账；跨 cutoff 的 RPC 可在 measurement 开始、drain 完成，单阶段 starts/completions 不强行相等。
-- logical 延迟从接受到终止，含排队；queue wait 从接受到开始；RPC 延迟只覆盖单次 attempt。取消不造完成样本，overflow/censored 不静默丢失。
+- 计划、投放、接受 cohort、阶段事件、桶和 HDR 观测分别可对账；跨 cutoff 的开始/完成合法，不强制 drain terminal 小于 drain starts。cutoff queued/running 是最终 cohort 残差，不是取消时间可追溯的实时快照，公式见 [设计说明](../../etcd_k8s_bench/DESIGN_zh.md#事件归属与守恒)。
+- logical 延迟从接受到终止，含排队；queue wait 从接受到开始；RPC 延迟只覆盖单次 attempt。可表示样本数与 overflow 之和对账对应事件；取消另列 censored，不造完成样本。成功/失败共用 HDR 不等于可重建 per-outcome 分布。
 - `timeout` 与 `result_unknown` 是可重叠的 failed 子集，不能相加。可变请求已发送但响应丢失时不盲重放。
 - Watch 只累计实际可观察区间，重连不抹去先前缺口；截止后的回收不能改写已冻结测量窗口。完整 relist 不在当前范围。
 - protobuf payload 不是 HTTP/2/TLS/网络字节；采样 RSS 峰值不是精确进程峰值。
-- checker 根据原始报告独立检查可见算术，不只相信 `accounting=true`；不复制计划编译算法或声称重算缺少原始计数的 HDR 分位数。
+- checker 根据原始报告独立检查可见算术与序列化类型范围，不只相信 `accounting=true`；内部历史算术状态仍是生产者声明，不能由最终 JSON 完整证明。副本和聚合标量应可核对，但不从摘要重算原始 HDR 分位数。
 
 ## 明确非目标
 

@@ -38,8 +38,7 @@ class InvocationError(Exception):
 class SignalState:
     def __init__(self) -> None:
         self.user_interrupt = False
-        self.forwarded_to_child = False
-        self.child: subprocess.Popen[bytes] | None = None
+        self.received_signals: list[str] = []
 HTTP_SCRAPE_BUDGET_SECONDS = 5.0
 HTTP_SCRAPE_POLL_SECONDS = 0.05
 HTTP_SCRAPE_TERMINATE_GRACE_SECONDS = 0.25
@@ -315,9 +314,14 @@ def _command_metadata(
     watchdog_triggered: bool = False,
     forced_kill: bool = False,
     error: str | None = None,
+    executed: bool = True,
+    interrupted: bool = False,
+    received_signals: list[str] | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "argv": list(argv),
+        "executed": executed,
         "exit_code": returncode,
         "elapsed_seconds": elapsed,
         "stdout_bytes": stdout_path.stat().st_size if stdout_path.exists() else 0,
@@ -325,10 +329,61 @@ def _command_metadata(
         "signal_sent": signal_sent or [],
         "watchdog_triggered": watchdog_triggered,
         "forced_kill": forced_kill,
+        "interrupted": interrupted,
+        "received_signals": received_signals or [],
     }
     if error is not None:
         result["error"] = error
+    if reason is not None:
+        result["reason"] = reason
     return result
+
+
+def _skipped_invocation(
+    argv: Sequence[str], output_dir: Path, stem: str, reason: str, state: SignalState,
+    *, stdout_suffix: str = ".stdout.txt",
+) -> dict[str, Any]:
+    metadata = _command_metadata(
+        argv, None, 0.0, output_dir / f"{stem}{stdout_suffix}", output_dir / f"{stem}.stderr.txt",
+        executed=False, interrupted=state.user_interrupt,
+        received_signals=list(state.received_signals), reason=reason,
+    )
+    _write_json(output_dir / f"{stem}-invocation.json", metadata)
+    return metadata
+
+
+def _wait_child(
+    process: subprocess.Popen[bytes], started: float, timeout: float, state: SignalState,
+    *, interrupt_after_seconds: float | None = None,
+) -> tuple[int, dict[str, Any]]:
+    signal_sent: list[str] = []
+    interrupt_attempted = False
+    watchdog_triggered = False
+    forced_kill = False
+    grace_deadline: float | None = None
+    while process.poll() is None:
+        now = time.monotonic()
+        elapsed = now - started
+        scheduled = interrupt_after_seconds is not None and elapsed >= interrupt_after_seconds
+        if elapsed >= timeout and not watchdog_triggered:
+            watchdog_triggered = True
+            grace_deadline = now + min(5.0, max(0.1, timeout * 0.25))
+        if (state.user_interrupt or scheduled or watchdog_triggered) and not interrupt_attempted:
+            interrupt_attempted = True
+            if _send_group(process, signal.SIGINT):
+                signal_sent.append("SIGINT")
+        if grace_deadline is not None and now >= grace_deadline and process.poll() is None:
+            forced_kill = True
+            if _send_group(process, signal.SIGKILL):
+                signal_sent.append("SIGKILL")
+            break
+        time.sleep(0.02)
+    return process.wait(), {
+        "signal_sent": signal_sent,
+        "watchdog_triggered": watchdog_triggered,
+        "forced_kill": forced_kill,
+        "interrupted": state.user_interrupt and "SIGINT" in signal_sent,
+    }
 
 
 def _run_capture(
@@ -336,46 +391,45 @@ def _run_capture(
     output_dir: Path,
     stem: str,
     timeout: float,
+    signal_state: SignalState,
     *,
     stdout_suffix: str = ".stdout.txt",
 ) -> dict[str, Any]:
+    if signal_state.user_interrupt:
+        return _skipped_invocation(argv, output_dir, stem, "interrupted before command", signal_state, stdout_suffix=stdout_suffix)
     stdout_path = output_dir / f"{stem}{stdout_suffix}"
     stderr_path = output_dir / f"{stem}.stderr.txt"
-    invocation_path = output_dir / f"{stem}-invocation.json"
     started = time.monotonic()
     returncode: int | None = None
     error: str | None = None
-    forced_kill = False
+    process: subprocess.Popen[bytes] | None = None
+    facts: dict[str, Any] = {}
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         try:
-            process = subprocess.Popen(
-                list(argv),
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                shell=False,
-                close_fds=True,
-                start_new_session=True,
-            )
-            try:
-                returncode = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                forced_kill = True
+            if not signal_state.user_interrupt:
+                process = subprocess.Popen(
+                    list(argv), stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                    shell=False, close_fds=True, start_new_session=True,
+                )
+                returncode, facts = _wait_child(process, started, timeout, signal_state)
+        except (OSError, RuntimeError) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if process is not None and process.poll() is None:
                 _send_group(process, signal.SIGKILL)
                 returncode = process.wait()
-                error = f"command exceeded timeout {timeout:.3f}s"
-        except OSError as exc:
-            error = f"{type(exc).__name__}: {exc}"
+                facts["forced_kill"] = True
+    if process is None:
+        stdout_path.unlink()
+        stderr_path.unlink()
+        if signal_state.user_interrupt and error is None:
+            return _skipped_invocation(argv, output_dir, stem, "interrupted before command launch", signal_state, stdout_suffix=stdout_suffix)
     metadata = _command_metadata(
-        argv,
-        returncode,
-        time.monotonic() - started,
-        stdout_path,
-        stderr_path,
-        forced_kill=forced_kill,
-        error=error,
+        argv, returncode, time.monotonic() - started, stdout_path, stderr_path,
+        executed=process is not None, error=error,
+        received_signals=list(signal_state.received_signals), **facts,
     )
-    _write_json(invocation_path, metadata)
+    _write_json(output_dir / f"{stem}-invocation.json", metadata)
     return metadata
 
 
@@ -394,80 +448,40 @@ def _run_benchmark(
     backend_metrics_url: str | None,
     signal_state: SignalState,
 ) -> dict[str, Any]:
+    if signal_state.user_interrupt:
+        return _skipped_invocation(argv, output_dir, "run", "interrupted before run", signal_state, stdout_suffix=".stdout.json")
     stdout_path = output_dir / "run.stdout.json"
     stderr_path = output_dir / "run.stderr.txt"
-    invocation_path = output_dir / "run-invocation.json"
     started = time.monotonic()
-    signal_state.forwarded_to_child = False
-    signal_sent: list[str] = []
-    watchdog_triggered = False
-    forced_kill = False
     returncode: int | None = None
     error: str | None = None
+    facts: dict[str, Any] = {}
     sampler_errors: list[str] = []
     sampler_stop = threading.Event()
     process: subprocess.Popen[bytes] | None = None
     sampler: MetricSampler | None = None
-    grace_deadline: float | None = None
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         try:
-            process = subprocess.Popen(
-                list(argv),
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                shell=False,
-                close_fds=True,
-                start_new_session=True,
-            )
-            signal_state.child = process
-            sampler = MetricSampler(
-                sampler_stop,
-                output_dir / "metrics.jsonl",
-                output_dir / "process.jsonl",
-                process.pid,
-                _metrics_url(metrics_listen),
-                backend_metrics_url,
-            )
-            sampler.start()
-            while process.poll() is None:
-                elapsed = time.monotonic() - started
-                if signal_state.user_interrupt and "SIGINT" not in signal_sent:
-                    if not signal_state.forwarded_to_child:
-                        _send_group(process, signal.SIGINT)
-                    signal_sent.append("SIGINT")
-                if (
-                    interrupt_after_seconds is not None
-                    and elapsed >= interrupt_after_seconds
-                    and "SIGINT" not in signal_sent
-                ):
-                    _send_group(process, signal.SIGINT)
-                    signal_sent.append("SIGINT")
-                if elapsed >= timeout_seconds and not watchdog_triggered:
-                    watchdog_triggered = True
-                    _send_group(process, signal.SIGINT)
-                    signal_sent.append("SIGINT")
-                    grace_deadline = time.monotonic() + min(5.0, max(0.1, timeout_seconds * 0.25))
-                if (
-                    grace_deadline is not None
-                    and time.monotonic() >= grace_deadline
-                    and process.poll() is None
-                ):
-                    forced_kill = True
-                    _send_group(process, signal.SIGKILL)
-                    break
-                time.sleep(0.02)
-            returncode = process.wait()
+            if not signal_state.user_interrupt:
+                process = subprocess.Popen(
+                    list(argv), stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                    shell=False, close_fds=True, start_new_session=True,
+                )
+                sampler = MetricSampler(
+                    sampler_stop, output_dir / "metrics.jsonl", output_dir / "process.jsonl",
+                    process.pid, _metrics_url(metrics_listen), backend_metrics_url,
+                )
+                sampler.start()
+                returncode, facts = _wait_child(
+                    process, started, timeout_seconds, signal_state,
+                    interrupt_after_seconds=interrupt_after_seconds,
+                )
         except (OSError, RuntimeError) as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
             sampler_stop.set()
             if sampler is not None:
-                sampler.join(
-                    timeout=HTTP_SCRAPE_BUDGET_SECONDS
-                    + HTTP_SCRAPE_TERMINATE_GRACE_SECONDS
-                    + 1.0
-                )
+                sampler.join(timeout=HTTP_SCRAPE_BUDGET_SECONDS + HTTP_SCRAPE_TERMINATE_GRACE_SECONDS + 1.0)
                 if sampler.is_alive():
                     sampler_errors.append("metrics/process sampler did not join")
                 elif sampler.error:
@@ -475,25 +489,25 @@ def _run_benchmark(
                 sampler_errors.extend(sampler.collection_errors)
             if process is not None and process.poll() is None:
                 _send_group(process, signal.SIGKILL)
-                process.wait()
-            signal_state.child = None
+                returncode = process.wait()
+                facts["forced_kill"] = True
     if sampler_errors:
         sampler_error = "; ".join(sampler_errors)
         error = sampler_error if error is None else f"{error}; {sampler_error}"
+    if process is None:
+        stdout_path.unlink()
+        stderr_path.unlink()
+        if signal_state.user_interrupt and error is None:
+            return _skipped_invocation(argv, output_dir, "run", "interrupted before run launch", signal_state, stdout_suffix=".stdout.json")
     metadata = _command_metadata(
-        argv,
-        returncode,
-        time.monotonic() - started,
-        stdout_path,
-        stderr_path,
-        signal_sent=signal_sent,
-        watchdog_triggered=watchdog_triggered,
-        forced_kill=forced_kill,
-        error=error,
+        argv, returncode, time.monotonic() - started, stdout_path, stderr_path,
+        executed=process is not None, error=error,
+        reason="benchmark spawn failed" if process is None else None,
+        received_signals=list(signal_state.received_signals), **facts,
     )
     metadata["collection_errors"] = sampler_errors
     metadata["metrics_scrape_outcomes"] = sampler.scrape_outcomes if sampler is not None else {}
-    _write_json(invocation_path, metadata)
+    _write_json(output_dir / "run-invocation.json", metadata)
     return metadata
 
 
@@ -502,11 +516,9 @@ def _install_signal_handlers(state: SignalState) -> dict[int, Any]:
 
     def handler(signum: int, _frame: Any) -> None:
         state.user_interrupt = True
-        if state.child is not None and not state.forwarded_to_child:
-            _send_group(state.child, signal.SIGINT)
-            state.forwarded_to_child = True
+        state.received_signals.append(signal.Signals(signum).name)
 
-    for signum in [signal.SIGINT]:
+    for signum in [signal.SIGINT, signal.SIGTERM]:
         previous[signum] = signal.getsignal(signum)
         signal.signal(signum, handler)
     return previous
@@ -624,6 +636,122 @@ def math_is_finite_nonnegative(value: float) -> bool:
     return isinstance(value, (int, float)) and value >= 0 and value != float("inf") and value != float("-inf") and value == value
 
 
+def _capture_failed(invocation: dict[str, Any]) -> bool:
+    return bool(
+        invocation.get("error")
+        or invocation.get("watchdog_triggered")
+        or invocation.get("forced_kill")
+        or (invocation.get("executed") and invocation.get("exit_code") != 0 and not invocation.get("interrupted"))
+    )
+
+
+def _collect(
+    args: argparse.Namespace, binary: Path, etcdctl: Path, config: Path,
+    output_dir: Path, state: SignalState,
+) -> int:
+    collection_errors: list[str] = []
+    command_timeout = max(1.0, min(float(args.timeout_seconds), 30.0))
+    endpoint_args = [
+        f"--endpoints={args.endpoint}",
+        f"--command-timeout={command_timeout:.3f}s",
+    ]
+    invocations: dict[str, dict[str, Any]] = {}
+    before_commands = [
+        ("etcdctl-version", [str(etcdctl), "version"]),
+        ("etcdctl-help", [str(etcdctl), "--help"]),
+        ("backend-status-before", [str(etcdctl), *endpoint_args, "endpoint", "status", "-w", "json"]),
+        ("backend-keyspace-before", [str(etcdctl), *endpoint_args, "get", "", "--from-key", "--limit=1", "-w", "json"]),
+    ]
+    for stem, command in before_commands:
+        invocation = _run_capture(command, output_dir, stem, command_timeout, state)
+        invocations[stem] = invocation
+        if _capture_failed(invocation):
+            collection_errors.append(f"{stem} failed")
+    plan = _run_capture(
+        [str(binary), "plan", "--config", str(output_dir / "input.json")],
+        output_dir, "plan", float(args.timeout_seconds), state, stdout_suffix=".stdout.json",
+    )
+    if _capture_failed(plan):
+        collection_errors.append("benchmark plan failed")
+    run_command = [
+        str(binary), "run", "--config", str(output_dir / "input.json"),
+        "--endpoint", args.endpoint, "--metrics-listen", args.metrics_listen,
+    ]
+    if state.user_interrupt or plan.get("exit_code") != 0 or _capture_failed(plan):
+        reason = "interrupted before run" if state.user_interrupt else "plan did not complete successfully"
+        run = _skipped_invocation(run_command, output_dir, "run", reason, state, stdout_suffix=".stdout.json")
+    else:
+        run = _run_benchmark(
+            run_command, output_dir, float(args.timeout_seconds), args.interrupt_after_seconds,
+            args.metrics_listen, args.backend_metrics_url, state,
+        )
+    if run.get("watchdog_triggered"):
+        collection_errors.append("benchmark watchdog triggered")
+    if run.get("forced_kill"):
+        collection_errors.append("benchmark process forcibly killed")
+    if run.get("error"):
+        collection_errors.append(f"benchmark collection: {run['error']}")
+    collection_errors.extend(str(error) for error in run.get("collection_errors", []))
+
+    skipped: dict[str, str] = {}
+    if not run.get("executed"):
+        skipped.update(metrics=run["reason"], process=run["reason"])
+    after_commands = [
+        ("backend-status-after", [str(etcdctl), *endpoint_args, "endpoint", "status", "-w", "json"]),
+        ("backend-keyspace-after", [str(etcdctl), *endpoint_args, "get", "", "--from-key", "--keys-only", "-w", "json"]),
+    ]
+    for stem, command in after_commands:
+        if not run.get("executed"):
+            invocation = _skipped_invocation(command, output_dir, stem, run["reason"], state)
+        else:
+            invocation = _run_capture(command, output_dir, stem, command_timeout, state)
+        invocations[stem] = invocation
+        if not invocation.get("executed"):
+            skipped[stem] = invocation.get("reason", "not executed")
+        if _capture_failed(invocation):
+            collection_errors.append(f"{stem} failed")
+
+    if not run.get("executed"):
+        check_result: dict[str, Any] = {
+            "report_valid": False, "experiment_status": None, "complete_evidence": False,
+            "errors": [], "checks": {},
+            "evidence": {"plan": "not_checked", "keyspace": "not_checked"},
+            "checked": False, "reason": run["reason"],
+        }
+    else:
+        try:
+            keyspace = invocations["backend-keyspace-after"]
+            check_result = check_report.check_paths(
+                output_dir / "run.stdout.json",
+                run["exit_code"] if type(run.get("exit_code")) is int else 255,
+                output_dir / "plan.stdout.json",
+                output_dir / "backend-keyspace-after.stdout.txt" if keyspace.get("exit_code") == 0 else None,
+            )
+        except (check_report.InputError, OSError, ValueError) as exc:
+            check_result = {
+                "report_valid": False, "experiment_status": None, "complete_evidence": False,
+                "errors": [f"checker: {exc}"], "checks": {},
+                "evidence": {"plan": "not_checked", "keyspace": "not_checked"},
+            }
+            collection_errors.append(f"checker failed: {exc}")
+    _write_json(output_dir / "check.json", check_result)
+    environment = _environment(
+        args, binary, etcdctl, config, output_dir,
+        invocations["etcdctl-version"], invocations["etcdctl-help"],
+        collection_errors, run.get("metrics_scrape_outcomes", {}),
+    )
+    environment["signals_received"] = list(state.received_signals)
+    environment["collection_skipped"] = skipped
+    _write_json(output_dir / "environment.json", environment)
+    if collection_errors:
+        return 1
+    if not run.get("executed"):
+        return 130 if state.user_interrupt else 1
+    if not check_result.get("report_valid"):
+        return 1
+    return run["exit_code"] if type(run.get("exit_code")) is int else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     try:
@@ -633,146 +761,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (InvocationError, OSError) as exc:
         print(f"run_synthetic: {exc}", file=sys.stderr)
         return 2
-
-    collection_errors: list[str] = []
-    command_timeout = max(1.0, min(float(args.timeout_seconds), 30.0))
-    endpoint_args = [
-        f"--endpoints={args.endpoint}",
-        f"--command-timeout={command_timeout:.3f}s",
-    ]
-    version_invocation = _run_capture([str(etcdctl), "version"], output_dir, "etcdctl-version", command_timeout)
-    help_invocation = _run_capture([str(etcdctl), "--help"], output_dir, "etcdctl-help", command_timeout)
-    for label, invocation in [("etcdctl version", version_invocation), ("etcdctl help", help_invocation)]:
-        if invocation.get("exit_code") != 0:
-            collection_errors.append(f"{label} failed")
-
-    status_before = _run_capture(
-        [str(etcdctl), *endpoint_args, "endpoint", "status", "-w", "json"],
-        output_dir,
-        "backend-status-before",
-        command_timeout,
-    )
-    keyspace_before = _run_capture(
-        [str(etcdctl), *endpoint_args, "get", "", "--from-key", "--limit=1", "-w", "json"],
-        output_dir,
-        "backend-keyspace-before",
-        command_timeout,
-    )
-    for label, invocation in [("backend status before", status_before), ("backend keyspace before", keyspace_before)]:
-        if invocation.get("exit_code") != 0:
-            collection_errors.append(f"{label} failed")
-
     state = SignalState()
     previous_handlers = _install_signal_handlers(state)
     try:
-        plan = _run_capture(
-            [str(binary), "plan", "--config", str(output_dir / "input.json")],
-            output_dir,
-            "plan",
-            float(args.timeout_seconds),
-            stdout_suffix=".stdout.json",
-        )
-        if plan.get("exit_code") != 0:
-            collection_errors.append("benchmark plan failed")
-        run = _run_benchmark(
-            [
-                str(binary),
-                "run",
-                "--config",
-                str(output_dir / "input.json"),
-                "--endpoint",
-                args.endpoint,
-                "--metrics-listen",
-                args.metrics_listen,
-            ],
-            output_dir,
-            float(args.timeout_seconds),
-            args.interrupt_after_seconds,
-            args.metrics_listen,
-            args.backend_metrics_url,
-            state,
-        )
+        return _collect(args, binary, etcdctl, config, output_dir, state)
+    except (OSError, RuntimeError) as exc:
+        print(f"run_synthetic: {exc}", file=sys.stderr)
+        return 1
     finally:
         _restore_signal_handlers(previous_handlers)
-
-    if run.get("watchdog_triggered"):
-        collection_errors.append("benchmark watchdog triggered")
-    if run.get("forced_kill"):
-        collection_errors.append("benchmark process forcibly killed")
-    run_collection_errors = run.get("collection_errors")
-    if isinstance(run_collection_errors, list):
-        collection_errors.extend(str(error) for error in run_collection_errors)
-
-    status_after = _run_capture(
-        [str(etcdctl), *endpoint_args, "endpoint", "status", "-w", "json"],
-        output_dir,
-        "backend-status-after",
-        command_timeout,
-    )
-    keyspace_after = _run_capture(
-        [
-            str(etcdctl),
-            *endpoint_args,
-            "get",
-            "",
-            "--from-key",
-            "--keys-only",
-            "-w",
-            "json",
-        ],
-        output_dir,
-        "backend-keyspace-after",
-        command_timeout,
-    )
-    for label, invocation in [("backend status after", status_after), ("backend keyspace after", keyspace_after)]:
-        if invocation.get("exit_code") != 0:
-            collection_errors.append(f"{label} failed")
-
-    _write_json(output_dir / "environment.json", _environment(
-        args,
-        binary,
-        etcdctl,
-        config,
-        output_dir,
-        version_invocation,
-        help_invocation,
-        collection_errors,
-        run.get("metrics_scrape_outcomes") if isinstance(run.get("metrics_scrape_outcomes"), dict) else {},
-    ))
-
-    check_result: dict[str, Any]
-    try:
-        plan_path: Path | None = (
-            output_dir / "plan.stdout.json" if plan.get("exit_code") == 0 else None
-        )
-        keyspace_path = (
-            output_dir / "backend-keyspace-after.stdout.txt"
-            if keyspace_after.get("exit_code") == 0
-            else None
-        )
-        check_result = check_report.check_paths(
-            output_dir / "run.stdout.json",
-            int(run["exit_code"]) if isinstance(run.get("exit_code"), int) else 255,
-            plan_path,
-            keyspace_path,
-        )
-    except (check_report.InputError, OSError, ValueError) as exc:
-        check_result = {
-            "report_valid": False,
-            "experiment_status": None,
-            "complete_evidence": False,
-            "errors": [f"checker: {exc}"],
-            "checks": {},
-            "evidence": {"plan": "not_checked", "keyspace": "not_checked"},
-        }
-        collection_errors.append(f"checker failed: {exc}")
-    _write_json(output_dir / "check.json", check_result)
-
-    if not check_result.get("report_valid"):
-        return 1
-    if collection_errors:
-        return 1
-    return int(run["exit_code"]) if isinstance(run.get("exit_code"), int) else 1
 
 
 if __name__ == "__main__":
