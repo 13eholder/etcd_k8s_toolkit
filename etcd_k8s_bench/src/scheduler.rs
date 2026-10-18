@@ -223,6 +223,26 @@ impl WorkItem {
             .map_err(|error| error.to_string())
     }
 
+    fn send_for_tick(
+        self,
+        permit: mpsc::Permit<'_, WorkItem>,
+        tick_end_ns: u64,
+    ) -> Result<DispatchOutcome, String> {
+        match self.accept_for_tick(tick_end_ns)? {
+            TokenAction::Applied => {
+                permit.send(self);
+                Ok(DispatchOutcome::Accepted)
+            }
+            TokenAction::RejectedAfterTick | TokenAction::RejectedAfterCutoff => {
+                Ok(DispatchOutcome::MissedToken)
+            }
+            TokenAction::RejectedAfterStop => Ok(DispatchOutcome::Stopped),
+            TokenAction::AlreadyFinalized => {
+                Err("measurement token finalized before admission".into())
+            }
+        }
+    }
+
     fn started(&self) -> Result<(), String> {
         self.token()
             .started()
@@ -1800,16 +1820,7 @@ fn dispatch_application_item(
             token,
         },
     };
-    match item.accept_for_tick(tick_end_ns)? {
-        TokenAction::Applied => {
-            permit.send(item);
-            Ok(DispatchOutcome::Accepted)
-        }
-        TokenAction::RejectedAfterTick => Ok(DispatchOutcome::MissedToken),
-        TokenAction::RejectedAfterCutoff => Ok(DispatchOutcome::MissedToken),
-        TokenAction::RejectedAfterStop => Ok(DispatchOutcome::Stopped),
-        TokenAction::AlreadyFinalized => Err("measurement token finalized before admission".into()),
-    }
+    item.send_for_tick(permit, tick_end_ns)
 }
 
 fn dispatch_periodic_item(
@@ -1860,16 +1871,7 @@ fn dispatch_periodic_item(
             return Err("measurement worker queue closed".into());
         }
     };
-    match item.accept_for_tick(tick_end_ns)? {
-        TokenAction::Applied => {
-            permit.send(item);
-            Ok(DispatchOutcome::Accepted)
-        }
-        TokenAction::RejectedAfterTick => Ok(DispatchOutcome::MissedToken),
-        TokenAction::RejectedAfterCutoff => Ok(DispatchOutcome::MissedToken),
-        TokenAction::RejectedAfterStop => Ok(DispatchOutcome::Stopped),
-        TokenAction::AlreadyFinalized => Err("measurement token finalized before admission".into()),
-    }
+    item.send_for_tick(permit, tick_end_ns)
 }
 
 fn skip_application_before(
@@ -1893,31 +1895,8 @@ fn skip_application_before(
 }
 
 fn periodic_event_lower_bound(plan: &CompiledPlan, at_ns: u64) -> usize {
-    let mut low = 0;
-    let mut high = plan.periodic_events.len();
-    while low < high {
-        let middle = low + (high - low) / 2;
-        if plan.periodic_events[middle].at_ns < at_ns {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    low
-}
-
-fn periodic_index_lower_bound(index: &[usize], position: usize) -> usize {
-    let mut low = 0;
-    let mut high = index.len();
-    while low < high {
-        let middle = low + (high - low) / 2;
-        if index[middle] < position {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    low
+    plan.periodic_events
+        .partition_point(|event| event.at_ns < at_ns)
 }
 
 fn periodic_counts_between(
@@ -1933,8 +1912,8 @@ fn periodic_counts_between(
         PeriodicKind::Compact,
     ] {
         let index = &plan.periodic_indexes[kind.index()];
-        let first = periodic_index_lower_bound(index, start);
-        let last = periodic_index_lower_bound(index, end);
+        let first = index.partition_point(|&position| position < start);
+        let last = index.partition_point(|&position| position < end);
         counts[kind.index()] =
             u64::try_from(last.saturating_sub(first)).map_err(|_| "periodic count exceeds u64")?;
     }

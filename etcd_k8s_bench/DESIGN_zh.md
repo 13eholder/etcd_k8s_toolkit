@@ -44,6 +44,8 @@
 
 1ms 投放窗口不能依赖 Tokio 向上取整的毫秒定时轮等待。投放在 `Runtime::block_on` 调用线程上直接等待，去掉独立定时线程加 Notify 的二次唤醒；单次 sleep 请求至多一个 tick 后协作式 yield，RPC timeout 等继续使用 Tokio。OS 实际睡眠可能超过请求时长，真正的调度停顿仍跳过过期 slots，不改变计划、计数或截止以伪装目标达标。CLI 默认使用 4 个 Tokio 执行器线程，保留 `TOKIO_WORKER_THREADS` 覆盖；不等同于配置的 128 个逻辑 worker。tick 目标使用固定有界栈空间，更新 key 复用分片计算结果，避免每 tick 分配和每更新重复构造。
 
+应用流与周期流共用最终 admission/send 路径，保证只有 token 的 tick/cutoff 检查通过后才发送到 worker；仍保留应用请求在取得队列许可后构造、周期请求在尝试取得许可前构造的顺序，不因去重改变背压或错误路径。周期事件与分类型索引使用标准库 `partition_point` 查找严格小于边界的区间，保持 tick 的半开窗口语义。生产连接与协议 fixture 共用 RPC 客户端构造逻辑，避免消息大小限制配置漂移。
+
 ## 事件归属与守恒
 
 measurement 为半开窗口 `[start, effective_cutoff)`，正好截止归 drain。admission、logical start/terminal、RPC start/completion 分别按真实事件时间归属，不能用一次入口时间代表后续事件。跨窗 RPC 在 measurement 开始、drain 完成是合法情况；阶段 starts/completions 不强行相等。

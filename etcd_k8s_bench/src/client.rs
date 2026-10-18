@@ -114,42 +114,24 @@ impl ClientError {
         if disposition == RequestDisposition::NotSent {
             return RetryDecision::NotSent;
         }
-        if self.is_timeout() {
-            return if method.is_mutable() {
-                RetryDecision::ResultUnknown
-            } else {
-                RetryDecision::Retry
+        let recoverable = self.is_timeout()
+            || match self {
+                Self::Transport(_) => true,
+                Self::Rpc(status) => matches!(
+                    status.code(),
+                    Code::Unavailable
+                        | Code::DeadlineExceeded
+                        | Code::ResourceExhausted
+                        | Code::Aborted
+                ),
             };
+        if !recoverable {
+            return RetryDecision::Stop;
         }
-        match self {
-            Self::Transport(_) if !method.is_mutable() => RetryDecision::Retry,
-            Self::Transport(_) => RetryDecision::ResultUnknown,
-            Self::Rpc(status) if !method.is_mutable() => {
-                if matches!(
-                    status.code(),
-                    Code::Unavailable
-                        | Code::DeadlineExceeded
-                        | Code::ResourceExhausted
-                        | Code::Aborted
-                ) {
-                    RetryDecision::Retry
-                } else {
-                    RetryDecision::Stop
-                }
-            }
-            Self::Rpc(status) => {
-                if matches!(
-                    status.code(),
-                    Code::Unavailable
-                        | Code::DeadlineExceeded
-                        | Code::ResourceExhausted
-                        | Code::Aborted
-                ) {
-                    RetryDecision::ResultUnknown
-                } else {
-                    RetryDecision::Stop
-                }
-            }
+        if method.is_mutable() {
+            RetryDecision::ResultUnknown
+        } else {
+            RetryDecision::Retry
         }
     }
 }
@@ -180,23 +162,9 @@ impl ClientBundle {
             .http2_adaptive_window(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
         let channel = endpoint.connect().await.map_err(ClientError::Transport)?;
-        let kv = KvClient::new(channel.clone())
-            .max_decoding_message_size(max_message_size)
-            .max_encoding_message_size(max_message_size);
-        let maintenance = MaintenanceClient::new(channel.clone())
-            .max_decoding_message_size(max_message_size)
-            .max_encoding_message_size(max_message_size);
-        let watch = GeneratedWatchClient::new(channel)
-            .max_decoding_message_size(max_message_size)
-            .max_encoding_message_size(max_message_size);
-        Ok(Self {
-            kv,
-            maintenance,
-            watch,
-        })
+        Ok(Self::from_channel(channel, max_message_size))
     }
 
-    #[cfg(test)]
     pub(crate) fn from_channel(channel: Channel, max_message_size: usize) -> Self {
         let kv = KvClient::new(channel.clone())
             .max_decoding_message_size(max_message_size)
