@@ -34,10 +34,7 @@ impl Kv for DelayedTxnFixture {
         Ok(Response::new(RangeResponse::default()))
     }
 
-    async fn put(
-        &self,
-        _request: Request<PutRequest>,
-    ) -> Result<Response<PutResponse>, Status> {
+    async fn put(&self, _request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         Ok(Response::new(PutResponse::default()))
     }
 
@@ -48,10 +45,7 @@ impl Kv for DelayedTxnFixture {
         Ok(Response::new(DeleteRangeResponse::default()))
     }
 
-    async fn txn(
-        &self,
-        _request: Request<TxnRequest>,
-    ) -> Result<Response<TxnResponse>, Status> {
+    async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
         let (response_sender, response_receiver) = oneshot::channel();
         let release = self.release.clone();
         let completed = self.completed.clone();

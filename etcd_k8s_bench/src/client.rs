@@ -136,7 +136,7 @@ impl ClientError {
     }
 }
 
-fn has_timeout_source(error: &(dyn StdError + 'static)) -> bool {
+pub(crate) fn has_timeout_source(error: &(dyn StdError + 'static)) -> bool {
     let mut source = Some(error);
     while let Some(error) = source {
         if error.downcast_ref::<tonic::TimeoutExpired>().is_some() {

@@ -159,6 +159,7 @@ Kubernetes journal 的 Get→point Watch 跟随与故障后约 1s 重建是另�
 - 只有合法 Created 打开当前 ready；提前 progress/event 不能替代。初始 `start_revision=0` 的 Created header 作为恢复基线，不当作已交付事件。
 - 有已交付 revision 时从 `last_revision+1` 恢复；尚无已交付事件时，初始 0 的订阅从保存的 Created header revision 本身恢复（不加 1），显式非零起点则沿用配置。不能简单在每次断线后用新 header 跳过历史。
 - Created/连接变化、恢复和取消受准备/有效测量截止/teardown deadline 约束；不自动 relist 补造完整性。
+- Watch 建流本地 timeout（`Cancelled` 且带 typed `tonic::TimeoutExpired` source）按可恢复 transport 处理，受同一阶段 deadline/退避约束；普通 Cancelled 及明确 semantic terminal 不放开重试，准备期终态直接使准备失败。
 
 ### WatchResponse 与事件
 
@@ -173,7 +174,7 @@ Kubernetes journal 的 Get→point Watch 跟随与故障后约 1s 重建是另�
 
 测量期断线/semantic terminal 形成覆盖缺口，其他压力继续；重连不能清除已有缺口。Kubernetes 的完整 reflector/relist 行为不是 bench 的恢复保证。
 
-最终 per-run Watch `payload_bytes` 由 [MeasurementRecorder::watch_response](../../etcd_k8s_bench/src/measurement.rs) 累加 `Event.encoded_len()`，不含外层 WatchResponse/header/transport。`watch.rs` 的局部 `event_bytes` 以及 proxy detail 日志另有 key/value 字节统计，不能混作同一口径。
+最终 per-run Watch `payload_bytes` 由 [MeasurementRecorder::watch_response](../../etcd_k8s_bench/src/measurement.rs) 累加 `Event.encoded_len()`，不含外层 WatchResponse/header/transport。bench 不维护第二套局部 key/value 字节累加；proxy detail 日志仍有自己的 key/value 字节口径，不能混作同一指标。
 
 ## LeaseGrant 与 native TTL
 

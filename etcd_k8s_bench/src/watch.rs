@@ -8,7 +8,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Code, Status};
 
-use crate::client::ClientBundle;
+use crate::client::{ClientBundle, has_timeout_source};
 use crate::config::WatchSpec;
 use crate::measurement::{
     MeasurementRecorder, WATCH_TERMINAL_CANCELED, WATCH_TERMINAL_COMPACTED,
@@ -17,7 +17,6 @@ use crate::measurement::{
 use crate::pb::etcdserverpb::{
     WatchCancelRequest, WatchCreateRequest, WatchRequest, WatchResponse, watch_request,
 };
-use crate::pb::mvccpb;
 
 type WatchResponseStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
 /// A shared absolute deadline used only while opening or reconnecting a watch.
@@ -110,7 +109,6 @@ pub struct WatchState {
     pub last_revision: i64,
     pub watch_id: i64,
     pub event_count: u64,
-    pub event_bytes: u64,
     pub reconnects: u64,
     /// Whether `watch_id` belongs to the currently established substream.
     watch_id_valid: bool,
@@ -176,10 +174,9 @@ impl WatchState {
                 .unwrap_or(0);
             self.last_revision = self.last_revision.max(delivered);
         }
-        for event in &response.events {
-            self.event_count = self.event_count.saturating_add(1);
-            self.event_bytes = self.event_bytes.saturating_add(event_bytes(event));
-        }
+        self.event_count = self
+            .event_count
+            .saturating_add(response.events.len() as u64);
         None
     }
 
@@ -198,17 +195,6 @@ impl WatchState {
             }
         }
     }
-}
-
-fn event_bytes(event: &mvccpb::Event) -> u64 {
-    event
-        .kv
-        .as_ref()
-        .map_or(0, |kv| (kv.key.len() + kv.value.len()) as u64)
-        + event
-            .prev_kv
-            .as_ref()
-            .map_or(0, |kv| (kv.key.len() + kv.value.len()) as u64)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -486,10 +472,11 @@ fn context_canceled(
 }
 
 fn is_recoverable_disconnect(status: &Status) -> bool {
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Unknown | Code::DeadlineExceeded
-    )
+    has_timeout_source(status)
+        || matches!(
+            status.code(),
+            Code::Unavailable | Code::Unknown | Code::DeadlineExceeded
+        )
 }
 
 const ETCD_NO_LEADER_MESSAGE: &str = "etcdserver: no leader";

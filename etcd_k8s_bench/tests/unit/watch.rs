@@ -1,13 +1,108 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
+use tonic::{Request, Response, Streaming};
 
 use super::*;
 use crate::measurement::MeasurementRecorder;
 use crate::pb::etcdserverpb::ResponseHeader;
+use crate::pb::etcdserverpb::watch_server::{Watch, WatchServer};
+use crate::pb::mvccpb;
 use crate::plan::CompiledPlan;
+
+#[derive(Clone)]
+struct OpenTimeoutFixture {
+    opens: Arc<AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl Watch for OpenTimeoutFixture {
+    type WatchStream = WatchResponseStream;
+
+    async fn watch(
+        &self,
+        request: Request<Streaming<WatchRequest>>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let mut requests = request.into_inner();
+        let _ = requests.message().await?;
+        if self.opens.fetch_add(1, Ordering::AcqRel) == 0 {
+            return std::future::pending().await;
+        }
+        Ok(Response::new(Box::pin(
+            tokio_stream::once(Ok(WatchResponse {
+                created: true,
+                watch_id: 1,
+                header: Some(ResponseHeader {
+                    revision: 7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .chain(tokio_stream::pending()),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn test_watch_endpoint_timeout_reconnects_and_becomes_ready() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = OpenTimeoutFixture {
+        opens: opens.clone(),
+    };
+    let (server_stop, stopped) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(WatchServer::new(fixture))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let client = ClientBundle::connect(
+        &format!("http://{address}"),
+        Duration::from_secs(1),
+        64 * 1024 * 1024,
+    )
+    .await
+    .unwrap();
+    let recorder = MeasurementRecorder::new(&recorder_plan()).unwrap();
+    let (shutdown, shutdown_rx) = shutdown_channel::channel(false);
+    let (ready, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(run_with_recorder(
+        client,
+        spec(),
+        shutdown_rx,
+        ready,
+        recorder,
+        0,
+        WatchDeadline::new(),
+    ));
+    let readiness = tokio::time::timeout(Duration::from_secs(5), ready_rx).await;
+    let _ = shutdown.send(true);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server_stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(readiness.is_ok_and(|ready| ready.is_ok()));
+    assert_eq!(outcome.terminal, WatchTerminal::ContextCanceled);
+    assert!(outcome.state.reconnects >= 1);
+    assert!(opens.load(Ordering::Acquire) >= 2);
+}
 
 #[derive(Clone)]
 struct FakeWatchClient {
@@ -30,8 +125,7 @@ impl WatchConnector for FakeWatchClient {
     {
         tokio::pin!(requests);
         let request = requests.next().await.expect("create request");
-        let Some(watch_request::RequestUnion::CreateRequest(create)) = request.request_union
-        else {
+        let Some(watch_request::RequestUnion::CreateRequest(create)) = request.request_union else {
             panic!("first request must create watch");
         };
         self.starts.lock().await.push(create.start_revision);
@@ -1015,8 +1109,7 @@ fn test_watch_prefix_end() {
 #[test]
 fn test_watch_requests_match_spec() {
     let create = create_request(&spec(), 9);
-    let watch_request::RequestUnion::CreateRequest(request) = create.request_union.unwrap()
-    else {
+    let watch_request::RequestUnion::CreateRequest(request) = create.request_union.unwrap() else {
         panic!("expected WatchCreateRequest")
     };
     assert_eq!(request.key, b"/registry/pods");
@@ -1026,8 +1119,7 @@ fn test_watch_requests_match_spec() {
     assert!(request.progress_notify);
 
     let cancel = cancel_request(3);
-    let watch_request::RequestUnion::CancelRequest(request) = cancel.request_union.unwrap()
-    else {
+    let watch_request::RequestUnion::CancelRequest(request) = cancel.request_union.unwrap() else {
         panic!("expected WatchCancelRequest")
     };
     assert_eq!(request.watch_id, 3);
@@ -1115,4 +1207,3 @@ fn test_watch_revision_advance() {
     });
     assert_eq!(delete_state.last_revision, 15);
 }
-

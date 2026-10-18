@@ -1298,7 +1298,7 @@ impl MeasurementRecorder {
                     .clock
                     .effective_cutoff_ns
                     .unwrap_or(state.clock.configured_cutoff_ns);
-                self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+                self.freeze_cutoff(&mut state, cutoff)?;
                 Phase::Drain
             }
             Phase::Drain | Phase::Finished => Phase::Drain,
@@ -1521,7 +1521,7 @@ impl MeasurementRecorder {
             .measurement_ns
             .unwrap_or(0)
             .min(state.clock.configured_cutoff_ns);
-        self.freeze_cutoff(&mut state, sample.run_ns, effective_ns)?;
+        self.freeze_cutoff(&mut state, effective_ns)?;
         Ok(Cutoff {
             configured_ns: state.clock.configured_cutoff_ns,
             effective_ns,
@@ -1544,7 +1544,7 @@ impl MeasurementRecorder {
                 .measurement_ns
                 .unwrap_or(0)
                 .min(state.clock.configured_cutoff_ns);
-            self.freeze_cutoff(&mut state, sample.run_ns, effective_ns)?;
+            self.freeze_cutoff(&mut state, effective_ns)?;
         }
         if state.active_tokens != 0 {
             return Err(MeasurementError::ActiveTokens(state.active_tokens));
@@ -1578,10 +1578,7 @@ impl MeasurementRecorder {
                         .measurement_ns
                         .unwrap_or(0)
                         .min(state.clock.configured_cutoff_ns);
-                    if self
-                        .freeze_cutoff(&mut state, sample.run_ns, effective_ns)
-                        .is_err()
-                    {
+                    if self.freeze_cutoff(&mut state, effective_ns).is_err() {
                         state.arithmetic_overflow = true;
                     }
                 }
@@ -1662,7 +1659,7 @@ impl MeasurementRecorder {
             let measurement_ns = sample.measurement_ns.unwrap_or(0);
             let cutoff = state.clock.configured_cutoff_ns;
             if measurement_ns >= cutoff {
-                self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+                self.freeze_cutoff(&mut state, cutoff)?;
                 Self::add(&mut state.measurement.logical[index].missed_schedule, 1)?;
                 if let Some(metrics) = &self.inner.metrics {
                     metrics.record_logical_missed_schedule(phase.as_str(), index, 1);
@@ -1718,7 +1715,7 @@ impl MeasurementRecorder {
             .effective_cutoff_ns
             .unwrap_or(state.clock.configured_cutoff_ns);
         if measurement_ns >= cutoff {
-            self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+            self.freeze_cutoff(&mut state, cutoff)?;
             let normal_cutoff =
                 state.clock.effective_cutoff_ns == Some(state.clock.configured_cutoff_ns);
             let counter = if normal_cutoff {
@@ -1783,7 +1780,7 @@ impl MeasurementRecorder {
                 .measurement_ns
                 .unwrap_or(0)
                 .min(state.clock.configured_cutoff_ns);
-            self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+            self.freeze_cutoff(&mut state, cutoff)?;
         }
         if state.phase() != Phase::Drain && state.phase() != Phase::Finished {
             return Err(MeasurementError::InvalidPhase(
@@ -1816,7 +1813,7 @@ impl MeasurementRecorder {
                     .effective_cutoff_ns
                     .unwrap_or(state.clock.configured_cutoff_ns);
                 if measurement_ns >= cutoff {
-                    self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+                    self.freeze_cutoff(&mut state, cutoff)?;
                     (Phase::Drain, method.index())
                 } else {
                     (Phase::Measurement, method.index())
@@ -1890,12 +1887,19 @@ impl MeasurementRecorder {
     fn freeze_cutoff(
         &self,
         state: &mut MeasurementState,
-        run_ns: u64,
         effective_ns: u64,
     ) -> Result<(), MeasurementError> {
         if state.clock.effective_cutoff_ns.is_none() {
+            let start = state.clock.measurement_start.ok_or_else(|| {
+                MeasurementError::InvalidPhase("cutoff requires a measurement start".into())
+            })?;
+            let start_run_ns = u64::try_from(start.duration_since(state.clock.start).as_nanos())
+                .map_err(|_| MeasurementError::ClockOverflow)?;
+            let drain_start_ns = start_run_ns
+                .checked_add(effective_ns)
+                .ok_or(MeasurementError::ClockOverflow)?;
             state.clock.effective_cutoff_ns = Some(effective_ns);
-            state.clock.drain_start_ns = Some(run_ns);
+            state.clock.drain_start_ns = Some(drain_start_ns);
             for watch in &mut state.watch {
                 if watch.measurement_connected_since_ns != WatchData::INACTIVE {
                     watch.storage.observable_duration_ns =
@@ -2406,20 +2410,10 @@ impl MeasurementRecorder {
         }
         let counter = &mut state.phase_data_mut(token.stream.phase).logical[token.stream.index];
         Self::add(&mut counter.offered, 1)?;
-        if reason == DropReason::Backpressure {
-            Self::add(&mut counter.dropped_full, 1)?;
-        } else {
-            Self::add(&mut counter.dropped_closed, 1)?;
-        }
+        Self::add(&mut counter.dropped_full, 1)?;
         if let Some(metrics) = &self.inner.metrics {
             metrics.record_logical_offered(token.stream.phase.as_str(), token.stream.index, 1);
-            if reason == DropReason::Backpressure {
-                metrics.record_logical_dropped_full(
-                    token.stream.phase.as_str(),
-                    token.stream.index,
-                    1,
-                );
-            }
+            metrics.record_logical_dropped_full(token.stream.phase.as_str(), token.stream.index, 1);
         }
         if token.stream.phase == Phase::Measurement {
             if let Some(bucket) = self.bucket_mut(&mut state, sample.measurement_ns.unwrap_or(0)) {
@@ -2675,7 +2669,7 @@ impl MeasurementRecorder {
                 if measurement_ns < cutoff {
                     (Phase::Measurement, true)
                 } else {
-                    self.freeze_cutoff(&mut state, sample.run_ns, cutoff)?;
+                    self.freeze_cutoff(&mut state, cutoff)?;
                     (Phase::Drain, false)
                 }
             }
@@ -3042,7 +3036,7 @@ fn logical_report(
         offered: counter.offered,
         accepted: counter.accepted,
         dropped_full: counter.dropped_full,
-        dropped_closed: counter.dropped_closed,
+        dropped_closed: 0,
         missed_schedule: counter.missed_schedule,
         not_offered_after_stop: counter.not_offered_after_stop,
         started_before_cutoff: counter.started_before_cutoff,

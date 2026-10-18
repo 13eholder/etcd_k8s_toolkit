@@ -294,7 +294,6 @@ pub struct CounterStorage {
     pub offered: u64,
     pub accepted: u64,
     pub dropped_full: u64,
-    pub dropped_closed: u64,
     pub missed_schedule: u64,
     pub not_offered_after_stop: u64,
     pub started_before_cutoff: u64,

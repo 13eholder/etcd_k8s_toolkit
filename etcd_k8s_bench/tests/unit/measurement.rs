@@ -57,11 +57,9 @@ fn small_plan() -> CompiledPlan {
 fn test_fractional_watch_coverage_and_zero_window_report() {
     let plan = std::sync::Arc::new(small_plan());
     let build_report = |clock: Arc<TestClock>, cutoff_ns: u64| {
-        let recorder = MeasurementRecorder::with_clock(
-            &plan,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
         record_preparation(&recorder, &plan);
         recorder.start_measurement().unwrap();
         for index in 0..plan.watch_specs().len() {
@@ -348,6 +346,26 @@ fn test_drain_timing_excludes_watch_teardown() {
 }
 
 #[test]
+fn test_late_cutoff_freeze_preserves_drain_elapsed() {
+    for (stop_ns, expected_cutoff) in [(40_000_000, 40_000_000), (130_000_000, 100_000_000)] {
+        let clock = TestClock::new();
+        let recorder = make_recorder(&clock);
+        clock.set(200_000_000);
+        recorder.start_measurement().unwrap();
+        clock.set(200_000_000 + stop_ns);
+        let cutoff = recorder.stop_measurement().unwrap();
+        assert_eq!(cutoff.effective_ns, expected_cutoff);
+        clock.set(400_000_000);
+        recorder.begin_watch_teardown().unwrap();
+        clock.set(450_000_000);
+        recorder.end_watch_teardown().unwrap();
+        let report = recorder.finish().unwrap();
+        assert_eq!(report.timing.drain_ns, Some(200_000_000 - expected_cutoff));
+        assert_eq!(report.timing.watch_teardown_ns, Some(50_000_000));
+    }
+}
+
+#[test]
 fn test_cutoff_classify() {
     let clock = TestClock::new();
     let plan = small_plan_with(10, 100, 10);
@@ -481,8 +499,7 @@ fn test_normal_cutoff_rejection_keeps_remaining_slots_missed() {
         .logical_streams
         .iter()
         .find(|stream| {
-            stream.work_class == LogicalWorkClass::Update
-                && stream.resource == ResourceKind::Pods
+            stream.work_class == LogicalWorkClass::Update && stream.resource == ResourceKind::Pods
         })
         .unwrap()
         .planned;
@@ -493,10 +510,7 @@ fn test_normal_cutoff_rejection_keeps_remaining_slots_missed() {
         .unwrap()
         .planned;
     recorder
-        .record_missed_schedule_before_cutoff(
-            application,
-            application_planned.saturating_sub(1),
-        )
+        .record_missed_schedule_before_cutoff(application, application_planned.saturating_sub(1))
         .unwrap();
     recorder
         .record_missed_schedule_before_cutoff(periodic, periodic_planned.saturating_sub(1))
@@ -564,11 +578,9 @@ fn test_cutoff_boundaries() {
     ] {
         let clock = TestClock::new();
         let plan = small_plan_with(10, 100, 10);
-        let recorder = MeasurementRecorder::with_clock(
-            &plan,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
         recorder.start_measurement().unwrap();
 
         clock.set(at_ns);
@@ -613,11 +625,9 @@ fn test_cutoff_boundaries() {
     ] {
         let clock = TestClock::new();
         let plan = small_plan_with(10, 100, 10);
-        let recorder = MeasurementRecorder::with_clock(
-            &plan,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
         recorder.start_measurement().unwrap();
         let token = match recorder.offer(stream).unwrap() {
             OfferResult::Token(token) => token,
@@ -656,11 +666,9 @@ fn test_cutoff_boundaries() {
     ] {
         let clock = TestClock::new();
         let plan = small_plan_with(10, 100, 10);
-        let recorder = MeasurementRecorder::with_clock(
-            &plan,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
         recorder.start_measurement().unwrap();
         let attempt = recorder.start_rpc_with_payload(RpcMethod::Txn, 7).unwrap();
         clock.set(at_ns);
@@ -690,11 +698,9 @@ fn test_cutoff_boundaries() {
     ] {
         let clock = TestClock::new();
         let plan = small_plan_with(10, 100, 10);
-        let recorder = MeasurementRecorder::with_clock(
-            &plan,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
         recorder.start_measurement().unwrap();
         let token = match recorder.offer(stream).unwrap() {
             OfferResult::Token(token) => token,
@@ -739,11 +745,9 @@ fn test_cutoff_queued_running() {
     for running in [false, true] {
         let clock = TestClock::new();
         let plan = small_plan_with(10, 100, 10);
-        let recorder = MeasurementRecorder::with_clock(
-            &plan,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap();
+        let recorder =
+            MeasurementRecorder::with_clock(&plan, Arc::clone(&clock) as Arc<dyn MonotonicClock>)
+                .unwrap();
         recorder.start_measurement().unwrap();
         let token = match recorder.offer(stream).unwrap() {
             OfferResult::Token(token) => token,

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::time::Instant;
 
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
@@ -20,8 +21,8 @@ use crate::pb::etcdserverpb::{
     AlarmRequest, AlarmResponse, CompactionRequest, CompactionResponse, DefragmentRequest,
     DefragmentResponse, DeleteRangeRequest, DeleteRangeResponse, HashKvRequest, HashKvResponse,
     HashRequest, HashResponse, MoveLeaderRequest, MoveLeaderResponse, PutRequest, PutResponse,
-    RangeResponse, ResponseHeader, ResponseOp, SnapshotRequest, SnapshotResponse,
-    StatusRequest, StatusResponse, TxnRequest, TxnResponse, WatchRequest, WatchResponse,
+    RangeResponse, ResponseHeader, ResponseOp, SnapshotRequest, SnapshotResponse, StatusRequest,
+    StatusResponse, TxnRequest, TxnResponse, WatchRequest, WatchResponse,
 };
 use crate::pb::mvccpb::KeyValue;
 use crate::plan::{CompiledPlan, DEFAULT_SYNTHETIC_CONFIG};
@@ -50,11 +51,151 @@ fn small_plan() -> CompiledPlan {
     CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap()
 }
 
+struct ExecutorEventClock {
+    origin: Instant,
+    ticks: AtomicU64,
+}
+
+impl MonotonicClock for ExecutorEventClock {
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_nanos(self.ticks.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+}
+
 fn executor_recorder() -> MeasurementRecorder {
     let plan = small_plan();
-    let recorder = MeasurementRecorder::new(&plan).unwrap();
+    let recorder = MeasurementRecorder::with_clock(
+        &plan,
+        Arc::new(ExecutorEventClock {
+            origin: Instant::now(),
+            ticks: AtomicU64::new(0),
+        }),
+    )
+    .unwrap();
     recorder.start_measurement().unwrap();
     recorder
+}
+
+#[derive(Clone, Default)]
+struct RetryRangeFixture {
+    calls: Arc<AtomicUsize>,
+    second: Arc<Notify>,
+    release_second: Arc<Notify>,
+    third: Arc<Notify>,
+}
+
+#[tonic::async_trait]
+impl Kv for RetryRangeFixture {
+    async fn range(
+        &self,
+        _request: Request<RangeRequest>,
+    ) -> Result<Response<RangeResponse>, Status> {
+        match self.calls.fetch_add(1, AtomicOrdering::AcqRel) {
+            0 => Err(Status::unavailable("first read failed")),
+            1 => {
+                self.second.notify_one();
+                self.release_second.notified().await;
+                Err(Status::unavailable("second read failed"))
+            }
+            _ => {
+                self.third.notify_one();
+                std::future::pending().await
+            }
+        }
+    }
+
+    async fn put(&self, _request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        Err(Status::unimplemented("unused by read budget fixture"))
+    }
+
+    async fn delete_range(
+        &self,
+        _request: Request<DeleteRangeRequest>,
+    ) -> Result<Response<DeleteRangeResponse>, Status> {
+        Err(Status::unimplemented("unused by read budget fixture"))
+    }
+
+    async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+        Err(Status::unimplemented("unused by read budget fixture"))
+    }
+
+    async fn compact(
+        &self,
+        _request: Request<CompactionRequest>,
+    ) -> Result<Response<CompactionResponse>, Status> {
+        Err(Status::unimplemented("unused by read budget fixture"))
+    }
+}
+
+#[tokio::test]
+async fn test_range_retry_budget_uses_the_paused_clock() {
+    let fixture = RetryRangeFixture::default();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = fixture.clone();
+    let (shutdown, stopped) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(KvServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let client = ClientBundle::from_channel(channel, 64 * 1024 * 1024);
+    // Keep auto-advance off during I/O. Only the explicit advance below may
+    // consume the first half of the operation budget.
+    let (release_clock, held_clock) = std::sync::mpsc::channel::<()>();
+    let (parked, ready) = oneshot::channel();
+    let clock_guard = tokio::task::spawn_blocking(move || {
+        let _ = parked.send(());
+        let _ = held_clock.recv_timeout(Duration::from_secs(10));
+    });
+    ready.await.unwrap();
+    time::pause();
+    let started = TokioInstant::now();
+    let recorder = executor_recorder();
+    let operation_recorder = recorder.clone();
+    let operation = tokio::spawn(async move {
+        execute_range(
+            &client,
+            RangeRequest {
+                key: b"k".to_vec(),
+                ..Default::default()
+            },
+            RangeSelector::All { target: None },
+            Duration::from_secs(60),
+            Arc::new(AtomicI64::new(0)),
+            &operation_recorder,
+        )
+        .await
+    });
+    fixture.second.notified().await;
+    time::advance(Duration::from_secs(30)).await;
+    fixture.release_second.notify_one();
+    fixture.third.notified().await;
+    drop(release_clock);
+    clock_guard.await.unwrap();
+    let result = operation.await.unwrap().unwrap_err();
+    assert_eq!(result.outcome, Outcome::Timeout);
+    assert!(
+        TokioInstant::now().duration_since(started)
+            <= Duration::from_secs(60) + Duration::from_millis(1)
+    );
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    recorder.stop_measurement().unwrap();
+    let report = recorder.finish().unwrap();
+    let rpc = &report.measurement.rpc[crate::measurement::RpcMethod::Range.index()];
+    assert_eq!(rpc.started, 3);
+    assert_eq!(rpc.completed, 3);
+    assert_eq!(rpc.failed, 3);
+    assert_eq!(rpc.timeout, 1);
 }
 
 fn record_test_preparation(recorder: &MeasurementRecorder, plan: &CompiledPlan) {
@@ -202,17 +343,15 @@ fn compact_response(revision: i64, succeeded: bool, version: i64, value: &[u8]) 
         } else {
             vec![ResponseOp {
                 response: Some(
-                    crate::pb::etcdserverpb::response_op::Response::ResponseRange(
-                        RangeResponse {
-                            kvs: vec![KeyValue {
-                                mod_revision: version,
-                                version,
-                                value: value.to_vec(),
-                                ..Default::default()
-                            }],
+                    crate::pb::etcdserverpb::response_op::Response::ResponseRange(RangeResponse {
+                        kvs: vec![KeyValue {
+                            mod_revision: version,
+                            version,
+                            value: value.to_vec(),
                             ..Default::default()
-                        },
-                    ),
+                        }],
+                        ..Default::default()
+                    }),
                 ),
             }]
         },
@@ -366,10 +505,7 @@ impl Kv for TxnFixture {
         }))
     }
 
-    async fn put(
-        &self,
-        _request: Request<PutRequest>,
-    ) -> Result<Response<PutResponse>, Status> {
+    async fn put(&self, _request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         Ok(Response::new(PutResponse::default()))
     }
 
@@ -602,10 +738,7 @@ impl Maintenance for MaintenanceFixture {
         Ok(Response::new(DefragmentResponse::default()))
     }
 
-    async fn hash(
-        &self,
-        _request: Request<HashRequest>,
-    ) -> Result<Response<HashResponse>, Status> {
+    async fn hash(&self, _request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
         Ok(Response::new(HashResponse::default()))
     }
 
@@ -885,9 +1018,7 @@ fn txn_put_key(request: &TxnRequest) -> Option<Vec<u8>> {
         .success
         .iter()
         .find_map(|operation| match operation.request.as_ref()? {
-            crate::pb::etcdserverpb::request_op::Request::RequestPut(put) => {
-                Some(put.key.clone())
-            }
+            crate::pb::etcdserverpb::request_op::Request::RequestPut(put) => Some(put.key.clone()),
             _ => None,
         })
 }
@@ -1009,9 +1140,7 @@ async fn test_run_with_ctrl_c_preparation_cancel_withholds_measurement() {
     let ctrl_c: CtrlCFuture = Box::pin(async move {
         receiver
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
-            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped"))
             .map(|_| ())
     });
     let run = tokio::spawn(run_with_ctrl_c(run_config(Arc::new(plan)), client, ctrl_c));
@@ -1066,9 +1195,7 @@ async fn test_run_fixture_holds_preparation_before_watch_and_load() {
     let ctrl_c: CtrlCFuture = Box::pin(async move {
         receiver
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
-            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped"))
             .map(|_| ())
     });
     let run = tokio::spawn(run_with_ctrl_c(run_config(plan.clone()), client, ctrl_c));
@@ -1136,9 +1263,7 @@ async fn test_run_fixture_cancellation_aborts_inflight_preparation() {
     let ctrl_c: CtrlCFuture = Box::pin(async move {
         receiver
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
-            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped"))
             .map(|_| ())
     });
     let run = tokio::spawn(run_with_ctrl_c(run_config(Arc::new(plan)), client, ctrl_c));
@@ -1258,11 +1383,7 @@ fn test_cas_missing_failure_key_is_terminal() {
 #[test]
 fn test_update_missing_recreates_as_create() {
     assert_eq!(
-        storage_operation_for_state(
-            ResourceOperation::GuaranteedUpdate,
-            &KeyState::Absent,
-            true,
-        ),
+        storage_operation_for_state(ResourceOperation::GuaranteedUpdate, &KeyState::Absent, true,),
         Some(ResourceOperation::Create)
     );
     assert_eq!(
@@ -1579,8 +1700,7 @@ async fn test_execute_compact_tick_runs_coordination_and_compact_via_real_rpc() 
         succeeded: true,
         ..Default::default()
     };
-    let (client, requests, shutdown, server) =
-        serve_txn_fixture(vec![Ok(first), Ok(second)]).await;
+    let (client, requests, shutdown, server) = serve_txn_fixture(vec![Ok(first), Ok(second)]).await;
     let recorder = executor_recorder();
     let mut compactor = CompactorState::default();
     let revision = Arc::new(AtomicI64::new(0));
@@ -1923,8 +2043,7 @@ async fn test_worker_outer_attempt_deadline_records_timeout_unknown_without_repl
     let (client, requests, _range_requests, gate, _created, _load_observed, shutdown, server) =
         serve_controlled_run_fixture(0).await;
     let plan = Arc::new(small_plan());
-    let recorder = MeasurementRecorder::new(&plan).unwrap();
-    recorder.start_measurement().unwrap();
+    let recorder = executor_recorder();
     let stream = plan
         .logical_streams
         .iter()
@@ -2485,10 +2604,9 @@ async fn test_watch_ready_rejects_queued_success_at_deadline() {
     let mut tasks = JoinSet::new();
     tasks.spawn(std::future::pending::<WatchTaskOutput>());
     let mut ctrl_c = pending_ctrl_c();
-    let error =
-        wait_for_watch_ready(&mut tasks, vec![ready_rx], TokioInstant::now(), &mut ctrl_c)
-            .await
-            .unwrap_err();
+    let error = wait_for_watch_ready(&mut tasks, vec![ready_rx], TokioInstant::now(), &mut ctrl_c)
+        .await
+        .unwrap_err();
     assert_eq!(error.to_string(), "watch readiness timed out");
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
@@ -2548,9 +2666,7 @@ async fn test_prepare_cancel_leaves_measurement_in_preparation() {
     let mut ctrl_c: CtrlCFuture = Box::pin(async move {
         receiver
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped")
-            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "cancel sender dropped"))
             .map(|_| ())
     });
     cancel.send(()).unwrap();
@@ -2808,31 +2924,6 @@ fn test_list_selector_limit_growth() {
     assert_eq!(pager.result().discarded, 6);
 }
 
-#[test]
-fn test_range_single_request_shapes() {
-    for request in [
-        RangeRequest {
-            key: b"/registry/pods/item".to_vec(),
-            ..Default::default()
-        },
-        RangeRequest {
-            key: b"/registry/pods/".to_vec(),
-            range_end: b"/registry/pods0".to_vec(),
-            count_only: true,
-            ..Default::default()
-        },
-        RangeRequest {
-            key: b"/registry/pods/".to_vec(),
-            range_end: b"/registry/pods0".to_vec(),
-            ..Default::default()
-        },
-    ] {
-        let limit = request.limit;
-        let pager = RangePager::new(request, RangeSelector::All { target: None });
-        assert_eq!(pager.request().limit, limit);
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn test_dispatch_rate() {
     let plan = small_plan();
@@ -2860,7 +2951,6 @@ async fn test_dispatch_rate() {
         0,
         1_000_000,
         deadline,
-        deadline,
     )
     .unwrap();
     let mut accepted = 0;
@@ -2875,8 +2965,8 @@ async fn test_dispatch_rate() {
     recorder.finish().unwrap();
 }
 
-#[test]
-fn test_dispatch_no_catchup() {
+#[tokio::test(start_paused = true)]
+async fn test_dispatch_no_catchup() {
     let plan = small_plan();
     let recorder = MeasurementRecorder::new(&plan).unwrap();
     recorder.start_measurement().unwrap();
@@ -2898,12 +2988,10 @@ fn test_dispatch_no_catchup() {
         0,
         1_000_000,
         expired,
-        now + Duration::from_secs(1),
     )
     .unwrap();
     let at_three_ms = planned_at(stream, 3_000_000).unwrap();
     skip_application_before(&plan, &recorder, &mut state, 3_000_000).unwrap();
-    assert_eq!(state.next_ordinals[stream_index], at_three_ms);
     let deadline = TokioInstant::now() + Duration::from_secs(1);
     dispatch_tick(
         &plan,
@@ -2913,18 +3001,19 @@ fn test_dispatch_no_catchup() {
         3_000_000,
         4_000_000,
         deadline,
-        deadline,
     )
     .unwrap();
-    let at_four_ms = planned_at(stream, 4_000_000).unwrap();
-    assert_eq!(state.next_ordinals[stream_index], at_four_ms);
     let mut accepted = 0;
     while let Ok(item) = receiver.try_recv() {
         accepted += 1;
         drop(item);
     }
-    assert_eq!(accepted, at_four_ms.saturating_sub(at_three_ms));
-    let cutoff = TokioInstant::now() - Duration::from_millis(1);
+    assert_eq!(
+        accepted,
+        planned_at(stream, 4_000_000)
+            .unwrap()
+            .saturating_sub(at_three_ms)
+    );
     dispatch_tick(
         &plan,
         &recorder,
@@ -2933,24 +3022,25 @@ fn test_dispatch_no_catchup() {
         4_000_000,
         5_000_000,
         deadline,
-        cutoff,
     )
     .unwrap();
-    assert_eq!(
-        state.next_ordinals[stream_index],
-        planned_at(stream, 5_000_000).unwrap()
-    );
     while let Ok(item) = receiver.try_recv() {
         drop(item);
     }
     drop(sender);
     drop(receiver);
     recorder.stop_measurement().unwrap();
-    recorder.finish().unwrap();
+    let report = recorder.finish().unwrap();
+    let row = &report.measurement.logical[stream_identity(stream).measurement_index().unwrap()];
+    assert_eq!(row.missed_schedule, at_three_ms);
+    assert_eq!(
+        row.accepted,
+        planned_at(stream, 5_000_000).unwrap() - at_three_ms
+    );
 }
 
-#[test]
-fn test_dispatch_interleaves_periodic_and_skips_elapsed_events() {
+#[tokio::test(start_paused = true)]
+async fn test_dispatch_interleaves_periodic_and_skips_elapsed_events() {
     let mut config = small_plan().config;
     config.load.update_rps = 2_000;
     config.periodic.node_lease_interval_ms = 1;
@@ -2971,7 +3061,6 @@ fn test_dispatch_interleaves_periodic_and_skips_elapsed_events() {
         &mut state,
         10_000_000,
         11_000_000,
-        deadline,
         deadline,
     )
     .unwrap();
@@ -3077,7 +3166,6 @@ fn test_final_cutoff_rejection_marks_remaining_slots_missed() {
         &mut state,
         0,
         10_000_000,
-        deadline,
         deadline,
     )
     .unwrap();
@@ -3367,7 +3455,6 @@ fn test_rejected_admission_never_reaches_worker_receiver() {
         plan.resource_key(stream.resource, 0, plan.config.seed),
         &sender,
         TokioInstant::now() + Duration::from_secs(1),
-        TokioInstant::now() + Duration::from_secs(1),
         0,
     )
     .unwrap();
@@ -3384,8 +3471,8 @@ fn test_rejected_admission_never_reaches_worker_receiver() {
     assert_eq!(row.missed_schedule, 1);
 }
 
-#[test]
-fn test_queue_full_drop() {
+#[tokio::test(start_paused = true)]
+async fn test_queue_full_drop() {
     let plan = small_plan();
     let recorder = MeasurementRecorder::new(&plan).unwrap();
     recorder.start_measurement().unwrap();
@@ -3418,7 +3505,6 @@ fn test_queue_full_drop() {
         plan.resource_key(stream.resource, 0, plan.config.seed),
         &sender,
         TokioInstant::now() + Duration::from_secs(1),
-        TokioInstant::now() + Duration::from_secs(1),
         1_000_000,
     )
     .unwrap();
@@ -3431,8 +3517,8 @@ fn test_queue_full_drop() {
     assert_eq!(row.dropped_full, 1);
 }
 
-#[test]
-fn test_queue_closed_drop() {
+#[tokio::test(start_paused = true)]
+async fn test_queue_closed_drop() {
     let plan = small_plan();
     let recorder = MeasurementRecorder::new(&plan).unwrap();
     recorder.start_measurement().unwrap();
@@ -3451,7 +3537,6 @@ fn test_queue_closed_drop() {
         0,
         plan.resource_key(stream.resource, 0, plan.config.seed),
         &sender,
-        TokioInstant::now() + Duration::from_secs(1),
         TokioInstant::now() + Duration::from_secs(1),
         1_000_000,
     );
@@ -3681,11 +3766,13 @@ async fn test_worker_drain_ctrl_c_aborts_and_joins_tasks() {
         std::future::pending::<Result<(), String>>().await
     });
     let mut ctrl_c: CtrlCFuture = Box::pin(async { Ok::<(), std::io::Error>(()) });
-    let (result, interrupted) =
-        drain_workers_with_ctrl_c(Vec::new(), workers, Duration::from_secs(1), &mut ctrl_c)
-            .await;
-    assert!(interrupted);
-    assert_eq!(result.unwrap_err(), "interrupted during drain");
+    let result =
+        drain_workers_with_ctrl_c(Vec::new(), workers, Duration::from_secs(1), &mut ctrl_c).await;
+    assert!(matches!(
+        result.failure,
+        Some(ControlFailure::Interrupted(_))
+    ));
+    assert!(!result.timed_out);
     assert!(dropped.load(AtomicOrdering::Acquire));
 }
 
@@ -3707,10 +3794,9 @@ async fn test_worker_drain_timeout_joins_and_drops_task() {
     ));
     assert_pending(drain.as_mut()).await;
     time::advance(Duration::from_millis(1)).await;
-    let (result, interrupted) = drain.await;
-    assert!(!interrupted);
-    let error = result.unwrap_err();
-    assert!(error.contains("worker drain deadline exceeded"));
+    let result = drain.await;
+    assert!(result.failure.is_none());
+    assert!(result.timed_out);
     assert!(dropped.load(AtomicOrdering::Acquire));
 }
 
@@ -3732,8 +3818,8 @@ async fn test_worker_panic_preempts_schedule() {
     )
     .await
     .unwrap_err();
-    assert!(error.contains("worker task failed"));
-    assert!(error.contains("injected worker panic"));
+    assert!(matches!(&error, ControlFailure::ExecutionFailure(_)));
+    assert!(error.to_string().contains("injected worker panic"));
 }
 
 #[tokio::test]
@@ -3741,11 +3827,91 @@ async fn test_worker_drain_error() {
     let mut workers = JoinSet::new();
     workers.spawn(async { Err::<(), _>("worker failed".to_string()) });
     let mut ctrl_c = pending_ctrl_c();
-    let (result, interrupted) =
-        drain_workers_with_ctrl_c(Vec::new(), workers, Duration::from_secs(1), &mut ctrl_c)
-            .await;
-    assert!(!interrupted);
-    assert!(result.unwrap_err().contains("worker failed"));
+    let result =
+        drain_workers_with_ctrl_c(Vec::new(), workers, Duration::from_secs(1), &mut ctrl_c).await;
+    assert!(!result.timed_out);
+    assert!(
+        matches!(result.failure, Some(ControlFailure::ExecutionFailure(error)) if error == "worker failed")
+    );
+}
+
+#[tokio::test]
+async fn test_worker_error_text_does_not_consume_signal_or_mark_timeout() {
+    for message in [
+        "ctrl-c signal failed: remote text",
+        "worker drain deadline exceeded: remote text",
+    ] {
+        let mut workers = JoinSet::new();
+        workers.spawn(async move { Err(message.to_owned()) });
+        let result = drain_workers_with_ctrl_c(
+            Vec::new(),
+            workers,
+            Duration::from_secs(1),
+            &mut pending_ctrl_c(),
+        )
+        .await;
+        assert!(!result.timed_out);
+        let failure = result.failure.unwrap();
+        assert!(!failure.signal_consumed());
+        assert!(matches!(failure, ControlFailure::ExecutionFailure(error) if error == message));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_drain_timeout_preserves_worker_failure() {
+    let mut workers = JoinSet::new();
+    let (failed, observed) = oneshot::channel();
+    workers.spawn(async move {
+        failed.send(()).unwrap();
+        Err("worker failed before timeout".to_owned())
+    });
+    workers.spawn(std::future::pending::<Result<(), String>>());
+    observed.await.unwrap();
+    let mut ctrl_c = pending_ctrl_c();
+    let mut drain = Box::pin(drain_workers_with_ctrl_c(
+        Vec::new(),
+        workers,
+        Duration::from_millis(1),
+        &mut ctrl_c,
+    ));
+    assert_pending(drain.as_mut()).await;
+    time::advance(Duration::from_millis(1)).await;
+    let result = drain.await;
+    assert!(result.timed_out);
+    assert!(
+        matches!(result.failure, Some(ControlFailure::ExecutionFailure(error)) if error == "worker failed before timeout")
+    );
+}
+
+#[tokio::test]
+async fn test_signal_failure_is_consumed_without_becoming_user_interrupt() {
+    let mut ctrl_c: CtrlCFuture =
+        Box::pin(async { Err(std::io::Error::other("signal registration failed")) });
+    let failure = wait_for_schedule_event(
+        &mut JoinSet::new(),
+        &mut JoinSet::new(),
+        TokioInstant::now() + Duration::from_secs(1),
+        &mut ctrl_c,
+        &time::sleep_until,
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.signal_consumed());
+    assert!(!failure.is_interrupted());
+    assert!(matches!(failure, ControlFailure::SignalFailure(_)));
+    let mut ctrl_c: CtrlCFuture =
+        Box::pin(async { Err(std::io::Error::other("signal registration failed")) });
+    let result = drain_workers_with_ctrl_c(
+        Vec::new(),
+        JoinSet::new(),
+        Duration::from_secs(1),
+        &mut ctrl_c,
+    )
+    .await;
+    let failure = result.failure.unwrap();
+    assert!(failure.signal_consumed());
+    assert!(!failure.is_interrupted());
+    assert!(!result.timed_out);
 }
 #[tokio::test]
 async fn test_worker_late_dequeue_runs_once_in_drain() {
@@ -3923,8 +4089,7 @@ async fn test_precise_ticks_offer_entire_update_budget() {
     let plan = CompiledPlan::compile(config, 64 * 1024 * 1024).unwrap();
     let clock = ExecutorPhaseClock::new();
     let recorder =
-        MeasurementRecorder::with_clock(&plan, clock.clone() as Arc<dyn MonotonicClock>)
-            .unwrap();
+        MeasurementRecorder::with_clock(&plan, clock.clone() as Arc<dyn MonotonicClock>).unwrap();
     record_test_preparation(&recorder, &plan);
     recorder.start_measurement().unwrap();
     let (sender, mut receiver) = mpsc::channel::<WorkItem>(64);

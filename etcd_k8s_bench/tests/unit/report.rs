@@ -4,8 +4,7 @@ use crate::plan::{CompiledPlan, DEFAULT_SYNTHETIC_CONFIG};
 
 #[test]
 fn test_run_report_serializes_exact_nine_top_level_fields() {
-    let synthetic =
-        SyntheticConfig::from_json(DEFAULT_SYNTHETIC_CONFIG, 64 * 1024 * 1024).unwrap();
+    let synthetic = SyntheticConfig::from_json(DEFAULT_SYNTHETIC_CONFIG, 64 * 1024 * 1024).unwrap();
     let plan = CompiledPlan::compile(synthetic, 64 * 1024 * 1024).unwrap();
     let preparation_logical_high = plan.measurement_layout.prepare_logical_histogram.high_us;
     let measurement_logical_high = plan
@@ -19,8 +18,7 @@ fn test_run_report_serializes_exact_nine_top_level_fields() {
         setup_started_at: std::time::Instant::now(),
         max_message_size: 64 * 1024 * 1024,
     };
-    let report =
-        RunReport::setup_failure(&config, RunStatus::Failed, "setup", "fixture failure");
+    let report = RunReport::setup_failure(&config, RunStatus::Failed, "setup", "fixture failure");
     let mut encoded = Vec::new();
     report.write_json(&mut encoded).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();

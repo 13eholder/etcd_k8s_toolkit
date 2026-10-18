@@ -9,8 +9,7 @@ fn plan_config(args: &[&str]) -> Result<CompiledPlan, ConfigError> {
 fn run_config(args: &[&str]) -> Result<RunConfig, ConfigError> {
     let mut full = vec!["bench", "run"];
     full.extend_from_slice(args);
-    let cli =
-        Cli::try_parse_from(full).map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    let cli = Cli::try_parse_from(full).map_err(|error| ConfigError::Invalid(error.to_string()))?;
     match cli.command {
         Command::Run(run) => run.resolve(),
         Command::Plan(_) => unreachable!(),
@@ -268,7 +267,5 @@ fn test_plan_writer_output_contract() {
 #[test]
 fn test_plan_rejects_run_only_flags() {
     assert!(Cli::try_parse_from(["bench", "plan", "--endpoint", DEFAULT_ENDPOINT]).is_err());
-    assert!(
-        Cli::try_parse_from(["bench", "plan", "--metrics-listen", "127.0.0.1:9898"]).is_err()
-    );
+    assert!(Cli::try_parse_from(["bench", "plan", "--metrics-listen", "127.0.0.1:9898"]).is_err());
 }

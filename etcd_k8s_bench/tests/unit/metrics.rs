@@ -226,11 +226,9 @@ async fn test_exporter_scrape_and_shutdown_reclaims_listener() {
 
     // Drive an accepted HTTP/1.1 keep-alive connection before shutdown.
     let mut held = TcpStream::connect(address).await.unwrap();
-    held.write_all(
-        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
-    )
-    .await
-    .unwrap();
+    held.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .unwrap();
     let held_response = read_http_response(&mut held).await;
     assert!(held_response.starts_with("HTTP/1.1 200 OK"));
     assert!(held_response.contains("etcd_k8s_bench_exporter_test_total"));

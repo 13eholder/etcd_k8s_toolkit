@@ -319,9 +319,7 @@ fn test_plan_counts() {
         u64::try_from(plan.periodic_events.len()).unwrap(),
         plan.measurement_layout.periodic_events
     );
-    assert!(
-        plan.measurement_layout.periodic_capacity >= plan.measurement_layout.periodic_events
-    );
+    assert!(plan.measurement_layout.periodic_capacity >= plan.measurement_layout.periodic_events);
     assert!(plan.periodic_events.windows(2).all(|pair| {
         (pair[0].at_ns, pair[0].kind, pair[0].node, pair[0].ordinal)
             <= (pair[1].at_ns, pair[1].kind, pair[1].node, pair[1].ordinal)
@@ -524,9 +522,7 @@ fn test_config_invalid_error() {
 
     let mut invalid_relation = valid.clone();
     invalid_relation["topology"]["pod_count"] = serde_json::Value::from(20_001);
-    assert!(
-        SyntheticConfig::from_json(&invalid_relation.to_string(), 64 * 1024 * 1024).is_err()
-    );
+    assert!(SyntheticConfig::from_json(&invalid_relation.to_string(), 64 * 1024 * 1024).is_err());
 
     let mut queue = valid.clone();
     queue["execution"]["workers"] = serde_json::Value::from(2);
@@ -584,8 +580,7 @@ fn test_config_invalid_error() {
 
     let mut watch_overflow = valid.clone();
     watch_overflow["watch"]["subscriptions_per_root"] = serde_json::Value::from(u64::MAX);
-    let config =
-        SyntheticConfig::from_json(&watch_overflow.to_string(), 64 * 1024 * 1024).unwrap();
+    let config = SyntheticConfig::from_json(&watch_overflow.to_string(), 64 * 1024 * 1024).unwrap();
     let error = CompiledPlan::compile(config, 64 * 1024 * 1024)
         .unwrap_err()
         .to_string();

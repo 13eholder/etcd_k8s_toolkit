@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use prost::Message;
 use serde::Serialize;
@@ -66,6 +66,10 @@ impl ControlFailure {
 
     fn is_interrupted(&self) -> bool {
         matches!(self, Self::Interrupted(_))
+    }
+
+    fn signal_consumed(&self) -> bool {
+        matches!(self, Self::Interrupted(_) | Self::SignalFailure(_))
     }
 }
 
@@ -740,14 +744,14 @@ async fn execute_range(
             "Range operation deadline is zero",
         ));
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = TokioInstant::now() + timeout;
     let mut pager = RangePager::new(request, selector);
     let mut page_offset = 0usize;
     loop {
         let page_request = pager.request();
         let mut attempts = 0;
         let response = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(TokioInstant::now());
             if remaining.is_zero() {
                 break Err(RangeExecutionError::new(
                     Outcome::Timeout,
@@ -1047,10 +1051,10 @@ async fn execute_status(
     latest_revision: Arc<AtomicI64>,
     recorder: &MeasurementRecorder,
 ) -> Result<ExecutorResult, String> {
-    let deadline = Instant::now() + timeout;
+    let deadline = TokioInstant::now() + timeout;
     let mut first_error = None;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
         if remaining.is_zero() {
             return Ok(first_error.map_or_else(
                 || ExecutorResult::new(Outcome::Timeout),
@@ -1088,7 +1092,7 @@ async fn execute_status(
                             first_error = Some(bound_error(error.to_string()));
                         }
                         let delay = Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(Instant::now()));
+                            .min(deadline.saturating_duration_since(TokioInstant::now()));
                         if delay.is_zero() {
                             return Ok(first_error.map_or_else(
                                 || ExecutorResult::new(Outcome::Timeout),
@@ -1129,8 +1133,8 @@ async fn execute_compact_tick(
     let value = previous_txn_header_revision.to_string();
     recorder.set_compactor_state_metric(compactor.status.as_metric());
 
-    let deadline = Instant::now() + timeout;
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let deadline = TokioInstant::now() + timeout;
+    let remaining = deadline.saturating_duration_since(TokioInstant::now());
     if remaining.is_zero() {
         return Ok(ExecutorResult::new(Outcome::Timeout));
     }
@@ -1195,7 +1199,7 @@ async fn execute_compact_tick(
     let Some(revision) = observation.compact_target else {
         return Ok(ExecutorResult::new(Outcome::Success));
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = deadline.saturating_duration_since(TokioInstant::now());
     if remaining.is_zero() {
         return Ok(ExecutorResult::new(Outcome::Timeout));
     }
@@ -1560,12 +1564,17 @@ fn capture_worker_join_error(
     }
 }
 
+struct DrainResult {
+    failure: Option<ControlFailure>,
+    timed_out: bool,
+}
+
 async fn drain_workers_with_ctrl_c(
     senders: Vec<mpsc::Sender<WorkItem>>,
     mut tasks: JoinSet<Result<(), String>>,
     timeout: Duration,
     ctrl_c: &mut CtrlCFuture,
-) -> (Result<(), String>, bool) {
+) -> DrainResult {
     drop(senders);
     let deadline = TokioInstant::now() + timeout;
     let mut first_error = None;
@@ -1577,15 +1586,16 @@ async fn drain_workers_with_ctrl_c(
                 while let Some(joined) = tasks.join_next().await {
                     capture_worker_join_error(joined, &mut first_error);
                 }
-                let interrupted = signal.is_ok();
-                let signal_error = match signal {
-                    Ok(()) => first_error.unwrap_or_else(|| "interrupted during drain".into()),
-                    Err(error) => first_error.map_or_else(
+                let failure = match signal {
+                    Ok(()) => ControlFailure::interrupted(
+                        first_error.unwrap_or_else(|| "interrupted during drain".into())
+                    ),
+                    Err(error) => ControlFailure::signal_failure(first_error.map_or_else(
                         || format!("ctrl-c signal failed: {error}"),
                         |first| format!("ctrl-c signal failed: {error}; {first}"),
-                    ),
+                    )),
                 };
-                return (Err(signal_error), interrupted);
+                return DrainResult { failure: Some(failure), timed_out: false };
             }
             joined = time::timeout_at(deadline, tasks.join_next()) => joined,
         };
@@ -1596,13 +1606,10 @@ async fn drain_workers_with_ctrl_c(
                 while let Some(joined) = tasks.join_next().await {
                     capture_worker_join_error(joined, &mut first_error);
                 }
-                return (
-                    Err(first_error.map_or_else(
-                        || "worker drain deadline exceeded".to_string(),
-                        |error| format!("worker drain deadline exceeded: {error}"),
-                    )),
-                    false,
-                );
+                return DrainResult {
+                    failure: first_error.map(ControlFailure::execution_failure),
+                    timed_out: true,
+                };
             }
         };
         let Some(joined) = joined else {
@@ -1610,7 +1617,10 @@ async fn drain_workers_with_ctrl_c(
         };
         capture_worker_join_error(joined, &mut first_error);
     }
-    (first_error.map_or(Ok(()), Err), false)
+    DrainResult {
+        failure: first_error.map(ControlFailure::execution_failure),
+        timed_out: false,
+    }
 }
 
 fn capture_watch_join_error(
@@ -1767,7 +1777,6 @@ fn dispatch_application_item(
     key: Vec<u8>,
     sender: &mpsc::Sender<WorkItem>,
     tick_deadline: TokioInstant,
-    _cutoff_deadline: TokioInstant,
     tick_end_ns: u64,
 ) -> Result<DispatchOutcome, String> {
     let identity = stream_identity(stream);
@@ -1829,7 +1838,6 @@ fn dispatch_periodic_item(
     event: &PeriodicEvent,
     sender: &mpsc::Sender<WorkItem>,
     tick_deadline: TokioInstant,
-    _cutoff_deadline: TokioInstant,
     tick_end_ns: u64,
 ) -> Result<DispatchOutcome, String> {
     let identity = periodic_identity(event.kind);
@@ -1983,7 +1991,6 @@ fn dispatch_tick(
     tick_start_ns: u64,
     tick_end_ns: u64,
     tick_deadline: TokioInstant,
-    _cutoff_deadline: TokioInstant,
 ) -> Result<(), String> {
     let mut targets = [0; crate::measurement::MEASUREMENT_STREAM_COUNT];
     for (index, stream) in plan.logical_streams.iter().enumerate() {
@@ -2032,7 +2039,6 @@ fn dispatch_tick(
                 key,
                 &senders[shard],
                 tick_deadline,
-                _cutoff_deadline,
                 tick_end_ns,
             )? {
                 DispatchOutcome::Accepted | DispatchOutcome::Dropped => {}
@@ -2074,7 +2080,6 @@ fn dispatch_tick(
                 event,
                 &senders[shard],
                 tick_deadline,
-                _cutoff_deadline,
                 tick_end_ns,
             )? {
                 DispatchOutcome::Accepted | DispatchOutcome::Dropped => {
@@ -2121,27 +2126,27 @@ async fn wait_for_schedule_event<F: Future<Output = ()>>(
     deadline: TokioInstant,
     ctrl_c: &mut CtrlCFuture,
     sleep_until: &impl Fn(TokioInstant) -> F,
-) -> Result<ScheduleControl, String> {
+) -> Result<ScheduleControl, ControlFailure> {
     tokio::select! {
         biased;
         signal = ctrl_c.as_mut() => match signal {
             Ok(()) => Ok(ScheduleControl::Interrupted),
-            Err(error) => Err(format!("ctrl-c signal failed: {error}")),
+            Err(error) => Err(ControlFailure::signal_failure(format!("ctrl-c signal failed: {error}"))),
         },
         worker_result = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
             match worker_result {
-                Some(Ok(Ok(()))) => Err("worker exited before the run ended".into()),
-                Some(Ok(Err(error))) => Err(error),
-                Some(Err(error)) => Err(format!("worker task failed: {error}")),
-                None => Err("all workers exited before the run ended".into()),
+                Some(Ok(Ok(()))) => Err(ControlFailure::execution_failure("worker exited before the run ended")),
+                Some(Ok(Err(error))) => Err(ControlFailure::execution_failure(error)),
+                Some(Err(error)) => Err(ControlFailure::execution_failure(format!("worker task failed: {error}"))),
+                None => Err(ControlFailure::execution_failure("all workers exited before the run ended")),
             }
         }
         watch_result = watch_tasks.join_next(), if !watch_tasks.is_empty() => {
             match watch_result {
                 Some(Ok((_name, Ok(_outcome)))) => Ok(ScheduleControl::Supervisor),
-                Some(Ok((name, Err(error)))) => Err(format!("watch {name} failed: {error}")),
-                Some(Err(error)) => Err(format!("watch task failed: {error}")),
-                None => Err("all watch tasks exited before the run ended".into()),
+                Some(Ok((name, Err(error)))) => Err(ControlFailure::execution_failure(format!("watch {name} failed: {error}"))),
+                Some(Err(error)) => Err(ControlFailure::execution_failure(format!("watch task failed: {error}"))),
+                None => Err(ControlFailure::execution_failure("all watch tasks exited before the run ended")),
             }
         }
         _ = sleep_until(deadline) => Ok(ScheduleControl::Tick),
@@ -2176,7 +2181,7 @@ fn mark_remaining_not_offered(
 enum DispatchExit {
     Completed(DispatchState),
     Interrupted(DispatchState),
-    Failed(String, DispatchState),
+    Failed(ControlFailure, DispatchState),
 }
 
 async fn dispatch_until<F: Future<Output = ()>>(
@@ -2192,7 +2197,12 @@ async fn dispatch_until<F: Future<Output = ()>>(
 ) -> DispatchExit {
     let duration_ns = match nanos(run_duration(plan)) {
         Ok(value) => value,
-        Err(error) => return DispatchExit::Failed(error, DispatchState::new(plan)),
+        Err(error) => {
+            return DispatchExit::Failed(
+                ControlFailure::execution_failure(error),
+                DispatchState::new(plan),
+            );
+        }
     };
     let tick_ns = nanos(crate::plan::PACING_TICK).expect("1ms fits u64 nanoseconds");
     let mut state = DispatchState::new(plan);
@@ -2228,7 +2238,7 @@ async fn dispatch_until<F: Future<Output = ()>>(
         if elapsed_ns >= duration_ns {
             return match mark_remaining_missed(plan, recorder, &mut state) {
                 Ok(()) => DispatchExit::Completed(state),
-                Err(error) => DispatchExit::Failed(error, state),
+                Err(error) => DispatchExit::Failed(ControlFailure::execution_failure(error), state),
             };
         }
         let current_tick = elapsed_ns / tick_ns;
@@ -2237,7 +2247,7 @@ async fn dispatch_until<F: Future<Output = ()>>(
             if let Err(error) =
                 skip_application_before(plan, recorder, &mut state, skipped_start_ns)
             {
-                return DispatchExit::Failed(error, state);
+                return DispatchExit::Failed(ControlFailure::execution_failure(error), state);
             }
             state.next_tick = current_tick;
             tick_start_ns = skipped_start_ns;
@@ -2252,9 +2262,8 @@ async fn dispatch_until<F: Future<Output = ()>>(
             tick_start_ns,
             tick_end_ns,
             tick_deadline,
-            cutoff,
         ) {
-            return DispatchExit::Failed(error, state);
+            return DispatchExit::Failed(ControlFailure::execution_failure(error), state);
         }
         state.next_tick = state.next_tick.saturating_add(1);
     }
@@ -2271,7 +2280,7 @@ async fn dispatch_until<F: Future<Output = ()>>(
     }
     match mark_remaining_missed(plan, recorder, &mut state) {
         Ok(()) => DispatchExit::Completed(state),
-        Err(error) => DispatchExit::Failed(error, state),
+        Err(error) => DispatchExit::Failed(ControlFailure::execution_failure(error), state),
     }
 }
 async fn worker_loop(
@@ -2405,7 +2414,7 @@ async fn execute_txn(
     latest_revision: Arc<AtomicI64>,
     recorder: &MeasurementRecorder,
 ) -> Result<ExecutorResult, String> {
-    let deadline = Instant::now() + timeout;
+    let deadline = TokioInstant::now() + timeout;
     let mut effective_operation = match states.get(&key) {
         Some(state) => storage_operation_for_state(operation, state, recreate_missing),
         None if operation == ResourceOperation::Create => Some(ResourceOperation::Create),
@@ -2429,10 +2438,10 @@ async fn execute_txn(
             }
             ResourceOperation::ConditionalDelete => TxnAttempt::delete(key.clone(), expected),
         };
-        let mut cas = CasLoop::new(attempt, cas_policy, deadline);
+        let mut cas = CasLoop::new(attempt, cas_policy, deadline.into_std());
         let next_operation = loop {
             let request = cas.request();
-            let start = Instant::now();
+            let start = TokioInstant::now();
             let remaining = deadline.saturating_duration_since(start);
             if remaining.is_zero() {
                 return Ok(ExecutorResult::new(Outcome::Timeout));
@@ -2476,7 +2485,7 @@ async fn execute_txn(
             if let Some(header) = response.header.as_ref() {
                 update_revision(&latest_revision, header.revision, recorder);
             }
-            match cas.observe(&response, Instant::now()) {
+            match cas.observe(&response, TokioInstant::now().into_std()) {
                 CasDecision::Succeeded {
                     header_revision: _,
                     state,
@@ -2879,8 +2888,8 @@ pub(crate) async fn run_with_ctrl_c(
     let ctrl_c_completed = interrupted
         || dispatch_error
             .as_ref()
-            .is_some_and(|error| error.starts_with("ctrl-c signal failed:"));
-    let (drain_error, drain_interrupted) = if ctrl_c_completed {
+            .is_some_and(ControlFailure::signal_consumed);
+    let drain_result = if ctrl_c_completed {
         let mut pending_ctrl_c: CtrlCFuture =
             Box::pin(std::future::pending::<Result<(), std::io::Error>>());
         drain_workers_with_ctrl_c(
@@ -2893,19 +2902,18 @@ pub(crate) async fn run_with_ctrl_c(
     } else {
         drain_workers_with_ctrl_c(senders, worker_tasks, drain_timeout(&plan), &mut ctrl_c).await
     };
-    if drain_interrupted {
+    if drain_result
+        .failure
+        .as_ref()
+        .is_some_and(ControlFailure::is_interrupted)
+    {
         interrupted = true;
     }
-    let drain_signal_completed = drain_interrupted
-        || drain_error
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.starts_with("ctrl-c signal failed:"));
-    let drain_timed_out = drain_error.as_ref().err().is_some_and(|error| {
-        error == "worker drain deadline exceeded"
-            || error.starts_with("worker drain deadline exceeded:")
-    });
-    if drain_timed_out {
+    let drain_signal_completed = drain_result
+        .failure
+        .as_ref()
+        .is_some_and(ControlFailure::signal_consumed);
+    if drain_result.timed_out {
         recorder.mark_drain_timeout();
     }
     let watch_begin_error = recorder
@@ -2934,11 +2942,8 @@ pub(crate) async fn run_with_ctrl_c(
         .err()
         .map(|error| format!("watch teardown finish failed: {error}"));
     let first_error = dispatch_error
-        .or_else(|| {
-            drain_error
-                .err()
-                .filter(|error| error != "worker drain deadline exceeded")
-        })
+        .map(|error| error.to_string())
+        .or_else(|| drain_result.failure.map(|error| error.to_string()))
         .or(watch_begin_error)
         .or_else(|| watch_error.err())
         .or(watch_end_error);
