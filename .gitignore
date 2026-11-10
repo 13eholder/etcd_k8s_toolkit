@@ -4,12 +4,10 @@
 .omp
 
 ref/
-docs/
 .agents/stages/
 tasks/
 etcd_k8s_bench/verify/
 
-# docs/：本地文档不版本管理；.agents/ 知识库整体跟踪，无需额外例外
 
 # 采样与审计原始产物：仓库只提交代码与 markdown 文档，原始证据仅保留本机
 perf.data
