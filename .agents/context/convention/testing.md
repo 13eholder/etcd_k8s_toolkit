@@ -65,7 +65,7 @@
 
 真实 `run`、`run_synthetic.py` 与 `check_report.py` 完整参数沿用 README，不在这里复制。必须显式指定专用可丢弃空后端、已有 etcdctl、全新输出目录；checker 传实际子进程退出码。工具不管理后端、不清库、不调整 quota。报告一致不等于实验成功。
 
-executor 采样 Tokio 单调时钟，纯 CAS 状态机只接收同域转换的时间值；网络 I/O 与 paused-clock 的自动推进不能混作完成同步。历史执行与验收记录见 [修复计划](../../../tasks/plan.md) 与各 Stage VERIFY，历史通过数不代表当前运行结果。
+executor 采样 Tokio 单调时钟，纯 CAS 状态机只接收同域转换的时间值；网络 I/O 与 paused-clock 的自动推进不能混作完成同步。历史执行与验收记录（各 Stage VERIFY 与修复计划）仅本地保留，历史通过数不代表当前运行结果。
 
 ## 文档验证
 

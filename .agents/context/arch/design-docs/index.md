@@ -4,7 +4,7 @@
 
 当前领域知识集中于 [设计目标](design-goals.md) 和 [API 子集](api-subset.md)：前者回答现阶段做什么/不做什么，后者细化到参数及 K8s/bench/proxy 边界。本索引负责原始设计与批准来源导航，不搬移或重写旧 Spec/ADR。
 
-注：Stage/ADR 归档位于 `.agents/stages/`，按 `.gitignore` 仅本地保留；下文指向 Stage 的链接在克隆仓库中不可达，其结论已内联本目录文档。
+注：Stage/ADR 归档（`.agents/stages/`）与修复记录（`tasks/`）按 `.gitignore` 仅本地保留；下文指向 Stage 的链接在克隆仓库中不可达，其结论已内联本目录文档。
 
 | 使用场景 | 权威来源 | 状态与范围 |
 | --- | --- | --- |
@@ -15,7 +15,6 @@
 | 修改 CAS、分页、Watch、compaction 请求 | [API 子集](api-subset.md) | 当前参数级行为契约及官方来源索引，区分协议事实与合成选择 |
 | 修改输入或默认压力 | [synthetic-k8s.json](../../../../etcd_k8s_bench/workloads/synthetic-k8s.json)、[Stage 006 Spec](../../../stages/006-rule-driven-timed-pressure/spec/timed-pressure.md) | 默认值维护在 JSON；完整 schema/验收语义在规格 |
 | 追踪决定及验收历史 | [Stage 总索引](../../../stages/INDEX.md)、[Stage 006](../../../stages/006-rule-driven-timed-pressure/STAGE.md)、[VERIFY](../../../stages/006-rule-driven-timed-pressure/VERIFY.md) | 历史记录；不代表当前重跑证明 |
-| 核对对抗审查修复和验收 | [修复计划](../../../../tasks/plan.md)、[执行清单](../../../../tasks/todo.md) | 已完成修复记录；不代替历史 Stage 验收或真实后端性能证明 |
 
 ## 已接受决定
 

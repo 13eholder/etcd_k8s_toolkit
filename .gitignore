@@ -6,6 +6,7 @@
 ref/
 docs/
 .agents/stages/
+tasks/
 
 # docs/：本地文档不版本管理；.agents/ 知识库整体跟踪，无需额外例外
 
