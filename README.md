@@ -1,9 +1,35 @@
 # etcd_k8s_toolkit
 
-Cargo workspace containing:
+Tools for evaluating etcd-compatible storage backends under Kubernetes-shaped
+load, plus an observable etcd gRPC proxy. The workspace contains:
 
 - `etcd_proxy`: a tonic etcd proxy with buffered JSONL request logging;
 - `etcd_k8s_bench`: a Kubernetes-shaped etcd API pressure generator.
+
+`etcd_k8s_bench` applies rule-driven, timed, open-loop pressure: it models six
+resource domains and Kubernetes-shaped etcd requests, prepares a fixed
+keyspace, and offers work at target logical rates inside a single real-time
+window. Results are an interpretable, accountable basis for comparing storage
+backends — **not** a Kubernetes control plane, a replay of production traffic,
+or a conversion to Kubernetes capacity.
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `etcd_proxy/` | etcd gRPC proxy: KV/Watch/Lease/Maintenance forwarding plus JSONL request logging |
+| `etcd_k8s_bench/` | pressure generator: config, plan, scheduler, client, workload, watch, measurement, report, metrics |
+| `etcd_k8s_bench/workloads/` | embedded default workload `synthetic-k8s.json` |
+| `etcd_k8s_bench/verify/` | Python evidence runner and offline report checker |
+| `etcd_k8s_bench/monitoring/` | local Prometheus + Grafana dashboard guide |
+| `proto/` | shared etcd RPC schema, compiled by both crates — edit the proto, never the generated code |
+| `.agents/context/` | agent knowledge base: conventions and design/arch docs (中文) |
+
+## Prerequisites
+
+- A Rust toolchain supporting edition 2024 (install via rustup).
+- `protoc` on `PATH`: both `build.rs` scripts compile `proto/rpc.proto`.
+- Python 3.10+ standard library for the verify tools (no third-party packages).
 
 ## Run etcd_proxy
 
@@ -16,14 +42,15 @@ cargo run --release -p etcd_proxy -- \
 ```
 
 Use `cargo run -p etcd_proxy -- --help` for all logging and transport options.
+The proxy is an observation tool, not a storage implementation: it forwards
+registered KV/Watch/Lease/Maintenance methods to a single upstream endpoint and
+logs them. The exact forwarded surface and known limitations are listed in the
+[API subset](.agents/context/arch/design-docs/api-subset.md#proxy-转发参数面).
 
 ## Synthetic benchmark
 
-`etcd_k8s_bench` applies rule-driven, timed, open-loop pressure. It models six
-resource domains and Kubernetes-shaped etcd requests, not a Kubernetes control
-plane or a replay of observed production traffic. Values are synthetic bytes,
-not API objects. No real rollout, watch cache, controller causality, or native
-TTL lifecycle is simulated. Results are not a conversion to Kubernetes capacity.
+Values are synthetic bytes, not API objects. No real rollout, watch cache,
+controller causality, or native TTL lifecycle is simulated.
 
 ### Build and inspect the plan
 
@@ -186,8 +213,19 @@ bounded kill deadline after an earlier SIGINT; tool failures return 1.
 
 The checker verifies observable counts, type ranges and arithmetic rather than
 trusting accounting flags. A final summary cannot independently prove all internal
-arithmetic history. See the [repair plan and verification](tasks/plan.md).
+arithmetic history.
 
-See the [API subset](.agents/domain/api-subset.md) for keys, CAS,
-pagination and Watch semantics, and [design (中文)](etcd_k8s_bench/DESIGN_zh.md)
-for lifecycle and accounting invariants.
+## Documentation
+
+- [Design (中文)](etcd_k8s_bench/DESIGN_zh.md) — module boundaries, lifecycle,
+  event attribution and accounting invariants
+- [Design goals (中文)](.agents/context/arch/design-docs/design-goals.md) — current goals,
+  non-goals, result semantics, acceptance criteria
+- [API subset (中文)](.agents/context/arch/design-docs/api-subset.md) — parameter-level keys, CAS,
+  pagination, Watch semantics, and the proxy forwarding surface
+- [Monitoring guide](etcd_k8s_bench/monitoring/README.md) — local
+  Prometheus + Grafana dashboard
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

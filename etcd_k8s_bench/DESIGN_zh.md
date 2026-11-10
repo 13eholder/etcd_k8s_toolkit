@@ -30,7 +30,7 @@
 
 默认应用更新 10,000/s × 600s，计划 6,000,000 次；主动读写比 1:20，计划 300,000 次。四类应用更新流、五类资源各两种主动读形状组成 14 条逻辑应用流；另有 NodeLease、Node status、Status、Compact 四条周期流。零权重流仍保留身份，计划按每流有理数向下取整，不能从总预算推测每个短窗口的取整结果。
 
-普通 NodeLease 10s 周期、5% 确定性 jitter，Node status 300s，Status 10s，Compact 60s。周期流与应用逻辑更新预算分开。value 默认 4,096 字节，NodeLease 为 512 字节。具体 key、CAS、Range、Watch 与 lease 区别见 [API 子集](../.agents/domain/api-subset.md)。
+普通 NodeLease 10s 周期、5% 确定性 jitter，Node status 300s，Status 10s，Compact 60s。周期流与应用逻辑更新预算分开。value 默认 4,096 字节，NodeLease 为 512 字节。具体 key、CAS、Range、Watch 与 lease 区别见 [API 子集](../.agents/context/arch/design-docs/api-subset.md)。
 
 ## 生命周期
 

@@ -6,20 +6,20 @@
 
 | 层次 | 当前范围 | 权威依据 |
 | --- | --- | --- |
-| Kubernetes 存储需求 | kube-apiserver：Range、Txn、Compact、LeaseGrant、Status 五个一元 RPC及 Watch 双向流 | [Stage 004 最小接口 ADR](../stages/004-k8s-mode-fidelity-correction/docs/adr/001-k8s-etcd-minimal-interface.md)、版本化 ref 研究 |
-| 当前 benchmark 活跃路径 | Range、Txn、Compact、Status 四个一元 RPC及 Watch；Put 在 Txn 内，不独立调用 Put RPC | [Stage 006 冻结契约](../stages/006-rule-driven-timed-pressure/docs/adr/003-approved-defaults-and-execution-contract.md)、[client.rs](../../etcd_k8s_bench/src/client.rs)、[scheduler.rs](../../etcd_k8s_bench/src/scheduler.rs) |
-| benchmark 保留的底层形状 | ConditionalDelete、部分通用 Range 执行器形状；不等于当前负载可配置项 | [workload.rs](../../etcd_k8s_bench/src/workload.rs)、scheduler 的 RangePager |
-| proxy 转发 | KV、Watch、Lease、Maintenance 四个 service 的已注册方法，参数面比 benchmark 宽 | [proxy main](../../etcd_proxy/src/main.rs)、[proxy.rs](../../etcd_proxy/src/proxy.rs) |
+| Kubernetes 存储需求 | kube-apiserver：Range、Txn、Compact、LeaseGrant、Status 五个一元 RPC及 Watch 双向流 | [Stage 004 最小接口 ADR](../../../stages/004-k8s-mode-fidelity-correction/docs/adr/001-k8s-etcd-minimal-interface.md)；上游研究基线见“来源与阅读规则” |
+| 当前 benchmark 活跃路径 | Range、Txn、Compact、Status 四个一元 RPC及 Watch；Put 在 Txn 内，不独立调用 Put RPC | [Stage 006 冻结契约](../../../stages/006-rule-driven-timed-pressure/docs/adr/003-approved-defaults-and-execution-contract.md)、[client.rs](../../../../etcd_k8s_bench/src/client.rs)、[scheduler.rs](../../../../etcd_k8s_bench/src/scheduler.rs) |
+| benchmark 保留的底层形状 | ConditionalDelete、部分通用 Range 执行器形状；不等于当前负载可配置项 | [workload.rs](../../../../etcd_k8s_bench/src/workload.rs)、scheduler 的 RangePager |
+| proxy 转发 | KV、Watch、Lease、Maintenance 四个 service 的已注册方法，参数面比 benchmark 宽 | [proxy main](../../../../etcd_proxy/src/main.rs)、[proxy.rs](../../../../etcd_proxy/src/proxy.rs) |
 | kubeadm 生命周期 | MemberList/Add/Remove/Promote 与 Status；Sync 是客户端操作 | Stage 004 ADR；不属于当前 bench/proxy 注册面 |
-| 仅协议声明 | Cluster、Auth；另有未进入当前 build 的 Lock/Election proto | [rpc.proto](../../proto/rpc.proto)、两个 crate 的 build.rs |
+| 仅协议声明 | Cluster、Auth；另有未进入当前 build 的 Lock/Election proto | [rpc.proto](../../../../proto/rpc.proto)、两个 crate 的 build.rs |
 
 **5+1 与 4+1 不矛盾**：Stage 006 的六类资源模型不施加 native TTL/LeaseGrant 压力，普通 NodeLease 使用 `Put.lease=0`；这没有改变 Kubernetes 对 native Lease 的需求，也没有移除 proxy Lease 转发。
 
 ## 来源与阅读规则
 
-- Kubernetes 参数列按仓库已接受的 Stage 004 ADR 及 `ref/` 对 **Kubernetes v1.35.5（研究标识 commit 6636cbce）、etcd client v3.6.5** 的分析整理；本次未重新审计该上游版本或联网复验全部官方结论。
-- benchmark 列按当前 Stage 006 决策、[执行规格](../stages/006-rule-driven-timed-pressure/spec/timed-pressure.md)与实际构造函数核对；不从旧 profile、已删除流量数据推导参数。
-- 本地字段定义以 [proto/rpc.proto](../../proto/rpc.proto)、[proto/kv.proto](../../proto/kv.proto) 为准；Rust 生成代码来自 [bench build.rs](../../etcd_k8s_bench/build.rs) 和 [proxy build.rs](../../etcd_proxy/build.rs)。本地 proto 不自动等于 etcd v3.6.5 的完整最新 schema。
+- Kubernetes 参数列按仓库已接受的 Stage 004 ADR 及对 **Kubernetes v1.35.5（研究标识 commit 6636cbce）、etcd client v3.6.5** 的上游分析整理，结论已内联本文；原始研究笔记仅保留本地 `ref/`，不随仓库发布。
+- benchmark 列按当前 Stage 006 决策、[执行规格](../../../stages/006-rule-driven-timed-pressure/spec/timed-pressure.md)与实际构造函数核对；不从旧 profile、已删除流量数据推导参数。
+- 本地字段定义以 [proto/rpc.proto](../../../../proto/rpc.proto)、[proto/kv.proto](../../../../proto/kv.proto) 为准；Rust 生成代码来自 [bench build.rs](../../../../etcd_k8s_bench/build.rs) 和 [proxy build.rs](../../../../etcd_proxy/build.rs)。本地 proto 不自动等于 etcd v3.6.5 的完整最新 schema。
 - 表中 `0`、`false`、空 bytes/数组是 protobuf 默认值，不一定在 wire 中显式编码；`\x00` 是一个 NUL 字节，不是空字符串。
 - “未使用”不表示后端应拒绝该合法参数；“业务不直接读取响应字段”不授权把字段清零。客户端流管理、错误转换、事件 helper 和端点发现可能间接依赖它。
 - 本文是当前领域汇总入口，不自行改变已接受决定。发现目标与实现差异时同时保留两者，见末节。
@@ -35,7 +35,7 @@
 
 ## KV Range
 
-来源：Stage 004 ADR 的 Range 表；[client preflight](../../etcd_k8s_bench/src/client.rs)、[ResourcePlan 请求构造](../../etcd_k8s_bench/src/plan.rs)、[RangePager](../../etcd_k8s_bench/src/scheduler.rs)。以下覆盖本地 `RangeRequest` 全部 13 个字段。
+来源：Stage 004 ADR 的 Range 表；[client preflight](../../../../etcd_k8s_bench/src/client.rs)、[ResourcePlan 请求构造](../../../../etcd_k8s_bench/src/plan.rs)、[RangePager](../../../../etcd_k8s_bench/src/scheduler.rs)。以下覆盖本地 `RangeRequest` 全部 13 个字段。
 
 | 字段 / 类型 | Kubernetes 已审阅调用面 | 当前 benchmark 活跃取值 |
 | --- | --- | --- |
@@ -76,7 +76,7 @@
 
 ## KV Txn 及嵌套操作
 
-来源：Stage 004 ADR 的四类模板；[workload 构造与 CAS 状态机](../../etcd_k8s_bench/src/workload.rs)、[scheduler 的 execute_txn/compaction](../../etcd_k8s_bench/src/scheduler.rs)。这些都是一个 `KV/Txn` RPC 内的分支，不是独立 Put/Delete RPC。
+来源：Stage 004 ADR 的四类模板；[workload 构造与 CAS 状态机](../../../../etcd_k8s_bench/src/workload.rs)、[scheduler 的 execute_txn/compaction](../../../../etcd_k8s_bench/src/scheduler.rs)。这些都是一个 `KV/Txn` RPC 内的分支，不是独立 Put/Delete RPC。
 
 ### 四类模板与当前活跃性
 
@@ -136,7 +136,7 @@ Kubernetes journal 的 Get→point Watch 跟随与故障后约 1s 重建是另�
 
 ## Watch 双向流
 
-来源：[watch.rs](../../etcd_k8s_bench/src/watch.rs)、[plan.watch_specs](../../etcd_k8s_bench/src/plan.rs)、[Stage 006 Watch ADR](../stages/006-rule-driven-timed-pressure/docs/adr/005-watch-lifecycle-and-outcome-corrections.md)、Stage 004/ref。一个 Watch RPC 包含 create/cancel/progress 子请求，RequestProgress 不是单独 RPC。
+来源：[watch.rs](../../../../etcd_k8s_bench/src/watch.rs)、[plan.watch_specs](../../../../etcd_k8s_bench/src/plan.rs)、[Stage 006 Watch ADR](../../../stages/006-rule-driven-timed-pressure/docs/adr/005-watch-lifecycle-and-outcome-corrections.md)、Stage 004/ref。一个 Watch RPC 包含 create/cancel/progress 子请求，RequestProgress 不是单独 RPC。
 
 ### WatchCreateRequest 全字段
 
@@ -174,7 +174,7 @@ Kubernetes journal 的 Get→point Watch 跟随与故障后约 1s 重建是另�
 
 测量期断线/semantic terminal 形成覆盖缺口，其他压力继续；重连不能清除已有缺口。Kubernetes 的完整 reflector/relist 行为不是 bench 的恢复保证。
 
-最终 per-run Watch `payload_bytes` 由 [MeasurementRecorder::watch_response](../../etcd_k8s_bench/src/measurement.rs) 累加 `Event.encoded_len()`，不含外层 WatchResponse/header/transport。bench 不维护第二套局部 key/value 字节累加；proxy detail 日志仍有自己的 key/value 字节口径，不能混作同一指标。
+最终 per-run Watch `payload_bytes` 由 [MeasurementRecorder::watch_response](../../../../etcd_k8s_bench/src/measurement.rs) 累加 `Event.encoded_len()`，不含外层 WatchResponse/header/transport。bench 不维护第二套局部 key/value 字节累加；proxy detail 日志仍有自己的 key/value 字节口径，不能混作同一指标。
 
 ## LeaseGrant 与 native TTL
 
@@ -242,7 +242,7 @@ proxy 在 `main.rs` 仅注册 KV/Watch/Lease/Maintenance。以下“转发”表
 - Watch 区分上游 Status 与 clean EOF，下游输入错误通过 oneshot 通知响应任务；KeepAlive 输入错误目前与 EOF 都结束请求流，不能宣称所有流错误完全透明。
 - 默认上下游消息上限 64MiB，可由 `--max-message-size` 调整。没有独立 TLS/Auth 配置面或自动重试/重连保证。
 - 日志可能包含完整请求/Watch value，不能当脱敏审计；有界日志背压会影响数据面。logger flush 不是 fsync 持久性保证。
-- Cluster/Auth 未注册；[v3lock.proto](../../proto/v3lock.proto)、[v3election.proto](../../proto/v3election.proto) 未进入当前 build 输入。LeaseCheckpoint 虽有 message，当前 Lease service/代理不因此具备公开 Checkpoint RPC。
+- Cluster/Auth 未注册；[v3lock.proto](../../../../proto/v3lock.proto)、[v3election.proto](../../../../proto/v3election.proto) 未进入当前 build 输入。LeaseCheckpoint 虽有 message，当前 Lease service/代理不因此具备公开 Checkpoint RPC。
 
 ## 错误、重试与响应校验
 
@@ -257,7 +257,7 @@ proxy 在 `main.rs` 仅注册 KV/Watch/Lease/Maintenance。以下“转发”表
 | Watch no-leader、compacted、server canceled、其他非重试状态 | semantic terminal；准备期失败，测量期记 gap 并继续其他压力 |
 | 本地 supervisor 取消 | 正常回收或用户中断，不能伪装服务端 terminal；不证明远端未提交 |
 
-Kubernetes 上层会将部分错误映射为 404/409/410/504、重新 LIST 或业务 reconcile；这些是 apiserver/client 层行为，不是本工具承诺返回 HTTP 状态。详细研究见 [错误分析](../../ref/k8s_etcd_error_handling_analysis.md)，实现入口见 [ClientError](../../etcd_k8s_bench/src/client.rs) 与 [工程错误指南](../docs/ERROR_HANDLING.md)。
+Kubernetes 上层会将部分错误映射为 404/409/410/504、重新 LIST 或业务 reconcile；这些是 apiserver/client 层行为，不是本工具承诺返回 HTTP 状态。实现入口见 [ClientError](../../../../etcd_k8s_bench/src/client.rs) 与 [工程错误指南](../../convention/error-handling.md)。
 
 当前重试参数：Range 每页最多 8 次 attempt，所有页共享一次逻辑操作 deadline，重试不额外退避；周期 Status 无独立 attempt 上限，以操作 deadline 为界、每次最多睡眠 10ms；对象 CAS 冲突在同一操作期限内重建请求，不重放可变 transport 错误。只读 transient Code 为 Unavailable/DeadlineExceeded/ResourceExhausted/Aborted，timeout 通过 typed source/Code 识别，不解析正文猜测。活跃 RPC 错误路径均按 RequestDisposition::Unknown 分类，NotSent 仅在有结构化未发送证据时才成立。
 
@@ -267,18 +267,10 @@ Watch 使用独立恢复策略：退避 `50ms × min(reconnects,20)`，open/back
 
 1. **Create 文案差异已按实现澄清**：当前 `build_create_txn` 的 failure 为空，Update/Delete/journal 才带 Range；旧活动说明曾一概写 failure Range。不能为匹配文案新增一次请求。
 2. **Range 校验未全覆盖**：`RangePager::observe_response` 检查 snapshot revision 与 `more=true` 空页，但未见完整 key 范围、排序和跨页推进校验。前文所列为应有协议语义，不声称当前 bench 完整检测异常后端。
-3. **Watch ready/阶段字段**：recorder 仅准备期清零 storage.ready；最终字段不能简单解释为当前连接数。断线/terminal 仍通过 gap 影响 observation_complete；跨阶段 disconnect/terminal 投影另有源码风险，未由本次文档整理验证。
+3. **Watch ready/阶段字段**：recorder 仅准备期清零 storage.ready；最终字段不能简单解释为当前连接数。断线/terminal 仍通过 gap 影响 observation_complete；跨阶段 disconnect/terminal 投影另有源码风险，未经验证。
 4. **协议版本差异**：上游研究的 MemberList.linearizable、较新 Status 字段不在本地 proto；Kubernetes 需求与当前工具强类型参数面分别列示，不静默扩充 schema。
-5. **验证范围**：这些表来自当前源码、proto 与已接受资料的字段核对。本次没有重跑 RPC/故障/高压实验；生成了请求不等于后端完整兼容，通过正常 smoke 不等于故障路径已证明。
+5. **验证范围**：这些表来自当前源码、proto 与已接受资料的字段核对；不等于重跑过 RPC/故障/高压实验。生成了请求不等于后端完整兼容，通过正常 smoke 不等于故障路径已证明。
 
-## 研究资料索引与维护
+## 维护
 
-- [特性与字段使用分析](../../ref/k8s_etcd_feature_usage_analysis.md)：调用与字段面。
-- [存储后端需求综合](../../ref/k8s_storage_backend_requirements.md)：apiserver 与 kubeadm 范围、revision/一致性/TTL 边界。
-- [Range QA](../../ref/k8s_etcd_range_qa.md)：prefix、namespace、分页。
-- [Watch prefix 与删除 QA](../../ref/k8s_etcd_watch_prefix_and_delete_qa.md)：对象/journal Watch、点删除参数。
-- [Lease 使用分析](../../ref/k8s_etcd_lease_usage_analysis.md)：Grant、reuse 与 NodeLease 区别。
-- [错误处理分析](../../ref/k8s_etcd_error_handling_analysis.md)：分层转换与恢复。
-- [官方文档使用模式汇总](../../ref/kubernetes-1.35-etcd-usage-patterns.md)：外部来源及其适用版本，不能从文档规模建议推导合成压力。
-
-修改请求构造、proto、proxy 注册面或 Stage 范围时，变更作者同步更新本文的参数/活跃性/差异，并在 [设计目标](design-goals.md) 同步当前有效目标与边界。旧 ref/ADR 留作来源，不再把它们的旧 benchmark 状态当当前支持面；保留真实的 Kubernetes 研究边界。审批依据仍是已接受决定，文档不能把实现缺陷合法化。
+本文是发布仓库内 Kubernetes 研究结论的唯一参数级汇总，研究基线见“来源与阅读规则”。修改请求构造、proto、proxy 注册面或 Stage 范围时，变更作者同步更新本文的参数/活跃性/差异，并在 [设计目标](design-goals.md) 同步当前有效目标与边界。旧 ADR 留作批准来源，不把它们的旧 benchmark 状态当当前支持面；保留真实的 Kubernetes 研究边界。审批依据仍是已接受决定，文档不能把实现缺陷合法化。

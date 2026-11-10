@@ -4,11 +4,11 @@
 
 `etcd_k8s_toolkit` 的当前产品目标是：**按 Kubernetes 访问规则生成固定存量，在独立真实时间窗口内按目标速率和周期施压，以可解释、可核算的结果粗略评估和比较存储后端承载能力。**
 
-本文只记录当前目标、非目标、领域概念与验收要求，不记录设计演进、旧目标或实施状态。参数级协议边界见 [API 子集](api-subset.md)，工程编码/测试规则见 [工程知识索引](../docs/index.md)，操作命令见 [README](../../README_zh.md)。决策依据另见 [设计索引](../docs/design-docs/index.md)。
+本文只记录当前目标、非目标、领域概念与验收要求，不记录设计演进、旧目标或实施状态。参数级协议边界见 [API 子集](api-subset.md)，工程编码/测试规则见根 [AGENTS](../../../../AGENTS.md) 导航，操作命令见 [README](../../../../README_zh.md)。决策依据另见 [设计索引](index.md)。
 
 ## 适用边界
 
-本文描述应满足的产品契约，不是实现完成或验收通过声明。详细验收条件见 [执行规格](../stages/006-rule-driven-timed-pressure/spec/timed-pressure.md)，实现导航见 [设计说明](../../etcd_k8s_bench/DESIGN_zh.md)。
+本文描述应满足的产品契约，不是实现完成或验收通过声明。详细验收条件见 [执行规格](../../../stages/006-rule-driven-timed-pressure/spec/timed-pressure.md)，实现导航见 [设计说明](../../../../etcd_k8s_bench/DESIGN_zh.md)。
 
 当前 benchmark 不施加 native Lease 压力；这不改变 Kubernetes 对 native Lease 的需求，也不限制 proxy 的通用 Lease 转发能力。三者的参数范围分别以 API 子集文档为准。
 
@@ -44,7 +44,7 @@
 
 ### 配置与默认条件
 
-唯一默认参数源是 [synthetic-k8s.json](../../etcd_k8s_bench/workloads/synthetic-k8s.json)；本文数值是该配置的可读投影，不另立默认值。外部 JSON 完整替换，CLI 标量最后覆盖，再统一校验；未知字段拒绝。`plan` 与 `run` 共用同一个生效配置与编译计划，`plan` 不连接后端。
+唯一默认参数源是 [synthetic-k8s.json](../../../../etcd_k8s_bench/workloads/synthetic-k8s.json)；本文数值是该配置的可读投影，不另立默认值。外部 JSON 完整替换，CLI 标量最后覆盖，再统一校验；未知字段拒绝。`plan` 与 `run` 共用同一个生效配置与编译计划，`plan` 不连接后端。
 
 | 条件 | 当前默认 | 解释 |
 | --- | --- | --- |
@@ -96,7 +96,7 @@
 
 ## 结果可信性要求
 
-- 计划、投放、接受 cohort、阶段事件、桶和 HDR 观测分别可对账；跨 cutoff 的开始/完成合法，不强制 drain terminal 小于 drain starts。cutoff queued/running 是最终 cohort 残差，不是取消时间可追溯的实时快照，公式见 [设计说明](../../etcd_k8s_bench/DESIGN_zh.md#事件归属与守恒)。
+- 计划、投放、接受 cohort、阶段事件、桶和 HDR 观测分别可对账；跨 cutoff 的开始/完成合法，不强制 drain terminal 小于 drain starts。cutoff queued/running 是最终 cohort 残差，不是取消时间可追溯的实时快照，公式见 [设计说明](../../../../etcd_k8s_bench/DESIGN_zh.md#事件归属与守恒)。
 - logical 延迟从接受到终止，含排队；queue wait 从接受到开始；RPC 延迟只覆盖单次 attempt。可表示样本数与 overflow 之和对账对应事件；取消另列 censored，不造完成样本。成功/失败共用 HDR 不等于可重建 per-outcome 分布。
 - `timeout` 与 `result_unknown` 是可重叠的 failed 子集，不能相加。可变请求已发送但响应丢失时不盲重放。
 - Watch 只累计实际可观察区间，重连不抹去先前缺口；截止后的回收不能改写已冻结测量窗口。完整 relist 不在当前范围。

@@ -39,33 +39,34 @@
 - 已有测试通过不等于质量合格；测试质量也不以通过数量、行覆盖率或 mock 数量衡量。
 - 旧目标被新设计替代时迁移对应行为测试，不继续冻结旧实现；仍有效的协议、安全和生命周期契约必须保留。
 - 此规则不是自动删除现有测试的授权。仅请求审查时先交付完整证据与逐项结论，未经实施请求不批量删改测试。
+
 ## 规则来源与适用范围
 
-以上“测试要求”及四个子节从本仓库原 `AGENTS.md` 原文迁入，适用范围不变；这是测试规则的唯一权威维护位置。初始化不授权批量改写或删除测试。
+以上“测试要求”及四个子节是本工作区测试规则的唯一权威维护位置，适用于本工作区的新增测试、测试修改和测试审查。
 
 ## 现有测试组织
 
-**现有实践**：bench 的 Rust 行为测试位于 `etcd_k8s_bench/tests/unit/*.rs`，由对应 `src` 模块通过 `#[path]` 引入；proxy 仍有内联测试。bench 的 [client 测试](../../etcd_k8s_bench/tests/unit/client.rs)、[watch 测试](../../etcd_k8s_bench/tests/unit/watch.rs)、[scheduler 测试](../../etcd_k8s_bench/tests/unit/scheduler.rs) 使用协议 fixture 验证客户端与生命周期。[Python 测试](../../etcd_k8s_bench/verify/test_verify.py) 覆盖离线报告检查及采集器真实进程/信号行为。fixture 不证明真实 etcd 性能。
+**现有实践**：bench 的 Rust 行为测试位于 `etcd_k8s_bench/tests/unit/*.rs`，由对应 `src` 模块通过 `#[path]` 引入；proxy 仍有内联测试。bench 的 [client 测试](../../../etcd_k8s_bench/tests/unit/client.rs)、[watch 测试](../../../etcd_k8s_bench/tests/unit/watch.rs)、[scheduler 测试](../../../etcd_k8s_bench/tests/unit/scheduler.rs)使用协议 fixture 验证客户端与生命周期。[Python 测试](../../../etcd_k8s_bench/verify/test_verify.py)覆盖离线报告检查及采集器真实进程/信号行为。fixture 不证明真实 etcd 性能。
 
-真实实验的前置条件和解释口径以 [使用说明](../../README_zh.md)、[设计说明](../../etcd_k8s_bench/DESIGN_zh.md) 为准；历史运行记录见 [Stage 006 VERIFY](../stages/006-rule-driven-timed-pressure/VERIFY.md)。历史通过数不是本次运行结果。
+真实实验的前置条件和解释口径以 [使用说明](../../../README_zh.md)、[设计说明](../../../etcd_k8s_bench/DESIGN_zh.md)为准；历史运行记录见 [Stage 006 VERIFY](../../stages/006-rule-driven-timed-pressure/VERIFY.md)。历史通过数不代表当前运行结果。
 
-## 命令与验证状态
+## 常用命令
 
-以下命令工作目录均为仓库根目录。**本次仅文档初始化，以下构建、格式化、测试和后端实验命令均未执行**。
+以下命令工作目录均为仓库根目录。
 
 | 命令 | 前置条件与来源 | 用途 |
 | --- | --- | --- |
-| `cargo build --release --workspace` | Rust 2024 工具链、Cargo 依赖可用、`protoc` 可用；[README](../../README_zh.md)、两个 crate 的 `build.rs` | 构建两个二进制 |
+| `cargo build --release --workspace` | Rust 2024 工具链、Cargo 依赖可用、`protoc` 可用；[README](../../../README_zh.md)、两个 crate 的 `build.rs` | 构建两个二进制 |
 | `cargo check --workspace` | 同上；Stage 006 VERIFY | 工作区编译检查 |
 | `cargo test --workspace` | 同上；Stage 006 VERIFY；dev-dependency 启用 Tokio `test-util` | Rust 行为测试，不代替真实后端验证 |
-| `cargo +nightly-2026-04-11 fmt --all -- --check` | 对应 rustup 工具链及 rustfmt；[格式配置](../../rustfmt.toml)、Stage 006 VERIFY | 复用历史 formatter 命令；仓库未发现统一工具链 pin，不能称其为永久规定版本 |
+| `cargo +nightly-2026-04-11 fmt --all -- --check` | 对应 rustup 工具链及 rustfmt；[格式配置](../../../rustfmt.toml) | 格式检查 |
 | `python3 -m unittest discover -s etcd_k8s_bench/verify -p test_verify.py -v` | Python 3.10+、标准库；Stage 006 VERIFY、Python 测试入口 | checker 与 runner 测试 |
 | `./target/release/etcd_k8s_bench plan --config etcd_k8s_bench/verify/synthetic-small.json` | 已构建 release binary；README | 无后端计划 smoke |
 
 真实 `run`、`run_synthetic.py` 与 `check_report.py` 完整参数沿用 README，不在这里复制。必须显式指定专用可丢弃空后端、已有 etcdctl、全新输出目录；checker 传实际子进程退出码。工具不管理后端、不清库、不调整 quota。报告一致不等于实验成功。
 
-对抗审查修复的计划批准、受控时钟/信号回归和本次实际执行结果集中于 [修复计划](../../tasks/plan.md)。executor 使用 Tokio 单调时钟，纯 CAS 只接收同域转换值；网络 I/O 与 paused-clock 的自动推进不能混作完成同步。测试通过数以该执行记录为准，不覆盖上表保留的初始化历史声明。
+executor 采样 Tokio 单调时钟，纯 CAS 状态机只接收同域转换的时间值；网络 I/O 与 paused-clock 的自动推进不能混作完成同步。历史执行与验收记录见 [修复计划](../../../tasks/plan.md) 与各 Stage VERIFY，历史通过数不代表当前运行结果。
 
 ## 文档验证
 
-未发现专用文档检查命令或仓库 CI 配置。本次使用临时只读脚本检查新增/修改 Markdown 的本地链接与章节锚点，比较迁移规则原文，并从根入口走查两个任务；结果与缺口见 [索引](index.md)。不引入 CI 或永久检查脚手架。
+仓库无专用文档检查命令或 CI。文档变更必须保证本地文件链接与章节锚点有效、规则不出现第二个维护位置；可用一次性只读脚本核查，不引入永久脚手架。已知缺口见 [技术债务](../arch/tech-debt.md)。

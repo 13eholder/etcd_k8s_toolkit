@@ -1,9 +1,29 @@
 # etcd_k8s_toolkit
 
-Cargo 工作区包含：
+面向 etcd 兼容存储后端评估的工具集，外加可观测的 etcd gRPC 代理。Cargo 工作区包含：
 
 - `etcd_proxy`：基于 tonic 的 etcd 代理，支持缓冲 JSONL 请求日志；
 - `etcd_k8s_bench`：Kubernetes 形状的 etcd API 压测器。
+
+`etcd_k8s_bench` 按规则驱动、定时、开环方式施压：建模六类资源域和 Kubernetes 形状的 etcd 请求，先准备固定存量，再在单一真实时间窗口内按目标逻辑速率投放。结果用于可解释、可核算地比较存储后端承载能力——**不是** Kubernetes 控制面、生产流量重放或 Kubernetes 容量换算。
+
+## 仓库结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `etcd_proxy/` | etcd gRPC 代理：KV/Watch/Lease/Maintenance 转发与 JSONL 请求日志 |
+| `etcd_k8s_bench/` | 压测器：config、plan、scheduler、client、workload、watch、measurement、report、metrics |
+| `etcd_k8s_bench/workloads/` | 内嵌默认负载 `synthetic-k8s.json` |
+| `etcd_k8s_bench/verify/` | Python 证据采集器与离线报告检查器 |
+| `etcd_k8s_bench/monitoring/` | 本机 Prometheus + Grafana 看板指南 |
+| `proto/` | 共享 etcd RPC schema，由两个 crate 编译——改 proto，不改生成代码 |
+| `.agents/context/` | 智能体知识库：约定与设计/架构文档 |
+
+## 前置依赖
+
+- 支持 edition 2024 的 Rust 工具链（rustup 安装）。
+- `protoc` 在 PATH 中：两个 `build.rs` 都要编译 `proto/rpc.proto`。
+- 验证工具需要 Python 3.10+ 标准库，无第三方依赖。
 
 ## 启动 etcd_proxy
 
@@ -15,11 +35,11 @@ cargo run --release -p etcd_proxy -- \
   --log-file etcd_proxy.jsonl
 ```
 
-完整日志和 transport 参数见 `cargo run -p etcd_proxy -- --help`。
+完整日志和 transport 参数见 `cargo run -p etcd_proxy -- --help`。proxy 是协议观测工具，不是存储实现：把已注册的 KV/Watch/Lease/Maintenance 方法转发到单一上游 endpoint 并记录日志；确切转发面与已知限制见 [API 子集](.agents/context/arch/design-docs/api-subset.md#proxy-转发参数面)。
 
 ## 规则驱动的定时合成压力
 
-`etcd_k8s_bench` 使用六类资源的合成存量与 Kubernetes 形状的 etcd 请求，按真实时间开环投放。它不是生产 trace 重放、Kubernetes 控制面或容量换算模型。value 是合成字节，不是可交给 apiserver 的 API 对象；不模拟真实 rollout、watch-cache、控制器因果关系或 native TTL 持续压力。
+value 是合成字节，不是可交给 apiserver 的 API 对象；不模拟真实 rollout、watch-cache、控制器因果关系或 native TTL 生命周期。
 
 ### 构建与查看计划
 
@@ -72,7 +92,7 @@ NodeLease 每 10s 更新，带确定性 5% jitter；Node status 每 300s，Statu
 
 | 退出码 | 意义 |
 | --- | --- |
-| 0 | 实验完成；不表示压力达标或 Watch 观测完整 |
+| 0 | 实验完成；不表示压力达标或 Watch 观察完整 |
 | 1 | 执行、setup 或生命周期失败 |
 | 2 | 参数或配置错误 |
 | 130 | 中断 |
@@ -81,7 +101,7 @@ NodeLease 每 10s 更新，带确定性 5% jitter；Node status 每 300s，Statu
 
 `dropped_full` 是目标 key shard 的队列满，不代表所有 worker 队列都满。`cutoff_queued/running` 是最终 accepted cohort 推导的截止残差，包含可能早于截止发生的取消，不是实时队列快照；完整公式见[事件归属与守恒](etcd_k8s_bench/DESIGN_zh.md#事件归属与守恒)。
 
-Watch coverage、observation_complete 与工作量守恒分开判断，重连不抹掉历史缺口。HDR 的 `sample_count + overflow` 才是已观测数量；取消另列 censored，不加入完成样本。成功和错误共用 HDR，timeout 延迟不表示后端实际完成时间。HDR 向上取整到至少1µs，在线微秒 sum/count/max 向下截断，两者不是同一舍入口径。protobuf payload 字节不等于 wire/TLS/网络字节；在线 Prometheus 和低频 CPU/RSS 不能替代最终报告，采样 RSS 峰值不是精确进程最大值。
+Watch coverage、observation_complete 与工作量守恒分开判断，重连不抹掉历史缺口。HDR 的 `sample_count + overflow` 才是已观测数量；取消另列 censored，不加入完成样本。成功和错误共用 HDR，timeout 延迟不表示后端实际完成时间。HDR 向上取整到至少 1µs，在线微秒 sum/count/max 向下截断，两者不是同一舍入口径。protobuf payload 字节不等于 wire/TLS/网络字节；在线 Prometheus 和低频 CPU/RSS 不能替代最终报告，采样 RSS 峰值不是精确进程最大值。
 
 ### 最小 Prometheus + Grafana 看板
 
@@ -109,8 +129,17 @@ python3 etcd_k8s_bench/verify/check_report.py \
 
 必须传真实子进程退出码，不能假定为 0。可选 `--keyspace PATH` 检查采集的最终 etcdctl keys-only JSON。checker 返回 0 仅表示所提供证据一致，不代表实验成功；未提供 plan/keyspace 时明确列为未检查。runner 的 `--timeout-seconds` 是外部 watchdog，不是测量时长；`--interrupt-after-seconds` 从子进程启动计时，包含准备阶段。可选 `--backend-metrics-url` 采集后端指标。采集错误、watchdog 和强杀不能伪装正常完成。
 
-runner 将收到的 SIGINT/SIGTERM 转为当前子进程的一次优雅 SIGINT，并保留原始信号与真实子进程退出码；正常优雅中断仍为130。plan 失败，或输出打开后的最终启动门禁发现已锁存取消，不会启动 run；未执行原因写入 `run-invocation.json`，不生成假报告，`check.json` 标明未检查。进入启动操作后才到来的取消按已执行子进程处理，不承诺原子撤回启动。采样/后置采集被取消时保存跳过原因；watchdog 在已有 SIGINT 后仍有强杀期限，工具故障优先返回1。
+runner 将收到的 SIGINT/SIGTERM 转为当前子进程的一次优雅 SIGINT，并保留原始信号与真实子进程退出码；正常优雅中断仍为 130。plan 失败，或输出打开后的最终启动门禁发现已锁存取消，不会启动 run；未执行原因写入 `run-invocation.json`，不生成假报告，`check.json` 明确列为未检查。进入启动操作后才到来的取消按已执行子进程处理，不承诺原子撤回启动。采样/后置采集被取消时保存跳过原因；watchdog 在已有 SIGINT 后仍有强杀期限，工具故障优先返回 1。
 
-checker 核对可见计数、类型范围和算式，不以 `accounting=true` 代替核验；内部历史算术溢出状态不能由最终摘要完全证明。修复范围、reviewer 批准和本次验证见[修复计划](tasks/plan.md)。
+checker 核对可见计数、类型范围和算式，不以 `accounting=true` 代替核验；内部历史算术溢出状态不能由最终摘要完全证明。
 
-协议详见 [API 子集](.agents/domain/api-subset.md)，实现边界见 [设计说明](etcd_k8s_bench/DESIGN_zh.md)。
+## 文档
+
+- [设计说明（中文）](etcd_k8s_bench/DESIGN_zh.md)：模块边界、生命周期、事件归属与守恒；
+- [设计目标（中文）](.agents/context/arch/design-docs/design-goals.md)：当前目标、非目标、结果语义与验收要求；
+- [API 子集（中文）](.agents/context/arch/design-docs/api-subset.md)：参数级 key、CAS、分页、Watch 语义与 proxy 转发面；
+- [监控指南](etcd_k8s_bench/monitoring/README.md)：本机 Prometheus + Grafana 看板。
+
+## 许可证
+
+Apache-2.0，见 [LICENSE](LICENSE)。
