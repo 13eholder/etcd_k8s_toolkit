@@ -18,8 +18,8 @@
 | --- | --- | --- |
 | `etcd_k8s_bench` | 规则到计划、存量准备、开环混合负载、生命周期、每次运行计量 | 完整 Kubernetes 控制面、通用 etcd 兼容认证 |
 | `etcd_proxy` | etcd gRPC 转发、局部请求与 Watch 观测 | 自身实现存储、持久性、透明覆盖所有 etcd 服务/metadata |
-| `verify/run_synthetic.py` | 调用同一个 plan/run，保存配置、命令、原始输出、后端状态与采样 | 自动部署后端、清库、提高 quota |
-| `verify/check_report.py` | 离线独立检查可观察的报告算术与可选外部证据 | 重算原始 HDR 分位数、证明后端容量或全面兼容 |
+| `verify/run_synthetic.py`（仅内部，不入库） | 调用同一个 plan/run，保存配置、命令、原始输出、后端状态与采样 | 自动部署后端、清库、提高 quota |
+| `verify/check_report.py`（仅内部，不入库） | 离线独立检查可观察的报告算术与可选外部证据 | 重算原始 HDR 分位数、证明后端容量或全面兼容 |
 
 高压力比较默认直连后端，避免逐请求日志改变被测负载。proxy 可用于小规模协议证据；不是主路径必经层。后端与生成器同机时记录资源竞争。
 

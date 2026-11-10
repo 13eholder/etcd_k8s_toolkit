@@ -20,7 +20,6 @@ or a conversion to Kubernetes capacity.
 | `etcd_proxy/` | etcd gRPC proxy: KV/Watch/Lease/Maintenance forwarding plus JSONL request logging |
 | `etcd_k8s_bench/` | pressure generator: config, plan, scheduler, client, workload, watch, measurement, report, metrics |
 | `etcd_k8s_bench/workloads/` | embedded default workload `synthetic-k8s.json` |
-| `etcd_k8s_bench/verify/` | Python evidence runner and offline report checker |
 | `etcd_k8s_bench/monitoring/` | local Prometheus + Grafana dashboard guide |
 | `proto/` | shared etcd RPC schema, compiled by both crates — edit the proto, never the generated code |
 | `.agents/context/` | agent knowledge base: conventions and design/arch docs (中文) |
@@ -29,7 +28,6 @@ or a conversion to Kubernetes capacity.
 
 - A Rust toolchain supporting edition 2024 (install via rustup).
 - `protoc` on `PATH`: both `build.rs` scripts compile `proto/rpc.proto`.
-- Python 3.10+ standard library for the verify tools (no third-party packages).
 
 ## Run etcd_proxy
 
@@ -57,7 +55,6 @@ controller causality, or native TTL lifecycle is simulated.
 ```sh
 cargo build --release --workspace
 ./target/release/etcd_k8s_bench plan
-./target/release/etcd_k8s_bench plan --config etcd_k8s_bench/verify/synthetic-small.json
 ./target/release/etcd_k8s_bench run --help
 ```
 
@@ -93,16 +90,19 @@ native lease. All resource values default to 4,096 bytes except NodeLease (512).
 
 The benchmark writes data. Supply a dedicated disposable etcd endpoint; never
 point these examples at a production cluster. Status and a full-keyspace
-count-only preflight must succeed, and any existing key causes rejection.
-Neither benchmark nor verification tooling clears the backend or changes quota.
-Use a new empty instance/data directory for every run.
+count-only preflight must succeed, and any existing key causes rejection. The
+benchmark never clears the backend or changes quota. Use a new empty
+instance/data directory for every run.
 
 ```sh
 ./target/release/etcd_k8s_bench run \
-  --config etcd_k8s_bench/verify/synthetic-small.json \
   --endpoint http://127.0.0.1:12379 \
   --metrics-listen 127.0.0.1:19898
 ```
+
+Omitting `--config` selects the embedded default: the full 600 s window at
+10,000 logical updates/s. Supply `--config` with your own JSON to run a
+different workload shape.
 
 Preparation creates all six resource domains, applies NodeReady updates, and
 waits for every Watch to be currently ready after Created. Preparation is outside
@@ -169,51 +169,6 @@ and errors, RPC throughput and mean/maximum latency, Watch, and etcd size/quota.
 Online metrics do not provide p99; use final JSON for exact quantiles. The exporter
 stops with the benchmark; Prometheus retains scraped history until retention or
 explicit storage-directory cleanup.
-
-### Capture repeatable evidence
-
-Python 3.10+ standard-library tools capture raw stdout/stderr, commands, binary
-SHA256, environment, backend status/keyspace, metrics, and process observations.
-The backend must already be running. The output directory must not exist.
-
-```sh
-python3 etcd_k8s_bench/verify/run_synthetic.py \
-  --binary ./target/release/etcd_k8s_bench \
-  --etcdctl /usr/local/bin/etcdctl \
-  --endpoint http://127.0.0.1:12379 \
-  --config etcd_k8s_bench/verify/synthetic-small.json \
-  --metrics-listen 127.0.0.1:19898 \
-  --output-dir /tmp/synthetic-evidence-new \
-  --timeout-seconds 240
-
-python3 etcd_k8s_bench/verify/check_report.py \
-  --report /tmp/synthetic-evidence-new/run.stdout.json \
-  --exit-code 0 \
-  --plan /tmp/synthetic-evidence-new/plan.stdout.json
-```
-
-Pass the actual child exit code to the checker, not an assumed zero. Optional
-`--keyspace PATH` checks the captured final etcdctl keys-only JSON.
-Checker exit 0 means supplied evidence is consistent, not that the experiment
-succeeded; omitted plan/keyspace checks are reported as unchecked. The runner's
-`--timeout-seconds` is an external watchdog, not measurement duration. Optional
-`--interrupt-after-seconds` is measured from child startup, including preparation.
-Optional `--backend-metrics-url` captures backend metrics. Collection failures and
-forced termination remain distinct from benchmark results.
-
-The runner latches SIGINT/SIGTERM and sends at most one graceful SIGINT per child,
-retaining the original signal and actual child return code. A graceful benchmark
-interruption remains 130. A failed plan or cancellation latched at the final gate
-after output files open prevents `run`. Cancellation after launch begins is handled
-as an executed child, not an atomic rollback of process creation. A skipped run
-has `executed:false`, a null exit code and a reason in its invocation metadata;
-it has no fabricated report, and `check.json` explicitly says not checked. Skipped
-sampling/post-run collection also records its reason. The watchdog still has a
-bounded kill deadline after an earlier SIGINT; tool failures return 1.
-
-The checker verifies observable counts, type ranges and arithmetic rather than
-trusting accounting flags. A final summary cannot independently prove all internal
-arithmetic history.
 
 ## Documentation
 

@@ -14,7 +14,6 @@
 | `etcd_proxy/` | etcd gRPC 代理：KV/Watch/Lease/Maintenance 转发与 JSONL 请求日志 |
 | `etcd_k8s_bench/` | 压测器：config、plan、scheduler、client、workload、watch、measurement、report、metrics |
 | `etcd_k8s_bench/workloads/` | 内嵌默认负载 `synthetic-k8s.json` |
-| `etcd_k8s_bench/verify/` | Python 证据采集器与离线报告检查器 |
 | `etcd_k8s_bench/monitoring/` | 本机 Prometheus + Grafana 看板指南 |
 | `proto/` | 共享 etcd RPC schema，由两个 crate 编译——改 proto，不改生成代码 |
 | `.agents/context/` | 智能体知识库：约定与设计/架构文档 |
@@ -23,7 +22,6 @@
 
 - 支持 edition 2024 的 Rust 工具链（rustup 安装）。
 - `protoc` 在 PATH 中：两个 `build.rs` 都要编译 `proto/rpc.proto`。
-- 验证工具需要 Python 3.10+ 标准库，无第三方依赖。
 
 ## 启动 etcd_proxy
 
@@ -46,7 +44,6 @@ value 是合成字节，不是可交给 apiserver 的 API 对象；不模拟真�
 ```sh
 cargo build --release --workspace
 ./target/release/etcd_k8s_bench plan
-./target/release/etcd_k8s_bench plan --config etcd_k8s_bench/verify/synthetic-small.json
 ./target/release/etcd_k8s_bench run --help
 ```
 
@@ -71,14 +68,15 @@ NodeLease 每 10s 更新，带确定性 5% jitter；Node status 每 300s，Statu
 
 ### 在专用空后端运行
 
-工具会写数据。必须显式提供专用、可丢弃的 etcd endpoint，不要使用生产集群。Status 和全 keyspace count-only preflight 必须成功，任意已有 key 均导致拒绝。benchmark 和验证工具均不清库、不调整 quota；每次运行使用新空实例及数据目录。
+工具会写数据。必须显式提供专用、可丢弃的 etcd endpoint，不要使用生产集群。Status 和全 keyspace count-only preflight 必须成功，任意已有 key 均导致拒绝。benchmark 不清库、不调整 quota；每次运行使用新空实例及数据目录。
 
 ```sh
 ./target/release/etcd_k8s_bench run \
-  --config etcd_k8s_bench/verify/synthetic-small.json \
   --endpoint http://127.0.0.1:12379 \
   --metrics-listen 127.0.0.1:19898
 ```
+
+省略 `--config` 即使用内嵌默认负载：完整 600 s 窗口、10,000 逻辑更新/s。需要不同负载形状时用 `--config` 提供自己的 JSON。
 
 准备阶段建立六类资源、执行 NodeReady，并等待全部 Watch 收到 Created 且当前仍 ready。准备不计入测量窗口。投放粒度为 **1ms**；调度迟到会跳过过期 slots，不补发追赶、不等待成功配额。单 tick 内可以批量投放。队列满明确丢弃，不扩大队列掩盖过载。
 
@@ -106,32 +104,6 @@ Watch coverage、observation_complete 与工作量守恒分开判断，重连不
 ### 最小 Prometheus + Grafana 看板
 
 [运行指南与配置](etcd_k8s_bench/monitoring/README.md)提供本机原生 Prometheus 和 Grafana 的启动、看板自动加载、指标口径及清理命令。六个面板覆盖更新目标/实际投放、漏投/丢弃/错误、RPC 吞吐与平均/最大延迟、Watch、etcd 空间/quota。在线指标不提供 p99；准确分位数读取最终 JSON。bench 退出后 exporter 关闭，历史抓取由 Prometheus 保留，直到 retention 或显式清理存储目录。
-
-### 采集可重复证据
-
-Python 3.10+ 标准库工具保存原始 stdout/stderr、命令、二进制 SHA256、机器信息、后端 status/keyspace、metrics 与进程采样。后端由操作者预先启动，输出目录必须不存在。
-
-```sh
-python3 etcd_k8s_bench/verify/run_synthetic.py \
-  --binary ./target/release/etcd_k8s_bench \
-  --etcdctl /usr/local/bin/etcdctl \
-  --endpoint http://127.0.0.1:12379 \
-  --config etcd_k8s_bench/verify/synthetic-small.json \
-  --metrics-listen 127.0.0.1:19898 \
-  --output-dir /tmp/synthetic-evidence-new \
-  --timeout-seconds 240
-
-python3 etcd_k8s_bench/verify/check_report.py \
-  --report /tmp/synthetic-evidence-new/run.stdout.json \
-  --exit-code 0 \
-  --plan /tmp/synthetic-evidence-new/plan.stdout.json
-```
-
-必须传真实子进程退出码，不能假定为 0。可选 `--keyspace PATH` 检查采集的最终 etcdctl keys-only JSON。checker 返回 0 仅表示所提供证据一致，不代表实验成功；未提供 plan/keyspace 时明确列为未检查。runner 的 `--timeout-seconds` 是外部 watchdog，不是测量时长；`--interrupt-after-seconds` 从子进程启动计时，包含准备阶段。可选 `--backend-metrics-url` 采集后端指标。采集错误、watchdog 和强杀不能伪装正常完成。
-
-runner 将收到的 SIGINT/SIGTERM 转为当前子进程的一次优雅 SIGINT，并保留原始信号与真实子进程退出码；正常优雅中断仍为 130。plan 失败，或输出打开后的最终启动门禁发现已锁存取消，不会启动 run；未执行原因写入 `run-invocation.json`，不生成假报告，`check.json` 明确列为未检查。进入启动操作后才到来的取消按已执行子进程处理，不承诺原子撤回启动。采样/后置采集被取消时保存跳过原因；watchdog 在已有 SIGINT 后仍有强杀期限，工具故障优先返回 1。
-
-checker 核对可见计数、类型范围和算式，不以 `accounting=true` 代替核验；内部历史算术溢出状态不能由最终摘要完全证明。
 
 ## 文档
 

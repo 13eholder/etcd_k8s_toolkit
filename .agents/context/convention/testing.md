@@ -46,7 +46,7 @@
 
 ## 现有测试组织
 
-**现有实践**：bench 的 Rust 行为测试位于 `etcd_k8s_bench/tests/unit/*.rs`，由对应 `src` 模块通过 `#[path]` 引入；proxy 仍有内联测试。bench 的 [client 测试](../../../etcd_k8s_bench/tests/unit/client.rs)、[watch 测试](../../../etcd_k8s_bench/tests/unit/watch.rs)、[scheduler 测试](../../../etcd_k8s_bench/tests/unit/scheduler.rs)使用协议 fixture 验证客户端与生命周期。[Python 测试](../../../etcd_k8s_bench/verify/test_verify.py)覆盖离线报告检查及采集器真实进程/信号行为。fixture 不证明真实 etcd 性能。
+**现有实践**：bench 的 Rust 行为测试位于 `etcd_k8s_bench/tests/unit/*.rs`，由对应 `src` 模块通过 `#[path]` 引入；proxy 仍有内联测试。bench 的 [client 测试](../../../etcd_k8s_bench/tests/unit/client.rs)、[watch 测试](../../../etcd_k8s_bench/tests/unit/watch.rs)、[scheduler 测试](../../../etcd_k8s_bench/tests/unit/scheduler.rs)使用协议 fixture 验证客户端与生命周期。内部 verify 工具的 Python 单元测试仅本地保留（`etcd_k8s_bench/verify/`，不入库）。fixture 不证明真实 etcd 性能。
 
 真实实验的前置条件和解释口径以 [使用说明](../../../README_zh.md)、[设计说明](../../../etcd_k8s_bench/DESIGN_zh.md)为准；历史运行记录见 [Stage 006 VERIFY](../../stages/006-rule-driven-timed-pressure/VERIFY.md)。历史通过数不代表当前运行结果。
 
@@ -60,10 +60,9 @@
 | `cargo check --workspace` | 同上；Stage 006 VERIFY | 工作区编译检查 |
 | `cargo test --workspace` | 同上；Stage 006 VERIFY；dev-dependency 启用 Tokio `test-util` | Rust 行为测试，不代替真实后端验证 |
 | `cargo +nightly-2026-04-11 fmt --all -- --check` | 对应 rustup 工具链及 rustfmt；[格式配置](../../../rustfmt.toml) | 格式检查 |
-| `python3 -m unittest discover -s etcd_k8s_bench/verify -p test_verify.py -v` | Python 3.10+、标准库；Stage 006 VERIFY、Python 测试入口 | checker 与 runner 测试 |
-| `./target/release/etcd_k8s_bench plan --config etcd_k8s_bench/verify/synthetic-small.json` | 已构建 release binary；README | 无后端计划 smoke |
+| `./target/release/etcd_k8s_bench plan` | 已构建 release binary | 无后端计划 smoke |
 
-真实 `run`、`run_synthetic.py` 与 `check_report.py` 完整参数沿用 README，不在这里复制。必须显式指定专用可丢弃空后端、已有 etcdctl、全新输出目录；checker 传实际子进程退出码。工具不管理后端、不清库、不调整 quota。报告一致不等于实验成功。
+真实 `run` 的完整参数沿用 README，不在这里复制。必须显式指定专用可丢弃空后端与全新输出目录；benchmark 不清库、不调整 quota。采集与核验工具（`run_synthetic.py`、`check_report.py`）仅内部保留，不入库。报告一致不等于实验成功。
 
 executor 采样 Tokio 单调时钟，纯 CAS 状态机只接收同域转换的时间值；网络 I/O 与 paused-clock 的自动推进不能混作完成同步。历史执行与验收记录（各 Stage VERIFY 与修复计划）仅本地保留，历史通过数不代表当前运行结果。
 

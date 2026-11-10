@@ -18,7 +18,6 @@
 | 高分辨率投放等待 | [pacing](../../../etcd_k8s_bench/src/pacing.rs) | 在投放调用线程直接等待，每次 sleep 请求至多 1ms 后协作式 yield；无额外线程，不改变迟到跳过和有界队列语义 |
 | RPC 与状态转换 | [client](../../../etcd_k8s_bench/src/client.rs)、[workload](../../../etcd_k8s_bench/src/workload.rs)、[watch](../../../etcd_k8s_bench/src/watch.rs) | 传输结果、CAS 冲突、Watch 语义终止分别处理 |
 | 计量与输出 | [measurement](../../../etcd_k8s_bench/src/measurement.rs)、[report](../../../etcd_k8s_bench/src/report.rs)、[metrics](../../../etcd_k8s_bench/src/metrics.rs) | 最终 per-run 报告与在线全局 recorder 分离 |
-| 外部证据 | [runner](../../../etcd_k8s_bench/verify/run_synthetic.py)、[checker](../../../etcd_k8s_bench/verify/check_report.py) | 采集与独立算术核对，不复制调度算法 |
 | 本机性能看板 | [monitoring](../../../etcd_k8s_bench/monitoring/README.md) | Prometheus 抓取现有在线指标，Grafana 自动加载六面板；最终 JSON 仍是计量真相源 |
 
 ## proxy 数据流

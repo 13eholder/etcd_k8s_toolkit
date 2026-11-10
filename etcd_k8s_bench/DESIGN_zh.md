@@ -20,7 +20,7 @@
 | `measurement.rs` | 单调时钟事件归属、token/cohort、计数、桶、HDR、Watch coverage |
 | `metrics.rs` | 有界在线观测、exporter 连接与后台任务回收 |
 | `report.rs` | 最终九字段协议投影，不发明新的计量语义 |
-| `verify/` | 调用唯一 plan/run、采集原始证据、独立离线算术核对 |
+| `verify/`（仅内部，不入库） | 调用唯一 plan/run、采集原始证据、独立离线算术核对 |
 
 配置解析与预算编译只有一处。周期计划在 run 配置克隆时共享，不随 worker 深拷贝。工具不重复编译压力预算，也不修改后端 quota 或自动清库。
 
@@ -89,14 +89,6 @@ timeout 与 result_unknown 是可重叠的 failed 子集。外层逻辑 deadline
 
 ## 可重复验证
 
-[英文使用说明](../README.md)与[中文使用说明](../README_zh.md)给出构建、plan、小规模 run 和采集命令。`verify/run_synthetic.py` 使用新输出目录保存配置副本、原始 stdout/stderr、argv/退出码、二进制 SHA256、机器/后端状态、keyspace、metrics、CPU/RSS。它不管理后端，不修改 quota；watchdog 与测量 cutoff 分开，所有自有子进程/采集线程有界回收。
-
-runner 从首个 capture 到证据落盘统一锁存 SIGINT/SIGTERM；每个自有子进程至多发送一次优雅 SIGINT。SIGTERM 转为 SIGINT 以复用 benchmark 的报告/回收路径，保留原始收到的信号及真实 Popen returncode；正常优雅中断沿用子进程 130，不伪造为 143。watchdog 即使此前已经发送 SIGINT，仍建立有限强杀期限，并将 watchdog/强杀作为工具失败。
-
-plan 启动失败、非零退出、watchdog、强杀或已锁存取消均禁止后续 run。未执行的 run 只有 `run-invocation.json` 中的 `executed:false`、`exit_code:null` 和 reason；不制造 run stdout/report。check.json 明确 not_checked、report_valid/complete_evidence=false，采样与后置采集的跳过原因写入 environment。未启动时用户取消返回130，工具故障返回1；已运行时采集/checker正常则保留真实子进程退出码。
-
-取消以输出文件打开之后、紧邻 Popen 的最终启动门禁为判定点；已锁存则关闭并移除本次新建输出，记录未执行。进入启动操作之后才到来的取消按真实已执行子进程发送 SIGINT 并回收，不承诺把并发启动原子撤回。
-
-`verify/check_report.py` 完全离线，核对 schema、身份、cohort、截止、桶、速率、HDR 可观察标量及退出一致性。queue/latency 副本核对完整 view；独立流和桶只求和 sample_count/overflow、核对精确 max，不能从摘要重建总体分位数。整数按序列化类型检查 u64/u128/i64 范围及对应可见算术。`checks.arithmetic` 只说明这些可见检查；`accounting.no_arithmetic_overflow` 的内部历史状态仍是生产者声明，false 必须与 failed、合法失败上下文和 measurement_complete=false 一致，不能据此跳过其他检查。未提供 plan/keyspace 明确未检查；各证据按自身新增错误归因，准备未完成不能作为完整六类存量检查通过。
+[英文使用说明](../README.md)与[中文使用说明](../README_zh.md)给出构建、plan 与 run 命令。采集与核验工具位于 `verify/`（`run_synthetic.py`、`check_report.py`），按 `.gitignore` 仅内部保留、不入库：runner 以新输出目录保存配置副本、原始 stdout/stderr、argv/退出码、二进制 SHA256、机器/后端状态、keyspace、metrics 与 CPU/RSS，不管理后端、不修改 quota，锁存 SIGINT/SIGTERM 并对每个子进程至多发送一次优雅 SIGINT；checker 完全离线，核对 schema、身份、cohort、截止、桶、速率、HDR 可观察标量及退出一致性，不能从摘要重建总体分位数，`accounting.no_arithmetic_overflow` 的内部历史状态仍是生产者声明。
 
 每次真实验证使用新空实例和目录。压力比较保持对象形状/value/周期不变，只改变更新速率；默认 10k/s×600s 与 1k/10k/50k/100k/s 各60s单独记录。后端过载可以是有效实验结果，但未跑高档、报告矛盾或生成器少投无解释不能作为验证通过。优化前先 profile 定位，再局部修改并重跑受影响档位。

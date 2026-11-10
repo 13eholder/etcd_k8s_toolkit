@@ -15,7 +15,7 @@
 
 该分类函数不等于调用方已实施重试。修改重试必须继续检查 [scheduler.rs](../../../etcd_k8s_bench/src/scheduler.rs)中实际循环、预算和取消边界；CAS 响应转换在 [workload.rs](../../../etcd_k8s_bench/src/workload.rs)，Watch 重连/终止在 [watch.rs](../../../etcd_k8s_bench/src/watch.rs)。错误向 CLI/报告的转换沿 [cli.rs](../../../etcd_k8s_bench/src/cli.rs)、[report.rs](../../../etcd_k8s_bench/src/report.rs)核验，不只检查错误 enum。
 
-Watch open 同样复用 typed TimeoutExpired source 判断，进入有界恢复；不是把全部 Cancelled 都当作 timeout。dispatch/drain 用 ControlFailure 和结构化超时事实传递信号是否已消费、Interrupted/SignalFailure 及 worker 首因，不能匹配错误正文决定后续是否 poll signal future。runner 的 SIGINT/SIGTERM 转发、plan 启动门禁及未执行证据见 [使用说明](../../../README_zh.md#采集可重复证据)。
+Watch open 同样复用 typed TimeoutExpired source 判断，进入有界恢复；不是把全部 Cancelled 都当作 timeout。dispatch/drain 用 ControlFailure 和结构化超时事实传递信号是否已消费、Interrupted/SignalFailure 及 worker 首因，不能匹配错误正文决定后续是否 poll signal future。runner 的 SIGINT/SIGTERM 转发、plan 启动门禁及未执行证据属内部 verify 工具（`etcd_k8s_bench/verify/`，仅本地）行为。
 
 ## proxy 现有行为及缺口
 

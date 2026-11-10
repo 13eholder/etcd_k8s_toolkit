@@ -7,6 +7,7 @@ ref/
 docs/
 .agents/stages/
 tasks/
+etcd_k8s_bench/verify/
 
 # docs/：本地文档不版本管理；.agents/ 知识库整体跟踪，无需额外例外
 
@@ -14,9 +15,5 @@ tasks/
 perf.data
 perf.data.*
 *.jsonl.gz
-etcd_k8s_bench/verify/**/*.txt
-etcd_k8s_bench/verify/**/*.jsonl
 __pycache__/
 *.pyc
-
-verify/
