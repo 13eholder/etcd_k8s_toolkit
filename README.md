@@ -16,7 +16,7 @@ The benchmark simulates only the storage-access characteristics of the load, and
 | `etcd_k8s_bench/workloads/` | embedded default workload `synthetic-k8s.json` |
 | `etcd_k8s_bench/monitoring/` | local Prometheus + Grafana dashboard guide |
 | `proto/` | shared etcd RPC schema, compiled by both crates — edit the proto, never the generated code |
-| `docs/` | user guides (中文): configuration reference, workload model, result interpretation |
+| `docs/` | user guides: configuration reference, workload model, result interpretation |
 
 ## Prerequisites and build
 
@@ -80,7 +80,7 @@ Default workload ([synthetic-k8s.json](etcd_k8s_bench/workloads/synthetic-k8s.js
 | Workers / total queue capacity | 128 / 4,096 |
 | RPC / logical-operation timeout | 5s / 10s |
 
-Beyond application traffic, four periodic streams run independently of the update-rate budget: NodeLease every 10s (deterministic 5% jitter), Node status every 300s, Status every 10s, compaction coordination every 60s. NodeLease is an ordinary KV under `/registry/leases/kube-node-lease`, not an etcd native lease. Full configuration fields and validation rules: [configuration reference](docs/配置参考.md) (中文); request shapes of each stream: [workload model](docs/负载模型.md) (中文).
+Beyond application traffic, four periodic streams run independently of the update-rate budget: NodeLease every 10s (deterministic 5% jitter), Node status every 300s, Status every 10s, compaction coordination every 60s. NodeLease is an ordinary KV under `/registry/leases/kube-node-lease`, not an etcd native lease. Full configuration fields and validation rules: [configuration reference](docs/configuration.md); request shapes of each stream: [workload model](docs/workload-model.md).
 
 ## Results and visualization
 
@@ -96,8 +96,8 @@ Beyond application traffic, four periodic streams run independently of the updat
 Interpretation rules:
 
 1. Logical rates differ from physical request counts: one logical update may cause multiple Txn attempts; one logical list may span multiple Range pages. planned, offered, missed_schedule, dropped_full, accepted, completed, and canceled are checked separately, never converted into each other.
-2. Counts are conserved, not equal: timeout and result_unknown are overlapping subsets of failed and must not be added together. Full accounting formulas and common misreadings: [result interpretation](docs/结果解读.md) (中文).
-3. Online metrics provide no p99; exact quantiles come from the final JSON. HDR vs online-metric semantics: [result interpretation](docs/结果解读.md) (中文).
+2. Counts are conserved, not equal: timeout and result_unknown are overlapping subsets of failed and must not be added together. Full accounting formulas and common misreadings: [result interpretation](docs/result-interpretation.md).
+3. Online metrics provide no p99; exact quantiles come from the final JSON. HDR vs online-metric semantics: [result interpretation](docs/result-interpretation.md).
 
 Local Prometheus + Grafana startup and cleanup: [monitoring guide](etcd_k8s_bench/monitoring/README.md); six panels cover offered updates, losses/errors, RPC throughput and latency, Watch, and backend size/quota.
 
@@ -115,12 +115,14 @@ Module boundaries, scheduling, and event attribution: [design document](etcd_k8s
 
 ## Documentation
 
-User guides (中文):
+User guides:
 
-- [Configuration reference](docs/配置参考.md): JSON fields, CLI overrides, validation rules
-- [Workload model](docs/负载模型.md): keyspace, application/periodic streams, Watch request shapes
-- [Result interpretation](docs/结果解读.md): report fields, accounting invariants, common misreadings
+- [Configuration reference](docs/configuration.md): JSON fields, CLI overrides, validation rules
+- [Workload model](docs/workload-model.md): keyspace, application/periodic streams, Watch request shapes
+- [Result interpretation](docs/result-interpretation.md): report fields, accounting invariants, common misreadings
 - [Monitoring guide](etcd_k8s_bench/monitoring/README.md): local Prometheus + Grafana dashboard
+
+Chinese versions of the three guides are alongside them in `docs/`（配置参考 / 负载模型 / 结果解读）.
 
 Design and contracts (中文, maintainer-facing):
 
